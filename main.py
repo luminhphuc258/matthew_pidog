@@ -5,11 +5,11 @@ import time
 import threading
 from pathlib import Path
 
-from matthew_robot.perception_planner import PerceptionPlanner
-from matthew_robot.motion_controller import MotionController
-from matthew_robot.face_display import FaceDisplay
-from matthew_robot.web_dashboard import WebDashboard
-from matthew_robot.active_listener import ActiveListener
+from perception_planner import PerceptionPlanner
+from motion_controller import MotionController
+from face_display import FaceDisplay
+from web_dashboard import WebDashboard
+from robot.active_listener import ActiveListener
 
 
 POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
