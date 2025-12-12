@@ -9,7 +9,7 @@ from perception_planner import PerceptionPlanner
 from motion_controller import MotionController
 from face_display import FaceDisplay
 from web_dashboard import WebDashboard
-from robot.active_listener import ActiveListener
+from active_listener import ActiveListener
 
 
 POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
