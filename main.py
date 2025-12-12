@@ -34,7 +34,7 @@ def main():
     motion.boot()
 
     # 3) face display
-    face = FaceDisplay(w=480, h=320, fullscreen=False)
+    face = FaceDisplay()
 
     # 5) active listening
     listener = ActiveListener(
@@ -95,7 +95,7 @@ def main():
             motion.execute(decision)
 
             # tick face UI
-            face.tick(fps=15)
+            face.tick()
 
             time.sleep(0.02)
 
