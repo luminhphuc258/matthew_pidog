@@ -1,275 +1,321 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import math
-import random
+import os, time, math
 import pygame
-from pygame import gfxdraw
 
-# --------------------------
-# AA drawing helpers
-# --------------------------
-def aa_line(surf, p1, p2, color, w=2):
-    # draw several AA lines for a thin but smooth stroke
-    x1, y1 = p1; x2, y2 = p2
-    gfxdraw.line(surf, int(x1), int(y1), int(x2), int(y2), color)
-    # pseudo thickness
-    for i in range(1, w):
-        gfxdraw.line(surf, int(x1), int(y1+i), int(x2), int(y2+i), color)
-        gfxdraw.line(surf, int(x1), int(y1-i), int(x2), int(y2-i), color)
+os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
-def aa_ellipse(surf, rect, color, filled=False):
-    x, y, w, h = rect
-    cx = x + w//2
-    cy = y + h//2
-    rx = w//2
-    ry = h//2
-    if filled:
-        gfxdraw.filled_ellipse(surf, cx, cy, rx, ry, color)
-    gfxdraw.aaellipse(surf, cx, cy, rx, ry, color)
+# ===== STYLE =====
+BG = (0, 0, 0)
 
-def aa_circle(surf, center, r, color, filled=False):
-    x, y = center
-    if filled:
-        gfxdraw.filled_circle(surf, int(x), int(y), int(r), color)
-    gfxdraw.aacircle(surf, int(x), int(y), int(r), color)
+# Orange neon like your sample
+ORANGE  = (255, 170, 60)   # core
+ORANGE2 = (255, 210, 130)  # glow/highlight
 
-def soft_glow_ellipse(surf, rect, base_alpha=30, layers=10):
-    # white-only soft glow for subtle 3D-ish look
-    x, y, w, h = rect
-    for i in range(layers, 0, -1):
-        pad = i * 2
-        a = int(base_alpha * (i / layers))
-        col = (255, 255, 255, a)
-        aa_ellipse(surf, (x - pad, y - pad, w + pad*2, h + pad*2), col, filled=False)
+# Thin strokes (mỏng thôi)
+THICK_LINE  = 4
+THICK_EYE   = 4
+THICK_MOUTH = 5
 
-# --------------------------
-# Face drawing
-# --------------------------
-def blink_value(t, period=4.2):
-    # returns 0..1 (0 open, 1 closed) with quick blink
-    phase = (t % period) / period
-    if phase < 0.03:
-        return phase / 0.03
-    if phase < 0.06:
-        return 1 - (phase - 0.03) / 0.03
-    return 0.0
+# Key mapping (as you requested)
+KEY_TO_EMO = {
+    "1": "love",
+    "2": "smile",
+    "3": "laugh",
+    "4": "what_is_it",
+    "5": "question",
+    "6": "suprise",
+    "7": "sleep",
+    "9": "sad",
+    "0": "angry",
+}
 
-def pupil_offset(t, amp):
-    return (
-        math.sin(t * 1.3) * amp,
-        math.cos(t * 1.1) * amp * 0.7
-    )
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
 
-def mouth_wiggle(t, amp):
-    return math.sin(t * 1.7) * amp
+def draw_glow_line(screen, p1, p2, width):
+    # subtle glow (3D-ish) using lighter orange behind
+    pygame.draw.line(screen, ORANGE2, p1, p2, max(1, width + 6))
+    pygame.draw.line(screen, ORANGE,  p1, p2, max(1, width))
 
-def draw_eye(surf, center, size, t, style="normal", blink=0.0):
-    cx, cy = center
-    ew, eh = size
-    stroke = (255, 255, 255, 220)
+def draw_glow_arc(screen, rect, start, end, width):
+    pygame.draw.arc(screen, ORANGE2, rect, start, end, max(1, width + 6))
+    pygame.draw.arc(screen, ORANGE,  rect, start, end, max(1, width))
 
-    # eyelid blink -> squash height
-    eh2 = max(2, int(eh * (1 - 0.85 * blink)))
+def draw_glow_rect_outline(screen, rect, radius, width):
+    pygame.draw.rect(screen, ORANGE2, rect, max(1, width + 6), border_radius=radius)
+    pygame.draw.rect(screen, ORANGE,  rect, max(1, width),     border_radius=radius)
 
-    # eye outline (thin)
-    rect = (int(cx - ew/2), int(cy - eh2/2), int(ew), int(eh2))
-    soft_glow_ellipse(surf, rect, base_alpha=18, layers=8)
-    aa_ellipse(surf, rect, stroke, filled=False)
+def draw_glow_circle(screen, center, r, width):
+    if width <= 0:
+        pygame.draw.circle(screen, ORANGE2, center, r + 6)
+        pygame.draw.circle(screen, ORANGE,  center, r)
+        return
+    pygame.draw.circle(screen, ORANGE2, center, r, max(1, width + 6))
+    pygame.draw.circle(screen, ORANGE,  center, r, max(1, width))
 
-    # pupil (only when open enough)
-    if eh2 > eh * 0.25:
-        ox, oy = pupil_offset(t, amp=ew * 0.10)
-        # style tweaks
-        if style == "side":
-            ox *= 1.6
-        if style == "up":
-            oy -= ew * 0.06
-        if style == "down":
-            oy += ew * 0.06
-        if style == "wink":
-            # wink handled outside (blink bigger), keep small pupil
-            ox *= 0.5; oy *= 0.5
+def eye_open(screen, cx, cy, w, h, pupil_dx=0, pupil_dy=0, blink=0.0):
+    # eyelid effect by shrinking height
+    hh = max(8, int(h * (1.0 - 0.90 * blink)))
+    rect = pygame.Rect(cx - w//2, cy - hh//2, w, hh)
+    radius = max(10, hh//2)
 
-        pr = max(2, int(min(ew, eh) * 0.12))
-        aa_circle(surf, (cx + ox, cy + oy), pr, stroke, filled=True)
+    draw_glow_rect_outline(screen, rect, radius=radius, width=THICK_EYE)
 
-        # tiny highlight (3D feel) -> small alpha dot
-        aa_circle(surf, (cx + ox - pr*0.35, cy + oy - pr*0.35), max(1, pr//3), (255,255,255,90), filled=True)
+    # pupil (soft 3D: glow + highlight)
+    pr = max(8, int(min(w, hh) * 0.14))
+    px = clamp(cx + pupil_dx, rect.left + pr + 8, rect.right - pr - 8)
+    py = clamp(cy + pupil_dy, rect.top  + pr + 8, rect.bottom - pr - 8)
 
-def draw_nose(surf, center, size, t, kind="round"):
-    cx, cy = center
-    stroke = (255, 255, 255, 220)
-    wig = mouth_wiggle(t, amp=size * 0.04)
+    pygame.draw.circle(screen, ORANGE2, (px, py), pr + 4)
+    pygame.draw.circle(screen, ORANGE,  (px, py), pr)
 
-    if kind == "round":
-        r = int(size * 0.18)
-        aa_circle(surf, (cx, cy + wig), r, stroke, filled=True)
-        aa_circle(surf, (cx - r*0.35, cy + wig - r*0.25), max(1, r//4), (255,255,255,70), filled=True)
-    elif kind == "triangle":
-        w = int(size * 0.40)
-        h = int(size * 0.26)
-        pts = [(cx, cy - h//2 + wig), (cx - w//2, cy + h//2 + wig), (cx + w//2, cy + h//2 + wig)]
-        # filled triangle (white with a bit lower alpha) for softer look
-        gfxdraw.filled_polygon(surf, [(int(x), int(y)) for x,y in pts], (255,255,255,200))
-        gfxdraw.aapolygon(surf, [(int(x), int(y)) for x,y in pts], stroke)
-    else:
-        # tiny
-        r = int(size * 0.12)
-        aa_circle(surf, (cx, cy + wig), r, stroke, filled=True)
+    # tiny highlight
+    pygame.draw.circle(screen, (255, 245, 220), (px - pr//3, py - pr//3), max(2, pr//3))
 
-def draw_mouth(surf, center, width, t, mood="neutral"):
-    cx, cy = center
-    stroke = (255, 255, 255, 220)
-    w = width
-    wig = mouth_wiggle(t, amp=w * 0.02)
+def eye_happy_arc(screen, cx, cy, w, h):
+    rect = pygame.Rect(cx - w//2, cy - h//2, w, h)
+    draw_glow_arc(screen, rect, math.pi, 2*math.pi, THICK_LINE)
 
-    if mood == "neutral":
-        p1 = (cx - w*0.18, cy + wig)
-        p2 = (cx + w*0.18, cy + wig)
-        aa_line(surf, p1, p2, stroke, w=2)
+def eye_dot(screen, cx, cy, r, t):
+    # dot eye with gentle floating highlight
+    bob = int(2 * math.sin(t * 2.4))
+    pygame.draw.circle(screen, ORANGE2, (cx, cy + bob), r + 4)
+    pygame.draw.circle(screen, ORANGE,  (cx, cy + bob), r)
+    pygame.draw.circle(screen, (255,245,220), (cx - r//3, cy - r//3 + bob), max(2, r//3))
 
-    elif mood == "smile":
-        # curve (polyline)
-        pts = []
-        for i in range(0, 21):
-            u = i / 20
-            x = cx - w*0.22 + u * w*0.44
-            y = cy + w*0.05 + (u - 0.5)**2 * w*0.20 + wig
-            pts.append((x, y))
-        for i in range(len(pts)-1):
-            aa_line(surf, pts[i], pts[i+1], stroke, w=2)
+def mouth_smile(screen, cx, cy, w, h, open_amt=0.0, wob=0):
+    rect = pygame.Rect(cx - w//2, cy - h//2 + wob, w, h)
+    draw_glow_arc(screen, rect, 0, math.pi, THICK_MOUTH)
 
-    elif mood == "sad":
-        pts = []
-        for i in range(0, 21):
-            u = i / 20
-            x = cx - w*0.22 + u * w*0.44
-            y = cy - w*0.05 - (u - 0.5)**2 * w*0.20 + wig
-            pts.append((x, y))
-        for i in range(len(pts)-1):
-            aa_line(surf, pts[i], pts[i+1], stroke, w=2)
+    if open_amt > 0:
+        ow = int(w * 0.30)
+        oh = int(h * 0.55 * open_amt)
+        if oh > 8:
+            r = max(10, oh//2)
+            rr = pygame.Rect(cx - ow//2, cy + int(h*0.10) + wob, ow, oh)
+            draw_glow_rect_outline(screen, rr, radius=r, width=THICK_LINE)
 
-    elif mood == "open":
-        # small open mouth
-        mw = int(w * 0.22)
-        mh = int(w * 0.14 + abs(wig)*2)
-        rect = (int(cx - mw/2), int(cy - mh/2), mw, mh)
-        soft_glow_ellipse(surf, rect, base_alpha=14, layers=7)
-        aa_ellipse(surf, rect, stroke, filled=False)
+def mouth_open(screen, cx, cy, w, h, wob=0):
+    rect = pygame.Rect(cx - w//2, cy - h//2 + wob, w, h)
+    r = max(12, h//2)
+    draw_glow_rect_outline(screen, rect, radius=r, width=THICK_MOUTH)
 
-def draw_face(surf, W, H, t, idx):
-    # black bg already
+def mouth_flat(screen, cx, cy, w, wob=0):
+    draw_glow_line(screen, (cx - w//2, cy + wob), (cx + w//2, cy + wob), THICK_MOUTH)
+
+def mouth_laugh(screen, cx, cy, w, h, t):
+    # wide smile + more open + bounce
+    bounce = int(6 * abs(math.sin(t * 3.2)))
+    mouth_smile(screen, cx, cy + bounce, w, h, open_amt=0.55 + 0.15*math.sin(t*4.5), wob=0)
+
+def draw_heart_outline(screen, x, y, s, t):
+    # outline heart (thin) with gentle pulse (matches your "love" icon)
+    pulse = 1.0 + 0.06 * math.sin(t * 3.0)
+    s = int(s * pulse)
+    # param heart curve -> polyline
+    pts = []
+    for i in range(0, 181, 6):
+        a = math.radians(i)
+        px = 16 * (math.sin(a) ** 3)
+        py = 13*math.cos(a) - 5*math.cos(2*a) - 2*math.cos(3*a) - math.cos(4*a)
+        pts.append((x + int(px * s/18), y - int(py * s/18)))
+    # glow outline
+    pygame.draw.lines(screen, ORANGE2, False, pts, THICK_LINE + 4)
+    pygame.draw.lines(screen, ORANGE,  False, pts, THICK_LINE)
+
+def q_mark(screen, cx, cy, t):
+    wob = int(6 * math.sin(t * 2.8))
+    rect = pygame.Rect(cx - 28, cy - 165 + wob, 56, 68)
+    draw_glow_arc(screen, rect, math.pi*1.1, math.pi*2.15, THICK_LINE)
+    draw_glow_line(screen, (cx + 24, cy - 108 + wob), (cx + 24, cy - 92 + wob), THICK_LINE)
+    draw_glow_circle(screen, (cx + 24, cy - 70 + wob), 6, 0)
+
+def ex_mark(screen, cx, cy, t):
+    bounce = int(8 * abs(math.sin(t*3.0)))
+    top = (cx, cy - 150 - bounce)
+    mid = (cx, cy - 98  - bounce)
+    draw_glow_line(screen, top, mid, THICK_LINE)
+    draw_glow_circle(screen, (cx, cy - 70 - bounce), 6, 0)
+
+def zzz(screen, cx, cy, t):
+    for i in range(3):
+        yy = cy - 165 - i*44 - int(8*math.sin(t*2 + i))
+        xx = cx + 165 + i*28
+        draw_glow_line(screen, (xx-16, yy-12), (xx+16, yy-12), THICK_LINE)
+        draw_glow_line(screen, (xx+16, yy-12), (xx-16, yy+12), THICK_LINE)
+        draw_glow_line(screen, (xx-16, yy+12), (xx+16, yy+12), THICK_LINE)
+
+def tears(screen, x, y, t):
+    bob = int(6 * math.sin(t * 2.7))
+    rect = pygame.Rect(x - 9, y + 18 + bob, 18, 36)
+    pygame.draw.ellipse(screen, ORANGE2, rect, 6)
+    pygame.draw.ellipse(screen, ORANGE,  rect, 3)
+
+def render_face(screen, emo, t):
+    W, H = screen.get_size()
+    screen.fill(BG)
+
     cx, cy = W//2, H//2
-    scale = min(W, H)
 
-    # layout
-    eye_y = cy - int(scale * 0.10)
-    eye_dx = int(scale * 0.18)
-    eye_size = (int(scale*0.12), int(scale*0.07))
+    # ===== Fullscreen layout (big features) =====
+    eye_y   = cy - int(H * 0.14)
+    mouth_y = cy + int(H * 0.18)
 
-    nose_y = cy + int(scale * 0.03)
-    mouth_y = cy + int(scale * 0.18)
+    eye_w = int(W * 0.32)
+    eye_h = int(H * 0.22)
+    gap   = int(W * 0.18)
 
-    b = blink_value(t, period=4.0 + (idx % 3) * 0.6)
+    lx = cx - gap
+    rx = cx + gap
 
-    # per-face styles roughly matching your 3x3 idea
-    if idx == 1:   # cute neutral
-        draw_eye(surf, (cx-eye_dx, eye_y), eye_size, t, "normal", blink=b*0.3)
-        draw_eye(surf, (cx+eye_dx, eye_y), eye_size, t, "normal", blink=b*0.3)
-        draw_nose(surf, (cx, nose_y), scale*0.30, t, "round")
-        draw_mouth(surf, (cx, mouth_y), scale*0.45, t, "smile")
+    mouth_w = int(W * 0.56)
+    mouth_h = int(H * 0.28)
 
-    elif idx == 2: # sad droopy
-        draw_eye(surf, (cx-eye_dx, eye_y), (eye_size[0], int(eye_size[1]*0.75)), t, "down", blink=b*0.25)
-        draw_eye(surf, (cx+eye_dx, eye_y), (eye_size[0], int(eye_size[1]*0.75)), t, "down", blink=b*0.25)
-        draw_nose(surf, (cx, nose_y), scale*0.34, t, "triangle")
-        draw_mouth(surf, (cx, mouth_y), scale*0.45, t, "sad")
+    # ===== subtle motion =====
+    # blink
+    phase = (t % 3.3)
+    blink = 0.0
+    if phase < 0.10:
+        blink = 1.0 - phase/0.10
+    elif phase < 0.20:
+        blink = (phase-0.10)/0.10
+    blink = clamp(blink, 0.0, 1.0)
 
-    elif idx == 3: # side look
-        draw_eye(surf, (cx-eye_dx, eye_y), eye_size, t, "side", blink=b*0.25)
-        draw_eye(surf, (cx+eye_dx, eye_y), eye_size, t, "side", blink=b*0.25)
-        draw_nose(surf, (cx, nose_y), scale*0.30, t, "round")
-        draw_mouth(surf, (cx, mouth_y), scale*0.42, t, "neutral")
+    pdx = int(math.sin(t*1.7) * (W * 0.012))
+    pdy = int(math.sin(t*1.2 + 1.1) * (H * 0.010))
+    wob = int(math.sin(t*2.4) * (H * 0.010))
 
-    elif idx == 4: # suspicious (one eye smaller)
-        draw_eye(surf, (cx-eye_dx, eye_y), (int(eye_size[0]*0.75), eye_size[1]), t, "normal", blink=b*0.15)
-        draw_eye(surf, (cx+eye_dx, eye_y), (int(eye_size[0]*1.05), eye_size[1]), t, "up", blink=b*0.15)
-        draw_nose(surf, (cx, nose_y), scale*0.28, t, "tiny")
-        draw_mouth(surf, (cx, mouth_y), scale*0.44, t, "neutral")
+    # ================== NEW 3 faces (love/smile/laugh) ==================
+    if emo == "love":
+        # heart outline centered (big) + small smile; eyes are minimal like icon style
+        draw_heart_outline(screen, cx, cy - int(H*0.10), int(min(W,H)*0.40), t)
+        # tiny dot eyes
+        eye_dot(screen, lx, eye_y, int(min(W,H)*0.028), t)
+        eye_dot(screen, rx, eye_y, int(min(W,H)*0.028), t)
+        mouth_smile(screen, cx, mouth_y, int(mouth_w*0.55), int(mouth_h*0.70), open_amt=0.10, wob=wob)
 
-    elif idx == 5: # shocked / worried
-        draw_eye(surf, (cx-eye_dx, eye_y), (eye_size[0], int(eye_size[1]*1.15)), t, "up", blink=b*0.05)
-        draw_eye(surf, (cx+eye_dx, eye_y), (eye_size[0], int(eye_size[1]*1.15)), t, "up", blink=b*0.05)
-        draw_nose(surf, (cx, nose_y), scale*0.36, t, "triangle")
-        draw_mouth(surf, (cx, mouth_y), scale*0.46, t, "open")
+    elif emo == "smile":
+        # icon-like: curved closed eyes + gentle smile
+        eye_happy_arc(screen, lx, eye_y, int(eye_w*0.90), int(eye_h*0.70))
+        eye_happy_arc(screen, rx, eye_y, int(eye_w*0.90), int(eye_h*0.70))
+        mouth_smile(screen, cx, mouth_y, int(mouth_w*0.68), int(mouth_h*0.80),
+                    open_amt=0.10 + 0.05*math.sin(t*3.8), wob=wob)
 
-    elif idx == 6: # friendly smile with smaller pupils
-        draw_eye(surf, (cx-eye_dx, eye_y), (int(eye_size[0]*0.9), eye_size[1]), t, "normal", blink=b*0.35)
-        draw_eye(surf, (cx+eye_dx, eye_y), (int(eye_size[0]*0.9), eye_size[1]), t, "normal", blink=b*0.35)
-        draw_nose(surf, (cx, nose_y), scale*0.33, t, "round")
-        draw_mouth(surf, (cx, mouth_y), scale*0.48, t, "smile")
+    elif emo == "laugh":
+        # bigger smile + open mouth bounce
+        eye_happy_arc(screen, lx, eye_y, int(eye_w*0.92), int(eye_h*0.70))
+        eye_happy_arc(screen, rx, eye_y, int(eye_w*0.92), int(eye_h*0.70))
+        mouth_laugh(screen, cx, mouth_y, int(mouth_w*0.78), int(mouth_h*0.90), t)
 
-    elif idx == 7: # wink
-        # left wink: force blink high
-        draw_eye(surf, (cx-eye_dx, eye_y), eye_size, t, "wink", blink=0.9)
-        draw_eye(surf, (cx+eye_dx, eye_y), eye_size, t, "normal", blink=b*0.25)
-        draw_nose(surf, (cx, nose_y), scale*0.26, t, "tiny")
-        draw_mouth(surf, (cx, mouth_y), scale*0.44, t, "smile")
+    # ================== Remapped faces you requested ==================
+    elif emo == "what_is_it":
+        # curious: eyes look opposite directions + flat mouth
+        eye_open(screen, lx, eye_y, eye_w, eye_h, -pdx, pdy, blink*0.25)
+        eye_open(screen, rx, eye_y, eye_w, eye_h,  pdx, -pdy, blink*0.25)
+        mouth_flat(screen, cx, mouth_y, int(mouth_w*0.52), wob=wob)
 
-    elif idx == 8: # big nose + neutral mouth
-        draw_eye(surf, (cx-eye_dx, eye_y), (int(eye_size[0]*0.85), eye_size[1]), t, "normal", blink=b*0.2)
-        draw_eye(surf, (cx+eye_dx, eye_y), (int(eye_size[0]*0.85), eye_size[1]), t, "normal", blink=b*0.2)
-        draw_nose(surf, (cx, nose_y), scale*0.40, t, "triangle")
-        draw_mouth(surf, (cx, mouth_y), scale*0.40, t, "neutral")
+    elif emo == "question":
+        # open eyes + small mouth + question mark
+        eye_open(screen, lx, eye_y, eye_w, eye_h, pdx, pdy, blink*0.20)
+        eye_open(screen, rx, eye_y, eye_w, eye_h, pdx, pdy, blink*0.20)
+        mouth_flat(screen, cx, mouth_y, int(mouth_w*0.40), wob=wob)
+        q_mark(screen, cx, cy, t)
 
-    elif idx == 9: # laughing / open smile
-        draw_eye(surf, (cx-eye_dx, eye_y), (int(eye_size[0]*0.95), int(eye_size[1]*0.65)), t, "normal", blink=b*0.45)
-        draw_eye(surf, (cx+eye_dx, eye_y), (int(eye_size[0]*0.95), int(eye_size[1]*0.65)), t, "normal", blink=b*0.45)
-        draw_nose(surf, (cx, nose_y), scale*0.34, t, "round")
-        draw_mouth(surf, (cx, mouth_y), scale*0.52, t, "open")
+    elif emo == "suprise":
+        # wide open eyes + small O mouth + exclamation
+        eye_open(screen, lx, eye_y, eye_w, eye_h, 0, 0, 0.0)
+        eye_open(screen, rx, eye_y, eye_w, eye_h, 0, 0, 0.0)
+        mouth_open(screen, cx, mouth_y, int(mouth_w*0.20), int(mouth_h*0.24), wob=wob)
+        ex_mark(screen, cx, cy, t)
 
-# --------------------------
-# Main
-# --------------------------
+    elif emo == "sleep":
+        # closed eyes + flat mouth + ZZZ
+        eye_happy_arc(screen, lx, eye_y + 14, int(eye_w*0.88), int(eye_h*0.62))
+        eye_happy_arc(screen, rx, eye_y + 14, int(eye_w*0.88), int(eye_h*0.62))
+        mouth_flat(screen, cx, mouth_y, int(mouth_w*0.32), wob=wob)
+        zzz(screen, cx, cy, t)
+
+    elif emo == "sad":
+        # droopy pupils + sad mouth + tear
+        eye_open(screen, lx, eye_y, eye_w, eye_h, -pdx, pdy + 10, blink*0.15)
+        eye_open(screen, rx, eye_y, eye_w, eye_h,  pdx, pdy + 10, blink*0.15)
+        # sad arc mouth (upside down smile)
+        rect = pygame.Rect(cx - int(mouth_w*0.65)//2, mouth_y - int(mouth_h*0.55)//2 + wob,
+                           int(mouth_w*0.65), int(mouth_h*0.55))
+        draw_glow_arc(screen, rect, math.pi, 2*math.pi, THICK_MOUTH)
+        tears(screen, lx + int(eye_w*0.22), eye_y + int(eye_h*0.06), t)
+
+    elif emo == "angry":
+        # jitter pupils + angry brows + wavy mouth
+        jitter = int(math.sin(t*10.0) * 6)
+        eye_open(screen, lx, eye_y, eye_w, eye_h, pdx + jitter, pdy, blink*0.05)
+        eye_open(screen, rx, eye_y, eye_w, eye_h, pdx - jitter, pdy, blink*0.05)
+
+        # brows
+        draw_glow_line(screen,
+                       (lx - int(eye_w*0.55), eye_y - int(eye_h*0.52)),
+                       (lx + int(eye_w*0.55), eye_y - int(eye_h*0.18)), THICK_LINE)
+        draw_glow_line(screen,
+                       (rx - int(eye_w*0.55), eye_y - int(eye_h*0.18)),
+                       (rx + int(eye_w*0.55), eye_y - int(eye_h*0.52)), THICK_LINE)
+
+        # wavy mouth
+        amp = int(H * 0.010)
+        pts = []
+        w = int(mouth_w * 0.58)
+        for i in range(54):
+            x = cx - w//2 + (i/53.0)*w
+            y = mouth_y + wob + math.sin(t*7.0 + i*0.30) * amp
+            pts.append((x, y))
+        pygame.draw.lines(screen, ORANGE2, False, pts, THICK_MOUTH + 4)
+        pygame.draw.lines(screen, ORANGE,  False, pts, THICK_MOUTH)
+
+    pygame.display.flip()
+
 def main():
     pygame.init()
-
     screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
-    W, H = screen.get_size()
-    clock = pygame.time.Clock()
+    pygame.mouse.set_visible(False)
 
+    emo = "smile"
+    auto = False
+    last = time.time()
+
+    print("Keys: 1=love 2=smile 3=laugh 4=what_is_it 5=question 6=suprise 7=sleep 9=sad 0=angry | SPACE auto | ESC quit")
+
+    order = ["love","smile","laugh","what_is_it","question","suprise","sleep","sad","angry"]
     idx = 1
-    t = 0.0
-    running = True
 
-    # pre-create transparent layer for alpha drawings
-    layer = pygame.Surface((W, H), pygame.SRCALPHA)
-
-    while running:
-        dt = clock.tick(60) / 1000.0
-        t += dt
+    while True:
+        now = time.time()
+        t = now
 
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
-                running = False
+                return
             if e.type == pygame.KEYDOWN:
-                if e.key == pygame.K_ESCAPE:
-                    running = False
-                if pygame.K_1 <= e.key <= pygame.K_9:
-                    idx = e.key - pygame.K_0
+                if e.key in (pygame.K_ESCAPE, pygame.K_q):
+                    return
+                if e.key == pygame.K_SPACE:
+                    auto = not auto
 
-        # background
-        screen.fill((0, 0, 0))
-        layer.fill((0, 0, 0, 0))
+                # digit keys mapping
+                if e.unicode in KEY_TO_EMO:
+                    emo = KEY_TO_EMO[e.unicode]
+                    auto = False
 
-        draw_face(layer, W, H, t, idx)
+        if auto and (now - last) > 2.0:
+            emo = order[idx % len(order)]
+            idx += 1
+            last = now
 
-        # blit alpha layer
-        screen.blit(layer, (0, 0))
-        pygame.display.flip()
-
-    pygame.quit()
+        render_face(screen, emo, t)
+        time.sleep(0.016)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
