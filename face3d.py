@@ -2,177 +2,250 @@
 # -*- coding: utf-8 -*-
 
 import math
+import random
 import pygame
+from pygame import gfxdraw
 
-# ---------------------------
-# Helpers: fake 3D shading
-# ---------------------------
+# --------------------------
+# AA drawing helpers
+# --------------------------
+def aa_line(surf, p1, p2, color, w=2):
+    # draw several AA lines for a thin but smooth stroke
+    x1, y1 = p1; x2, y2 = p2
+    gfxdraw.line(surf, int(x1), int(y1), int(x2), int(y2), color)
+    # pseudo thickness
+    for i in range(1, w):
+        gfxdraw.line(surf, int(x1), int(y1+i), int(x2), int(y2+i), color)
+        gfxdraw.line(surf, int(x1), int(y1-i), int(x2), int(y2-i), color)
 
-def clamp(x, a, b):
-    return a if x < a else b if x > b else x
-
-def draw_radial_gradient_circle(surf, center, radius, inner_color, outer_color, steps=64):
-    """Fake 3D: vẽ circle nhiều vòng để tạo radial gradient."""
-    cx, cy = center
-    for i in range(steps, 0, -1):
-        t = i / steps
-        r = int(radius * t)
-        col = (
-            int(outer_color[0] + (inner_color[0] - outer_color[0]) * t),
-            int(outer_color[1] + (inner_color[1] - outer_color[1]) * t),
-            int(outer_color[2] + (inner_color[2] - outer_color[2]) * t),
-            int(outer_color[3] + (inner_color[3] - outer_color[3]) * t),
-        )
-        pygame.draw.circle(surf, col, (cx, cy), r)
-
-def draw_glow_circle(surf, center, radius, color, glow=18):
-    """Glow: vẽ nhiều vòng alpha nhỏ dần."""
-    cx, cy = center
-    for i in range(glow, 0, -1):
-        a = int(color[3] * (i / glow) * 0.35)
-        pygame.draw.circle(surf, (color[0], color[1], color[2], a), (cx, cy), radius + i)
-
-def draw_glow_line(surf, p1, p2, color, width=6, glow=14):
-    """Glow cho line (miệng)."""
-    for i in range(glow, 0, -1):
-        a = int(color[3] * (i / glow) * 0.25)
-        pygame.draw.line(surf, (color[0], color[1], color[2], a), p1, p2, width + i*2)
-    pygame.draw.line(surf, color, p1, p2, width)
-
-def draw_eye_3d(base, pos, eye_r, iris_r, pupil_r, neon):
-    """
-    Vẽ 1 mắt 3D giả lập:
-    - eyeball: radial gradient (nổi khối)
-    - highlight: chấm sáng
-    - iris+pupil: pupil di chuyển
-    """
-    x, y = pos
-
-    # glow ngoài
-    draw_glow_circle(base, (x, y), eye_r, neon, glow=22)
-
-    # eyeball 3D (tối ngoài, sáng trong)
-    eyeball = pygame.Surface((eye_r*2+4, eye_r*2+4), pygame.SRCALPHA)
-    draw_radial_gradient_circle(
-        eyeball,
-        (eye_r+2, eye_r+2),
-        eye_r,
-        inner_color=(30, 120, 255, 210),
-        outer_color=(0, 10, 35, 220),
-        steps=80
-    )
-    base.blit(eyeball, (x-eye_r-2, y-eye_r-2))
-
-    # viền neon (thick)
-    pygame.draw.circle(base, (neon[0], neon[1], neon[2], 220), (x, y), eye_r, 5)
-
-    # highlight (ánh sáng)
-    pygame.draw.circle(base, (255, 255, 255, 90), (x-int(eye_r*0.35), y-int(eye_r*0.35)), int(eye_r*0.18))
-    pygame.draw.circle(base, (255, 255, 255, 40), (x-int(eye_r*0.20), y-int(eye_r*0.20)), int(eye_r*0.10))
-
-def draw_iris_and_pupil(base, eye_center, eye_r, iris_r, pupil_r, look_target, neon):
-    ex, ey = eye_center
-    tx, ty = look_target
-
-    # vector nhìn
-    vx, vy = tx - ex, ty - ey
-    dist = math.hypot(vx, vy) or 1.0
-    nx, ny = vx / dist, vy / dist
-
-    # giới hạn pupil trong mắt
-    max_offset = eye_r - iris_r - 8
-    px = ex + int(nx * max_offset)
-    py = ey + int(ny * max_offset)
-
-    # iris (gradient nhỏ)
-    iris = pygame.Surface((iris_r*2+2, iris_r*2+2), pygame.SRCALPHA)
-    draw_radial_gradient_circle(
-        iris,
-        (iris_r+1, iris_r+1),
-        iris_r,
-        inner_color=(neon[0], neon[1], neon[2], 200),
-        outer_color=(0, 0, 0, 220),
-        steps=60
-    )
-    base.blit(iris, (px-iris_r-1, py-iris_r-1))
-
-    # pupil
-    pygame.draw.circle(base, (0, 0, 0, 230), (px, py), pupil_r)
-
-    # pupil highlight
-    pygame.draw.circle(base, (255, 255, 255, 80), (px-int(pupil_r*0.35), py-int(pupil_r*0.35)), int(pupil_r*0.30))
-
-def draw_mouth_3d(base, rect, mood, neon):
-    """
-    Vẽ miệng kiểu neon 3D giả lập.
-    mood: "smile" | "sad" | "neutral"
-    """
+def aa_ellipse(surf, rect, color, filled=False):
     x, y, w, h = rect
     cx = x + w//2
     cy = y + h//2
+    rx = w//2
+    ry = h//2
+    if filled:
+        gfxdraw.filled_ellipse(surf, cx, cy, rx, ry, color)
+    gfxdraw.aaellipse(surf, cx, cy, rx, ry, color)
 
-    # glow nền miệng
-    mouth_layer = pygame.Surface((w, h), pygame.SRCALPHA)
+def aa_circle(surf, center, r, color, filled=False):
+    x, y = center
+    if filled:
+        gfxdraw.filled_circle(surf, int(x), int(y), int(r), color)
+    gfxdraw.aacircle(surf, int(x), int(y), int(r), color)
 
-    if mood == "smile":
-        # cung cười
+def soft_glow_ellipse(surf, rect, base_alpha=30, layers=10):
+    # white-only soft glow for subtle 3D-ish look
+    x, y, w, h = rect
+    for i in range(layers, 0, -1):
+        pad = i * 2
+        a = int(base_alpha * (i / layers))
+        col = (255, 255, 255, a)
+        aa_ellipse(surf, (x - pad, y - pad, w + pad*2, h + pad*2), col, filled=False)
+
+# --------------------------
+# Face drawing
+# --------------------------
+def blink_value(t, period=4.2):
+    # returns 0..1 (0 open, 1 closed) with quick blink
+    phase = (t % period) / period
+    if phase < 0.03:
+        return phase / 0.03
+    if phase < 0.06:
+        return 1 - (phase - 0.03) / 0.03
+    return 0.0
+
+def pupil_offset(t, amp):
+    return (
+        math.sin(t * 1.3) * amp,
+        math.cos(t * 1.1) * amp * 0.7
+    )
+
+def mouth_wiggle(t, amp):
+    return math.sin(t * 1.7) * amp
+
+def draw_eye(surf, center, size, t, style="normal", blink=0.0):
+    cx, cy = center
+    ew, eh = size
+    stroke = (255, 255, 255, 220)
+
+    # eyelid blink -> squash height
+    eh2 = max(2, int(eh * (1 - 0.85 * blink)))
+
+    # eye outline (thin)
+    rect = (int(cx - ew/2), int(cy - eh2/2), int(ew), int(eh2))
+    soft_glow_ellipse(surf, rect, base_alpha=18, layers=8)
+    aa_ellipse(surf, rect, stroke, filled=False)
+
+    # pupil (only when open enough)
+    if eh2 > eh * 0.25:
+        ox, oy = pupil_offset(t, amp=ew * 0.10)
+        # style tweaks
+        if style == "side":
+            ox *= 1.6
+        if style == "up":
+            oy -= ew * 0.06
+        if style == "down":
+            oy += ew * 0.06
+        if style == "wink":
+            # wink handled outside (blink bigger), keep small pupil
+            ox *= 0.5; oy *= 0.5
+
+        pr = max(2, int(min(ew, eh) * 0.12))
+        aa_circle(surf, (cx + ox, cy + oy), pr, stroke, filled=True)
+
+        # tiny highlight (3D feel) -> small alpha dot
+        aa_circle(surf, (cx + ox - pr*0.35, cy + oy - pr*0.35), max(1, pr//3), (255,255,255,90), filled=True)
+
+def draw_nose(surf, center, size, t, kind="round"):
+    cx, cy = center
+    stroke = (255, 255, 255, 220)
+    wig = mouth_wiggle(t, amp=size * 0.04)
+
+    if kind == "round":
+        r = int(size * 0.18)
+        aa_circle(surf, (cx, cy + wig), r, stroke, filled=True)
+        aa_circle(surf, (cx - r*0.35, cy + wig - r*0.25), max(1, r//4), (255,255,255,70), filled=True)
+    elif kind == "triangle":
+        w = int(size * 0.40)
+        h = int(size * 0.26)
+        pts = [(cx, cy - h//2 + wig), (cx - w//2, cy + h//2 + wig), (cx + w//2, cy + h//2 + wig)]
+        # filled triangle (white with a bit lower alpha) for softer look
+        gfxdraw.filled_polygon(surf, [(int(x), int(y)) for x,y in pts], (255,255,255,200))
+        gfxdraw.aapolygon(surf, [(int(x), int(y)) for x,y in pts], stroke)
+    else:
+        # tiny
+        r = int(size * 0.12)
+        aa_circle(surf, (cx, cy + wig), r, stroke, filled=True)
+
+def draw_mouth(surf, center, width, t, mood="neutral"):
+    cx, cy = center
+    stroke = (255, 255, 255, 220)
+    w = width
+    wig = mouth_wiggle(t, amp=w * 0.02)
+
+    if mood == "neutral":
+        p1 = (cx - w*0.18, cy + wig)
+        p2 = (cx + w*0.18, cy + wig)
+        aa_line(surf, p1, p2, stroke, w=2)
+
+    elif mood == "smile":
+        # curve (polyline)
         pts = []
-        for i in range(0, 31):
-            t = i / 30
-            px = x + int(t * w)
-            # parabol cười
-            py = y + int(h*0.55 + (t-0.5)*(t-0.5) * h*1.0)
-            pts.append((px, py))
+        for i in range(0, 21):
+            u = i / 20
+            x = cx - w*0.22 + u * w*0.44
+            y = cy + w*0.05 + (u - 0.5)**2 * w*0.20 + wig
+            pts.append((x, y))
         for i in range(len(pts)-1):
-            draw_glow_line(base, pts[i], pts[i+1], neon, width=8, glow=14)
+            aa_line(surf, pts[i], pts[i+1], stroke, w=2)
 
     elif mood == "sad":
-        # cung buồn (úp ngược)
         pts = []
-        for i in range(0, 31):
-            t = i / 30
-            px = x + int(t * w)
-            py = y + int(h*0.45 - (t-0.5)*(t-0.5) * h*1.0)
-            pts.append((px, py))
+        for i in range(0, 21):
+            u = i / 20
+            x = cx - w*0.22 + u * w*0.44
+            y = cy - w*0.05 - (u - 0.5)**2 * w*0.20 + wig
+            pts.append((x, y))
         for i in range(len(pts)-1):
-            draw_glow_line(base, pts[i], pts[i+1], neon, width=8, glow=14)
+            aa_line(surf, pts[i], pts[i+1], stroke, w=2)
 
-    else:
-        # ngang
-        p1 = (x + int(w*0.15), cy)
-        p2 = (x + int(w*0.85), cy)
-        draw_glow_line(base, p1, p2, neon, width=10, glow=14)
+    elif mood == "open":
+        # small open mouth
+        mw = int(w * 0.22)
+        mh = int(w * 0.14 + abs(wig)*2)
+        rect = (int(cx - mw/2), int(cy - mh/2), mw, mh)
+        soft_glow_ellipse(surf, rect, base_alpha=14, layers=7)
+        aa_ellipse(surf, rect, stroke, filled=False)
 
-# ---------------------------
-# Main demo
-# ---------------------------
+def draw_face(surf, W, H, t, idx):
+    # black bg already
+    cx, cy = W//2, H//2
+    scale = min(W, H)
 
+    # layout
+    eye_y = cy - int(scale * 0.10)
+    eye_dx = int(scale * 0.18)
+    eye_size = (int(scale*0.12), int(scale*0.07))
+
+    nose_y = cy + int(scale * 0.03)
+    mouth_y = cy + int(scale * 0.18)
+
+    b = blink_value(t, period=4.0 + (idx % 3) * 0.6)
+
+    # per-face styles roughly matching your 3x3 idea
+    if idx == 1:   # cute neutral
+        draw_eye(surf, (cx-eye_dx, eye_y), eye_size, t, "normal", blink=b*0.3)
+        draw_eye(surf, (cx+eye_dx, eye_y), eye_size, t, "normal", blink=b*0.3)
+        draw_nose(surf, (cx, nose_y), scale*0.30, t, "round")
+        draw_mouth(surf, (cx, mouth_y), scale*0.45, t, "smile")
+
+    elif idx == 2: # sad droopy
+        draw_eye(surf, (cx-eye_dx, eye_y), (eye_size[0], int(eye_size[1]*0.75)), t, "down", blink=b*0.25)
+        draw_eye(surf, (cx+eye_dx, eye_y), (eye_size[0], int(eye_size[1]*0.75)), t, "down", blink=b*0.25)
+        draw_nose(surf, (cx, nose_y), scale*0.34, t, "triangle")
+        draw_mouth(surf, (cx, mouth_y), scale*0.45, t, "sad")
+
+    elif idx == 3: # side look
+        draw_eye(surf, (cx-eye_dx, eye_y), eye_size, t, "side", blink=b*0.25)
+        draw_eye(surf, (cx+eye_dx, eye_y), eye_size, t, "side", blink=b*0.25)
+        draw_nose(surf, (cx, nose_y), scale*0.30, t, "round")
+        draw_mouth(surf, (cx, mouth_y), scale*0.42, t, "neutral")
+
+    elif idx == 4: # suspicious (one eye smaller)
+        draw_eye(surf, (cx-eye_dx, eye_y), (int(eye_size[0]*0.75), eye_size[1]), t, "normal", blink=b*0.15)
+        draw_eye(surf, (cx+eye_dx, eye_y), (int(eye_size[0]*1.05), eye_size[1]), t, "up", blink=b*0.15)
+        draw_nose(surf, (cx, nose_y), scale*0.28, t, "tiny")
+        draw_mouth(surf, (cx, mouth_y), scale*0.44, t, "neutral")
+
+    elif idx == 5: # shocked / worried
+        draw_eye(surf, (cx-eye_dx, eye_y), (eye_size[0], int(eye_size[1]*1.15)), t, "up", blink=b*0.05)
+        draw_eye(surf, (cx+eye_dx, eye_y), (eye_size[0], int(eye_size[1]*1.15)), t, "up", blink=b*0.05)
+        draw_nose(surf, (cx, nose_y), scale*0.36, t, "triangle")
+        draw_mouth(surf, (cx, mouth_y), scale*0.46, t, "open")
+
+    elif idx == 6: # friendly smile with smaller pupils
+        draw_eye(surf, (cx-eye_dx, eye_y), (int(eye_size[0]*0.9), eye_size[1]), t, "normal", blink=b*0.35)
+        draw_eye(surf, (cx+eye_dx, eye_y), (int(eye_size[0]*0.9), eye_size[1]), t, "normal", blink=b*0.35)
+        draw_nose(surf, (cx, nose_y), scale*0.33, t, "round")
+        draw_mouth(surf, (cx, mouth_y), scale*0.48, t, "smile")
+
+    elif idx == 7: # wink
+        # left wink: force blink high
+        draw_eye(surf, (cx-eye_dx, eye_y), eye_size, t, "wink", blink=0.9)
+        draw_eye(surf, (cx+eye_dx, eye_y), eye_size, t, "normal", blink=b*0.25)
+        draw_nose(surf, (cx, nose_y), scale*0.26, t, "tiny")
+        draw_mouth(surf, (cx, mouth_y), scale*0.44, t, "smile")
+
+    elif idx == 8: # big nose + neutral mouth
+        draw_eye(surf, (cx-eye_dx, eye_y), (int(eye_size[0]*0.85), eye_size[1]), t, "normal", blink=b*0.2)
+        draw_eye(surf, (cx+eye_dx, eye_y), (int(eye_size[0]*0.85), eye_size[1]), t, "normal", blink=b*0.2)
+        draw_nose(surf, (cx, nose_y), scale*0.40, t, "triangle")
+        draw_mouth(surf, (cx, mouth_y), scale*0.40, t, "neutral")
+
+    elif idx == 9: # laughing / open smile
+        draw_eye(surf, (cx-eye_dx, eye_y), (int(eye_size[0]*0.95), int(eye_size[1]*0.65)), t, "normal", blink=b*0.45)
+        draw_eye(surf, (cx+eye_dx, eye_y), (int(eye_size[0]*0.95), int(eye_size[1]*0.65)), t, "normal", blink=b*0.45)
+        draw_nose(surf, (cx, nose_y), scale*0.34, t, "round")
+        draw_mouth(surf, (cx, mouth_y), scale*0.52, t, "open")
+
+# --------------------------
+# Main
+# --------------------------
 def main():
     pygame.init()
 
-    # Fullscreen trên Pi
     screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
     W, H = screen.get_size()
     clock = pygame.time.Clock()
 
-    # Màu nền + neon
-    bg = (0, 0, 0)
-    neon = (40, 140, 255, 255)  # xanh dương robot
-
-    # Layout mắt to full screen
-    eye_r = int(min(W, H) * 0.17)
-    iris_r = int(eye_r * 0.42)
-    pupil_r = int(eye_r * 0.18)
-
-    left_eye = (W//2 - int(eye_r*1.6), H//2 - int(eye_r*0.2))
-    right_eye = (W//2 + int(eye_r*1.6), H//2 - int(eye_r*0.2))
-
-    mouth_rect = (W//2 - int(W*0.20), H//2 + int(H*0.20), int(W*0.40), int(H*0.18))
-
-    mood = "smile"
+    idx = 1
     t = 0.0
-
     running = True
+
+    # pre-create transparent layer for alpha drawings
+    layer = pygame.Surface((W, H), pygame.SRCALPHA)
+
     while running:
         dt = clock.tick(60) / 1000.0
         t += dt
@@ -183,30 +256,17 @@ def main():
             if e.type == pygame.KEYDOWN:
                 if e.key == pygame.K_ESCAPE:
                     running = False
-                if e.key == pygame.K_1:
-                    mood = "smile"
-                if e.key == pygame.K_2:
-                    mood = "neutral"
-                if e.key == pygame.K_3:
-                    mood = "sad"
+                if pygame.K_1 <= e.key <= pygame.K_9:
+                    idx = e.key - pygame.K_0
 
-        screen.fill(bg)
+        # background
+        screen.fill((0, 0, 0))
+        layer.fill((0, 0, 0, 0))
 
-        # target nhìn: bay vòng vòng để thấy mắt chuyển động
-        target_x = W//2 + int(math.cos(t*1.4) * W*0.18)
-        target_y = H//2 + int(math.sin(t*1.1) * H*0.14)
+        draw_face(layer, W, H, t, idx)
 
-        # Vẽ eyeball 3D trước
-        draw_eye_3d(screen, left_eye, eye_r, iris_r, pupil_r, neon)
-        draw_eye_3d(screen, right_eye, eye_r, iris_r, pupil_r, neon)
-
-        # Vẽ iris+pupil sau
-        draw_iris_and_pupil(screen, left_eye, eye_r, iris_r, pupil_r, (target_x, target_y), neon)
-        draw_iris_and_pupil(screen, right_eye, eye_r, iris_r, pupil_r, (target_x, target_y), neon)
-
-        # Miệng 3D neon
-        draw_mouth_3d(screen, mouth_rect, mood, neon)
-
+        # blit alpha layer
+        screen.blit(layer, (0, 0))
         pygame.display.flip()
 
     pygame.quit()
