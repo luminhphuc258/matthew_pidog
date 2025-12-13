@@ -43,7 +43,7 @@ class MatthewPidogBootClass:
         self.tail_pin  = tail_pin  or [11]
 
         # giữ nguyên như code bạn
-        self.head_init_angles = head_init_angles or [20, -45, -90]
+        self.head_init_angles = head_init_angles or [80, -70, 90]
         self.tail_init_angle  = tail_init_angle or [30]
 
         self.force_head_port = force_head_port
