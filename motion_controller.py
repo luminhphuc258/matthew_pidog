@@ -35,7 +35,7 @@ class MotionController:
         head_p8_fixed=30,
         head_p9_fixed=-60,
         head_p10_a=0,
-        head_p10_b=80,
+        head_p10_b=-80,
     ):
         self.pose_file = Path(pose_file)
         self.servo_ports = [f"P{i}" for i in range(12)]
