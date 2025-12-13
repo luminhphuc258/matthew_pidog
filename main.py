@@ -11,7 +11,6 @@ from face_display import FaceDisplay
 from web_dashboard import WebDashboard
 from active_listener import ActiveListener
 
-
 POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
 
 
@@ -33,8 +32,9 @@ def main():
     motion = MotionController(pose_file=POSE_FILE)
     motion.boot()
 
-    # 3) face display
-    face = FaceDisplay()
+    # 3) face display (pygame thread)
+    face = FaceDisplay(default_face="what_is_it", fps=60, fullscreen=True)
+    face.start()
 
     # 5) active listening
     listener = ActiveListener(
@@ -81,21 +81,19 @@ def main():
             else:
                 manual["move"] = None
 
-            # emotion mapping
+            # face mapping (NEW)
             if decision == "FORWARD":
-                face.set_emotion("happy")
+                face.set_face("music")          # đang chạy vui vui
             elif decision in ("TURN_LEFT", "TURN_RIGHT"):
-                face.set_emotion("neutral")
+                face.set_face("what_is_it")     # đang quan sát
             elif decision in ("BACK",):
-                face.set_emotion("angry")
+                face.set_face("angry")          # lùi vì nguy hiểm
             else:
-                face.set_emotion("sad" if st.cam_blocked or st.imu_bump else "neutral")
+                # STOP / UNKNOWN
+                face.set_face("sad" if (st.cam_blocked or st.imu_bump) else "what_is_it")
 
             # act
             motion.execute(decision)
-
-            # tick face UI
-            face.tick()
 
             time.sleep(0.02)
 
@@ -105,7 +103,7 @@ def main():
         listener.stop()
         planner.stop()
         motion.close()
-        face.close()
+        face.stop()
 
 
 if __name__ == "__main__":
