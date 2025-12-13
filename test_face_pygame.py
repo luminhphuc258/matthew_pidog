@@ -3,72 +3,104 @@
 
 import os
 import time
-
-# Ưu tiên chạy không cần X11: KMSDRM -> FBCON -> DIRECTFB
-# (phải set trước khi import pygame)
-if "DISPLAY" not in os.environ:
-    os.environ.setdefault("SDL_VIDEODRIVER", "kmsdrm")
-os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
-
 import pygame
 
+# chạy trong desktop session (AnyDesk / màn hình thật)
+os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
-def draw_face(screen, emo: str):
+# ================= FACE DRAW =================
+
+def draw_face(screen, mode: str):
     w, h = screen.get_size()
-    screen.fill((20, 20, 20))  # background
+    screen.fill((245, 230, 215))  # nền sáng giống ảnh
 
     amber = (255, 170, 0)
+    dark = (20, 20, 20)
 
-    # eye positions
-    cx1, cx2 = int(w * 0.35), int(w * 0.65)
-    cy = int(h * 0.45)
-    eye_w, eye_h = int(w * 0.08), int(h * 0.14)
+    # head
+    head_r = int(min(w, h) * 0.28)
+    cx, cy = w // 2, h // 2 - 30
+    pygame.draw.circle(screen, dark, (cx, cy), head_r)
 
-    def eye(cx, tilt=0):
-        y_shift = int(tilt / 2)
-        rect = pygame.Rect(cx - eye_w, cy - eye_h + y_shift, eye_w * 2, eye_h * 2)
-        pygame.draw.rect(screen, amber, rect, border_radius=8)
+    # eyes base
+    eye_w, eye_h = int(head_r * 0.35), int(head_r * 0.45)
+    ex1, ex2 = cx - eye_w, cx + eye_w
+    ey = cy - eye_h // 4
 
-    # mouth
-    def mouth_line(y, thickness=10):
-        mx0, mx1 = int(w * 0.40), int(w * 0.60)
-        pygame.draw.rect(screen, amber, pygame.Rect(mx0, y, mx1 - mx0, thickness), border_radius=6)
+    def eye(cx, tilt=0, scale=1.0):
+        rect = pygame.Rect(
+            cx - int(eye_w * scale),
+            ey - int(eye_h * scale) + tilt,
+            int(eye_w * 2 * scale),
+            int(eye_h * 2 * scale),
+        )
+        pygame.draw.ellipse(screen, amber, rect)
+        pygame.draw.ellipse(screen, (255, 210, 120), rect, 3)
 
-    if emo == "happy":
-        eye(cx1, 0); eye(cx2, 0)
-        mouth_line(int(h * 0.72), thickness=10)
-    elif emo == "sad":
-        eye(cx1, -10); eye(cx2, 10)
-        mouth_line(int(h * 0.75), thickness=10)
-    elif emo == "angry":
-        eye(cx1, 18); eye(cx2, -18)
-        mouth_line(int(h * 0.68), thickness=14)
-    else:
-        eye(cx1, 0); eye(cx2, 0)
+    def mouth(y, happy=True):
+        width = int(head_r * 0.9)
+        height = 14
+        mx = cx - width // 2
+        pygame.draw.rect(
+            screen,
+            amber,
+            pygame.Rect(mx, y, width, height),
+            border_radius=6,
+        )
+
+    # ================= MODES =================
+
+    if mode == "friend":
+        eye(ex1, 0, 1.0); eye(ex2, 0, 1.0)
+        mouth(cy + int(head_r * 0.55))
+
+    elif mode == "follow":
+        eye(ex1, 0, 0.9); eye(ex2, 0, 0.9)
+
+    elif mode == "petting":
+        eye(ex1, 15, 0.6); eye(ex2, 15, 0.6)
+
+    elif mode == "companion":
+        eye(ex1, -5, 0.8); eye(ex2, -5, 0.8)
+        mouth(cy + int(head_r * 0.6))
+
+    elif mode == "guardian":
+        eye(ex1, 0, 0.7); eye(ex2, 0, 0.7)
+
+    elif mode == "angry":
+        eye(ex1, -15, 0.8); eye(ex2, 15, 0.8)
+        mouth(cy + int(head_r * 0.5), happy=False)
 
     pygame.display.flip()
 
 
-def main():
-    print("[TEST] init pygame...")
-    pygame.init()
+# ================= TEST LOOP =================
 
-    # fullscreen theo màn hình thật (WaveShare)
+def main():
+    pygame.init()
     screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
     pygame.mouse.set_visible(False)
 
-    emotions = ["neutral", "happy", "angry", "sad"]
+    modes = [
+        "friend",
+        "follow",
+        "petting",
+        "companion",
+        "guardian",
+        "angry",
+    ]
 
-    print("[TEST] cycling face... (Ctrl+C to stop)")
+    print("Robot Face Test – Ctrl+C to exit")
+
     while True:
-        for emo in emotions:
-            print("FACE:", emo)
+        for m in modes:
+            print("FACE:", m)
             t0 = time.time()
             while time.time() - t0 < 2.0:
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
+                for e in pygame.event.get():
+                    if e.type == pygame.QUIT:
                         return
-                draw_face(screen, emo)
+                draw_face(screen, m)
                 time.sleep(0.05)
 
 
