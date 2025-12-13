@@ -1,364 +1,291 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, math, time
+import os, time, math
 import pygame
 
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
-# =========================
-# 9 emotions (full-screen)
-# =========================
-# 1: Joy (tongue out)
-# 2: Angry (arms crossed)
-# 3: Big Laugh (open mouth)
-# 4: Surprise (hands up)
-# 5: Shy (hands clasp)
-# 6: Love (big smile)
-# 7: Bleh (tongue long)
-# 8: Cry (hands on cheeks)
-# 9: Shock (hands near cheeks, mouth small)
-EMO_KEYS = ["joy","angry","laugh","surprise","shy","love","bleh","cry","shock"]
+BLUE = (60, 200, 255)     # neon blue
+BLUE2 = (120, 230, 255)   # highlight
+BLACK = (0, 0, 0)
 
+EMOS = [
+    "happy_open",    # 1
+    "happy_closed",  # 2
+    "love",          # 3
+    "confused",      # 4
+    "surprised",     # 5
+    "talking",       # 6
+    "laugh",         # 7
+    "sleep",         # 8
+    "sad",           # 9
+    "pain",          # 10
+    "dead",          # 11
+    "angry",         # 12
+]
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
-
-def draw_round_rect(surf, color, rect, radius=12, width=0):
+def draw_round_rect(surf, color, rect, radius, width=0):
     pygame.draw.rect(surf, color, rect, width, border_radius=radius)
 
+def draw_text(screen, text, x, y, size, color=BLUE):
+    font = pygame.font.SysFont("DejaVu Sans", size, bold=True)
+    img = font.render(text, True, color)
+    r = img.get_rect(center=(x, y))
+    screen.blit(img, r)
 
-class DoraFaceRenderer:
-    def __init__(self, screen):
-        self.screen = screen
-        self.W, self.H = screen.get_size()
+def eye_open(screen, cx, cy, w, h, pupil_dx=0, pupil_dy=0, blink=0.0):
+    """
+    blink: 0..1 (0 open, 1 closed)
+    """
+    # eyelid effect by shrinking height
+    hh = max(6, int(h * (1.0 - 0.92 * blink)))
+    rect = pygame.Rect(cx - w//2, cy - hh//2, w, hh)
 
-        # palette
-        self.BG = (200, 230, 250)          # light blue
-        self.BLUE = (60, 165, 225)
-        self.WHITE = (245, 245, 245)
-        self.BLACK = (25, 25, 25)
-        self.RED = (235, 65, 65)
-        self.PINK = (255, 170, 190)
-        self.MOUTH_RED = (200, 50, 55)
-        self.TONGUE = (255, 135, 125)
-        self.COLLAR = (230, 40, 45)
-        self.BELL = (245, 210, 75)
+    # eye outline + fill
+    draw_round_rect(screen, BLUE, rect, radius=hh//2, width=4)
+    # pupil
+    pr = max(5, int(min(w, hh) * 0.13))
+    px = clamp(cx + pupil_dx, rect.left + pr + 6, rect.right - pr - 6)
+    py = clamp(cy + pupil_dy, rect.top + pr + 6, rect.bottom - pr - 6)
+    pygame.draw.circle(screen, BLUE, (px, py), pr)
+    pygame.draw.circle(screen, BLUE2, (px - pr//3, py - pr//3), max(2, pr//3))
 
-        self.cx = self.W // 2
-        self.cy = int(self.H * 0.47)
-        self.size = int(min(self.W, self.H) * 0.78)
+def eye_happy_arc(screen, cx, cy, w, h):
+    # smiling closed eye arc
+    rect = pygame.Rect(cx - w//2, cy - h//2, w, h)
+    pygame.draw.arc(screen, BLUE, rect, math.pi, 2*math.pi, 6)
 
-        self.head_r = int(self.size * 0.34)
-        self.face_r = int(self.size * 0.27)
+def eye_x(screen, cx, cy, size):
+    s = size
+    pygame.draw.line(screen, BLUE, (cx - s, cy - s), (cx + s, cy + s), 6)
+    pygame.draw.line(screen, BLUE, (cx - s, cy + s), (cx + s, cy - s), 6)
 
-        # eye geometry
-        self.eye_w = int(self.size * 0.11)
-        self.eye_h = int(self.size * 0.15)
-        self.eye_gap = int(self.size * 0.03)
-        self.eye_y = self.cy - int(self.size * 0.15)
+def eye_spiral(screen, cx, cy, r, t):
+    # spiral using polyline
+    pts = []
+    turns = 3.5
+    for i in range(80):
+        a = (i/80.0) * turns * 2*math.pi + t*2.2
+        rr = (i/80.0) * r
+        pts.append((cx + rr*math.cos(a), cy + rr*math.sin(a)))
+    pygame.draw.lines(screen, BLUE, False, pts, 4)
 
-        self.nose_r = int(self.size * 0.040)
-        self.nose_c = (self.cx, self.cy - int(self.size * 0.02))
+def mouth_smile(screen, cx, cy, w, h, open_amount=0.0):
+    # smile arc + optional open
+    rect = pygame.Rect(cx - w//2, cy - h//2, w, h)
+    pygame.draw.arc(screen, BLUE, rect, 0, math.pi, 6)
+    if open_amount > 0:
+        ow = int(w*0.25)
+        oh = int(h*0.35*open_amount)
+        if oh > 3:
+            pygame.draw.ellipse(screen, BLUE, pygame.Rect(cx-ow//2, cy+int(h*0.15), ow, oh), 4)
 
-        # animation
-        self.t0 = time.time()
+def mouth_open(screen, cx, cy, w, h):
+    rect = pygame.Rect(cx - w//2, cy - h//2, w, h)
+    draw_round_rect(screen, BLUE, rect, radius=h//2, width=6)
 
-    def pupil_offset(self, mode: str, t: float):
-        """
-        Animated eye movement. Returns (dx, dy) in pixels for pupil.
-        Different modes have different "personality".
-        """
-        base = int(self.size * 0.012)
-        # global subtle drift left-right
-        dx = int(math.sin(t * 1.8) * base)
-        dy = int(math.sin(t * 1.1 + 1.7) * (base // 2))
+def mouth_sad(screen, cx, cy, w, h):
+    rect = pygame.Rect(cx - w//2, cy - h//2, w, h)
+    pygame.draw.arc(screen, BLUE, rect, math.pi, 2*math.pi, 6)
 
-        if mode in ("angry",):
-            dx += int(math.sin(t * 6.0) * (base // 2))
-            dy += int(math.sin(t * 7.0) * (base // 3))
-        elif mode in ("cry", "shock"):
-            dy += int(abs(math.sin(t * 3.5)) * base)
-        elif mode in ("shy",):
-            dx -= int(abs(math.sin(t * 2.2)) * base)
-            dy += int(abs(math.sin(t * 2.6)) * (base // 2))
-        elif mode in ("love", "laugh"):
-            dx += int(math.sin(t * 2.6) * base)
-        elif mode in ("bleh", "joy"):
-            dx += int(math.sin(t * 3.0) * base)
-            dy -= int(math.sin(t * 2.4) * (base // 2))
+def mouth_flat(screen, cx, cy, w):
+    pygame.draw.line(screen, BLUE, (cx - w//2, cy), (cx + w//2, cy), 6)
 
-        return dx, dy
+def mouth_wavy(screen, cx, cy, w, amp, t):
+    pts=[]
+    for i in range(50):
+        x = cx - w//2 + (i/49.0)*w
+        y = cy + math.sin(t*7 + i*0.35)*amp
+        pts.append((x,y))
+    pygame.draw.lines(screen, BLUE, False, pts, 6)
 
-    def _draw_head_base(self):
-        s = self.screen
-        s.fill(self.BG)
+def bubble(screen, x, y, w, h, text, blink_on=True):
+    # simple speech bubble
+    rect = pygame.Rect(x - w//2, y - h//2, w, h)
+    draw_round_rect(screen, BLUE, rect, radius=18, width=4)
+    if blink_on:
+        draw_text(screen, text, x, y, size=int(h*0.55), color=BLUE)
 
-        # head blue
-        pygame.draw.circle(s, self.BLUE, (self.cx, self.cy), self.head_r)
+def hearts(screen, cx, cy, t):
+    # two hearts pulsing
+    pulse = 1.0 + 0.12*math.sin(t*4.0)
+    for dx in (-70, 70):
+        r = int(26*pulse)
+        x = cx + dx
+        y = cy - 20
+        # heart made of 2 circles + triangle-ish polygon
+        pygame.draw.circle(screen, BLUE, (x - r//2, y), r//2)
+        pygame.draw.circle(screen, BLUE, (x + r//2, y), r//2)
+        pts = [(x - r, y), (x + r, y), (x, y + int(r*1.4))]
+        pygame.draw.polygon(screen, BLUE, pts)
 
-        # face white
-        pygame.draw.circle(s, self.WHITE, (self.cx, self.cy + int(self.size*0.02)), self.face_r)
+def ex_mark(screen, cx, cy, t):
+    # ! bouncing
+    bounce = int(8*abs(math.sin(t*3)))
+    draw_text(screen, "!", cx, cy - 120 - bounce, 64, BLUE)
 
-        # nose
-        pygame.draw.circle(s, self.RED, self.nose_c, self.nose_r)
-        pygame.draw.circle(s, (255,255,255), (self.nose_c[0]-int(self.nose_r*0.35), self.nose_c[1]-int(self.nose_r*0.35)),
-                           max(2, int(self.nose_r*0.25)))
+def q_mark(screen, cx, cy, t):
+    # ? wobble
+    wob = int(6*math.sin(t*3))
+    draw_text(screen, "?", cx, cy - 120 + wob, 64, BLUE)
 
-        # center line
-        pygame.draw.line(s, self.BLACK,
-                         (self.cx, self.cy + int(self.size*0.01)),
-                         (self.cx, self.cy + int(self.size*0.22)), 3)
+def zzz(screen, cx, cy, t):
+    # Zzz floating
+    for i in range(3):
+        yy = cy - 140 - i*40 - int(10*math.sin(t*2 + i))
+        xx = cx + 120 + i*28
+        draw_text(screen, "Z", xx, yy, 42 - i*6, BLUE)
 
-        # cheeks blush
-        blush_r = int(self.size*0.045)
-        pygame.draw.circle(s, self.PINK, (self.cx - int(self.size*0.18), self.cy + int(self.size*0.05)), blush_r)
-        pygame.draw.circle(s, self.PINK, (self.cx + int(self.size*0.18), self.cy + int(self.size*0.05)), blush_r)
+def tear(screen, x, y, t):
+    # tear drop bobbing
+    bob = int(6*math.sin(t*3))
+    rect = pygame.Rect(x-10, y+15+bob, 20, 34)
+    pygame.draw.ellipse(screen, BLUE, rect, 3)
 
-        # whiskers
-        whisk_y0 = self.cy + int(self.size*0.02)
-        for i in (-1, 0, 1):
-            yy = whisk_y0 + i * int(self.size*0.06)
-            pygame.draw.line(s, self.BLACK,
-                             (self.cx - int(self.size*0.28), yy),
-                             (self.cx - int(self.size*0.07), yy), 3)
-            pygame.draw.line(s, self.BLACK,
-                             (self.cx + int(self.size*0.07), yy),
-                             (self.cx + int(self.size*0.28), yy), 3)
+# ===================== 12 face animations =====================
 
-        # collar + bell
-        collar_y = self.cy + int(self.size*0.33)
-        collar_h = int(self.size*0.055)
-        collar_rect = pygame.Rect(self.cx - int(self.size*0.26), collar_y, int(self.size*0.52), collar_h)
-        draw_round_rect(s, self.COLLAR, collar_rect, radius=int(collar_h*0.45))
+def render_face(screen, emo, t):
+    W, H = screen.get_size()
+    screen.fill(BLACK)
 
-        bell_c = (self.cx, collar_y + collar_h + int(self.size*0.03))
-        bell_r = int(self.size*0.05)
-        pygame.draw.circle(s, self.BELL, bell_c, bell_r)
-        pygame.draw.circle(s, self.BLACK, bell_c, bell_r, 2)
-        pygame.draw.line(s, self.BLACK, (bell_c[0]-bell_r, bell_c[1]-int(bell_r*0.2)),
-                         (bell_c[0]+bell_r, bell_c[1]-int(bell_r*0.2)), 2)
-        pygame.draw.circle(s, self.BLACK, (bell_c[0], bell_c[1]+int(bell_r*0.25)), max(2, int(bell_r*0.12)))
+    cx, cy = W//2, H//2
 
-    def _eye_rects(self):
-        left = pygame.Rect(self.cx - self.eye_gap - self.eye_w, self.eye_y, self.eye_w, self.eye_h)
-        right = pygame.Rect(self.cx + self.eye_gap, self.eye_y, self.eye_w, self.eye_h)
-        return left, right
+    # scale big
+    eye_y = cy - int(H*0.10)
+    mouth_y = cy + int(H*0.16)
 
-    def _draw_eyes_open(self, mode: str, t: float, squint=0):
-        s = self.screen
-        left, right = self._eye_rects()
+    eye_w = int(W*0.22)
+    eye_h = int(H*0.16)
+    gap = int(W*0.12)
 
-        # squint shrinks height
-        if squint != 0:
-            shrink = int(abs(squint) * self.eye_h)
-            left = pygame.Rect(left.x, left.y + shrink//2, left.w, max(8, left.h - shrink))
-            right = pygame.Rect(right.x, right.y + shrink//2, right.w, max(8, right.h - shrink))
+    lx = cx - gap
+    rx = cx + gap
 
-        pygame.draw.ellipse(s, self.WHITE, left)
-        pygame.draw.ellipse(s, self.WHITE, right)
-        pygame.draw.ellipse(s, self.BLACK, left, 3)
-        pygame.draw.ellipse(s, self.BLACK, right, 3)
+    mouth_w = int(W*0.38)
+    mouth_h = int(H*0.18)
 
-        dx, dy = self.pupil_offset(mode, t)
-        pr = max(4, int(self.size*0.018))
+    # animation common
+    blink = 0.0
+    # periodic blink (short)
+    phase = (t % 3.5)
+    if phase < 0.12:
+        blink = 1.0 - phase/0.12
+    elif phase < 0.24:
+        blink = (phase-0.12)/0.12
+    else:
+        blink = 0.0
+    blink = clamp(blink, 0.0, 1.0)
 
-        # pupils inside bounds
-        lx = clamp(left.centerx + dx, left.left + pr + 3, left.right - pr - 3)
-        ly = clamp(left.centery + dy, left.top + pr + 3, left.bottom - pr - 3)
-        rx = clamp(right.centerx + dx, right.left + pr + 3, right.right - pr - 3)
-        ry = clamp(right.centery + dy, right.top + pr + 3, right.bottom - pr - 3)
+    # pupils drifting
+    pdx = int(math.sin(t*1.8) * (W*0.01))
+    pdy = int(math.sin(t*1.2 + 1.2) * (H*0.01))
 
-        pygame.draw.circle(s, self.BLACK, (lx, ly), pr)
-        pygame.draw.circle(s, self.BLACK, (rx, ry), pr)
+    if emo == "happy_open":
+        eye_open(screen, lx, eye_y, eye_w, eye_h, pdx, pdy, blink)
+        eye_open(screen, rx, eye_y, eye_w, eye_h, pdx, pdy, blink)
+        mouth_smile(screen, cx, mouth_y, mouth_w, mouth_h, open_amount=0.25+0.15*math.sin(t*4))
 
-        # highlights
-        pygame.draw.circle(s, (255,255,255), (lx-int(pr*0.4), ly-int(pr*0.4)), max(2, pr//3))
-        pygame.draw.circle(s, (255,255,255), (rx-int(pr*0.4), ry-int(pr*0.4)), max(2, pr//3))
+    elif emo == "happy_closed":
+        eye_happy_arc(screen, lx, eye_y, int(eye_w*0.9), int(eye_h*0.9))
+        eye_happy_arc(screen, rx, eye_y, int(eye_w*0.9), int(eye_h*0.9))
+        mouth_smile(screen, cx, mouth_y, mouth_w, mouth_h, open_amount=0.15)
 
-    def _draw_eyes_happy_closed(self):
-        s = self.screen
-        left, right = self._eye_rects()
-        # arcs
-        rect_l = pygame.Rect(left.x-2, left.y+int(left.h*0.35), left.w+4, int(left.h*0.7))
-        rect_r = pygame.Rect(right.x-2, right.y+int(right.h*0.35), right.w+4, int(right.h*0.7))
-        pygame.draw.arc(s, self.BLACK, rect_l, math.pi, 2*math.pi, 4)
-        pygame.draw.arc(s, self.BLACK, rect_r, math.pi, 2*math.pi, 4)
+    elif emo == "love":
+        # heart eyes
+        hearts(screen, cx, eye_y, t)
+        mouth_smile(screen, cx, mouth_y, mouth_w, mouth_h, open_amount=0.22)
 
-    def _draw_brows_angry(self):
-        s = self.screen
-        left, right = self._eye_rects()
-        pygame.draw.line(s, self.BLACK,
-                         (left.left, left.top + int(left.h*0.25)),
-                         (left.right, left.top - int(left.h*0.10)), 4)
-        pygame.draw.line(s, self.BLACK,
-                         (right.left, right.top - int(right.h*0.10)),
-                         (right.right, right.top + int(right.h*0.25)), 4)
+    elif emo == "confused":
+        eye_open(screen, lx, eye_y, eye_w, eye_h, -pdx, pdy, blink*0.4)
+        eye_open(screen, rx, eye_y, eye_w, eye_h, pdx, -pdy, blink*0.4)
+        mouth_flat(screen, cx, mouth_y, int(mouth_w*0.55))
+        q_mark(screen, cx, cy, t)
 
-    def _mouth_open(self, big=True):
-        s = self.screen
-        w = int(self.size * (0.36 if big else 0.24))
-        h = int(self.size * (0.22 if big else 0.16))
-        rect = pygame.Rect(self.cx - w//2, self.cy + int(self.size*0.10), w, h)
-        pygame.draw.ellipse(s, self.MOUTH_RED, rect)
-        pygame.draw.ellipse(s, self.BLACK, rect, 4)
+    elif emo == "surprised":
+        eye_open(screen, lx, eye_y, eye_w, eye_h, 0, 0, 0.0)
+        eye_open(screen, rx, eye_y, eye_w, eye_h, 0, 0, 0.0)
+        mouth_open(screen, cx, mouth_y, int(mouth_w*0.28), int(mouth_h*0.22))
+        ex_mark(screen, cx, cy, t)
 
-        # tongue
-        tr = pygame.Rect(rect.x + int(rect.w*0.22), rect.y + int(rect.h*0.50), int(rect.w*0.56), int(rect.h*0.50))
-        pygame.draw.ellipse(s, self.TONGUE, tr)
-        pygame.draw.ellipse(s, self.BLACK, tr, 2)
+    elif emo == "talking":
+        eye_open(screen, lx, eye_y, eye_w, eye_h, pdx, pdy, blink)
+        eye_open(screen, rx, eye_y, eye_w, eye_h, pdx, pdy, blink)
+        # mouth talk (open/close)
+        amt = 0.35 + 0.35*(0.5+0.5*math.sin(t*8.0))
+        mouth_open(screen, cx, mouth_y, int(mouth_w*0.22), int(mouth_h*0.22*amt))
+        bubble(screen, cx+int(W*0.22), cy-int(H*0.23), int(W*0.18), int(H*0.12), "...", blink_on=(math.sin(t*3)>-0.2))
 
-    def _mouth_big_laugh(self):
-        self._mouth_open(big=True)
+    elif emo == "laugh":
+        # squint laughing
+        eye_happy_arc(screen, lx, eye_y, int(eye_w*0.9), int(eye_h*0.9))
+        eye_happy_arc(screen, rx, eye_y, int(eye_w*0.9), int(eye_h*0.9))
+        mouth_smile(screen, cx, mouth_y, mouth_w, mouth_h, open_amount=0.55+0.15*math.sin(t*5.0))
 
-    def _mouth_small_o(self):
-        s = self.screen
-        rect = pygame.Rect(self.cx - int(self.size*0.08), self.cy + int(self.size*0.12), int(self.size*0.16), int(self.size*0.18))
-        pygame.draw.ellipse(s, self.MOUTH_RED, rect)
-        pygame.draw.ellipse(s, self.BLACK, rect, 4)
+    elif emo == "sleep":
+        # sleepy eyes + zzz
+        eye_happy_arc(screen, lx, eye_y+20, int(eye_w*0.85), int(eye_h*0.85))
+        eye_happy_arc(screen, rx, eye_y+20, int(eye_w*0.85), int(eye_h*0.85))
+        mouth_flat(screen, cx, mouth_y, int(mouth_w*0.35))
+        zzz(screen, cx, cy, t)
 
-    def _mouth_smile(self):
-        s = self.screen
-        rect = pygame.Rect(self.cx - int(self.size*0.18), self.cy + int(self.size*0.12), int(self.size*0.36), int(self.size*0.22))
-        pygame.draw.arc(s, self.BLACK, rect, 0, math.pi, 5)
+    elif emo == "sad":
+        eye_open(screen, lx, eye_y, eye_w, eye_h, -pdx, pdy+10, blink*0.2)
+        eye_open(screen, rx, eye_y, eye_w, eye_h, pdx, pdy+10, blink*0.2)
+        mouth_sad(screen, cx, mouth_y+10, mouth_w, mouth_h)
+        tear(screen, lx+int(eye_w*0.18), eye_y+int(eye_h*0.05), t)
 
-    def _draw_hands(self, pose: str):
-        """
-        Simple hands/arms in front.
-        """
-        s = self.screen
-        hand_r = int(self.size*0.06)
-        y = self.cy + int(self.size*0.22)
+    elif emo == "pain":
+        # tight eyes + wavy mouth (shake)
+        # eyes squeezed
+        eye_happy_arc(screen, lx, eye_y+10, int(eye_w*0.85), int(eye_h*0.60))
+        eye_happy_arc(screen, rx, eye_y+10, int(eye_w*0.85), int(eye_h*0.60))
+        mouth_wavy(screen, cx, mouth_y, int(mouth_w*0.55), amp=int(H*0.018), t=t)
+        # little "stress lines"
+        for i in range(6):
+            x = cx - int(W*0.20) + i*int(W*0.07)
+            pygame.draw.line(screen, BLUE, (x, eye_y-int(H*0.12)), (x+10, eye_y-int(H*0.15)), 3)
 
-        if pose == "hands_up":  # surprise
-            x1 = self.cx - int(self.size*0.22)
-            x2 = self.cx + int(self.size*0.22)
-            pygame.draw.circle(s, self.WHITE, (x1, y), hand_r)
-            pygame.draw.circle(s, self.WHITE, (x2, y), hand_r)
-            pygame.draw.circle(s, self.BLACK, (x1, y), hand_r, 2)
-            pygame.draw.circle(s, self.BLACK, (x2, y), hand_r, 2)
+    elif emo == "dead":
+        eye_x(screen, lx, eye_y, int(W*0.03))
+        eye_x(screen, rx, eye_y, int(W*0.03))
+        mouth_flat(screen, cx, mouth_y, int(mouth_w*0.40))
 
-        elif pose == "clasp":  # shy
-            x1 = self.cx - int(self.size*0.05)
-            x2 = self.cx + int(self.size*0.05)
-            pygame.draw.circle(s, self.WHITE, (x1, y), hand_r)
-            pygame.draw.circle(s, self.WHITE, (x2, y), hand_r)
-            pygame.draw.circle(s, self.BLACK, (x1, y), hand_r, 2)
-            pygame.draw.circle(s, self.BLACK, (x2, y), hand_r, 2)
+    elif emo == "angry":
+        # sharp angry eyes (squint + pupils jitter)
+        jitter = int(math.sin(t*12)*6)
+        eye_open(screen, lx, eye_y, eye_w, eye_h, pdx+jitter, pdy, blink*0.1)
+        eye_open(screen, rx, eye_y, eye_w, eye_h, pdx-jitter, pdy, blink*0.1)
+        # eyebrows
+        pygame.draw.line(screen, BLUE, (lx-int(eye_w*0.55), eye_y-int(eye_h*0.55)),
+                         (lx+int(eye_w*0.55), eye_y-int(eye_h*0.15)), 7)
+        pygame.draw.line(screen, BLUE, (rx-int(eye_w*0.55), eye_y-int(eye_h*0.15)),
+                         (rx+int(eye_w*0.55), eye_y-int(eye_h*0.55)), 7)
+        mouth_wavy(screen, cx, mouth_y+10, int(mouth_w*0.55), amp=int(H*0.010), t=t)
 
-        elif pose == "cheeks":  # cry / shock
-            y2 = self.cy + int(self.size*0.10)
-            x1 = self.cx - int(self.size*0.24)
-            x2 = self.cx + int(self.size*0.24)
-            pygame.draw.circle(s, self.WHITE, (x1, y2), hand_r)
-            pygame.draw.circle(s, self.WHITE, (x2, y2), hand_r)
-            pygame.draw.circle(s, self.BLACK, (x1, y2), hand_r, 2)
-            pygame.draw.circle(s, self.BLACK, (x2, y2), hand_r, 2)
+    pygame.display.flip()
 
-        elif pose == "cross":  # angry arms crossed
-            # two blue arms crossing
-            arm_w = int(self.size*0.24)
-            arm_h = int(self.size*0.08)
-            r = int(arm_h*0.45)
-            rect1 = pygame.Rect(self.cx - arm_w, self.cy + int(self.size*0.24), arm_w, arm_h)
-            rect2 = pygame.Rect(self.cx, self.cy + int(self.size*0.24), arm_w, arm_h)
-            draw_round_rect(s, self.BLUE, rect1, radius=r)
-            draw_round_rect(s, self.BLUE, rect2, radius=r)
 
-            # hands tips
-            pygame.draw.circle(s, self.WHITE, (rect1.left+int(arm_h*0.5), rect1.centery), hand_r)
-            pygame.draw.circle(s, self.WHITE, (rect2.right-int(arm_h*0.5), rect2.centery), hand_r)
-            pygame.draw.circle(s, self.BLACK, (rect1.left+int(arm_h*0.5), rect1.centery), hand_r, 2)
-            pygame.draw.circle(s, self.BLACK, (rect2.right-int(arm_h*0.5), rect2.centery), hand_r, 2)
-
-    def _draw_tears(self, t: float):
-        s = self.screen
-        left, right = self._eye_rects()
-        # tears under eyes
-        for ex in (left.centerx, right.centerx):
-            drop_w = int(self.size*0.035)
-            drop_h = int(self.size*0.07)
-            yy = left.bottom + int(self.size*0.02) + int(abs(math.sin(t*3.0))*6)
-            rect = pygame.Rect(ex - drop_w//2, yy, drop_w, drop_h)
-            pygame.draw.ellipse(s, (170, 220, 255), rect)
-            pygame.draw.ellipse(s, (110, 170, 235), rect, 2)
-
-    def render(self, emo: str):
-        t = time.time() - self.t0
-
-        self._draw_head_base()
-
-        # 9 unique expressions (Dora-like)
-        if emo == "joy":
-            # squint + big mouth + tongue out
-            self._draw_eyes_open(emo, t, squint=0.15)
-            self._mouth_open(big=True)
-
-        elif emo == "angry":
-            self._draw_eyes_open(emo, t, squint=0.25)
-            self._draw_brows_angry()
-            self._mouth_smile()
-            self._draw_hands("cross")
-
-        elif emo == "laugh":
-            self._draw_eyes_open(emo, t, squint=0.0)
-            self._mouth_big_laugh()
-
-        elif emo == "surprise":
-            self._draw_eyes_open(emo, t, squint=0.0)
-            self._mouth_small_o()
-            self._draw_hands("hands_up")
-
-        elif emo == "shy":
-            self._draw_eyes_open(emo, t, squint=0.10)
-            self._mouth_smile()
-            self._draw_hands("clasp")
-
-        elif emo == "love":
-            # happy closed eyes + big smile mouth
-            self._draw_eyes_happy_closed()
-            self._mouth_big_laugh()
-            self._draw_hands("clasp")
-
-        elif emo == "bleh":
-            self._draw_eyes_open(emo, t, squint=0.0)
-            # long tongue
-            self._mouth_open(big=False)
-            s = self.screen
-            tongue_rect = pygame.Rect(self.cx - int(self.size*0.06), self.cy + int(self.size*0.22), int(self.size*0.12), int(self.size*0.18))
-            pygame.draw.ellipse(s, self.TONGUE, tongue_rect)
-            pygame.draw.ellipse(s, self.BLACK, tongue_rect, 2)
-
-        elif emo == "cry":
-            self._draw_eyes_open(emo, t, squint=0.15)
-            self._mouth_open(big=True)
-            self._draw_hands("cheeks")
-            self._draw_tears(t)
-
-        elif emo == "shock":
-            self._draw_eyes_open(emo, t, squint=0.0)
-            self._mouth_small_o()
-            self._draw_hands("cheeks")
-
-        pygame.display.flip()
-
+# ===================== Main test app =====================
 
 def main():
     pygame.init()
     screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
     pygame.mouse.set_visible(False)
 
-    renderer = DoraFaceRenderer(screen)
-
     idx = 0
     auto = True
-    last_switch = time.time()
+    last = time.time()
 
-    print("Dora-like 9 emotions fullscreen")
-    print("Keys: 1..9 switch | Space toggle auto | ESC quit")
+    print("12 animated faces | 1..12 select | SPACE auto | ESC quit")
 
     while True:
+        now = time.time()
+        t = now
+
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
                 return
@@ -367,18 +294,29 @@ def main():
                     return
                 if e.key == pygame.K_SPACE:
                     auto = not auto
-                # number keys 1..9
+
+                # 1..9
                 if pygame.K_1 <= e.key <= pygame.K_9:
                     idx = e.key - pygame.K_1
                     auto = False
+                # 0 = 10
+                if e.key == pygame.K_0:
+                    idx = 9
+                    auto = False
+                # - = 11, = = 12  (fallback mapping on small keyboard)
+                if e.key == pygame.K_MINUS:
+                    idx = 10
+                    auto = False
+                if e.key == pygame.K_EQUALS:
+                    idx = 11
+                    auto = False
 
-        if auto and (time.time() - last_switch) > 2.0:
-            idx = (idx + 1) % 9
-            last_switch = time.time()
+        if auto and (now - last) > 2.0:
+            idx = (idx + 1) % len(EMOS)
+            last = now
 
-        emo = EMO_KEYS[idx]
-        renderer.render(emo)
-        time.sleep(0.02)
+        render_face(screen, EMOS[idx], t)
+        time.sleep(0.016)  # ~60fps
 
 
 if __name__ == "__main__":
