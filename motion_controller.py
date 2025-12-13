@@ -33,9 +33,9 @@ class MotionController:
         p1_invert=True,
         # ===== head controller =====
         head_p8_fixed=30,
-        head_p9_fixed=-80,
-        head_p10_a=-80,
-        head_p10_b=-85,
+        head_p9_fixed=-60,
+        head_p10_a=-8,
+        head_p10_b=-10,
     ):
         self.pose_file = Path(pose_file)
         self.servo_ports = [f"P{i}" for i in range(12)]
