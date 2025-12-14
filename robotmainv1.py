@@ -8,31 +8,25 @@ import subprocess
 from pathlib import Path
 from typing import Optional, Dict
 
-import serial  # đọc UART trực tiếp giống script test của bạn
+import serial
 
 from perception_planner import PerceptionPlanner
 from motion_controller import MotionController
 from face_display import FaceDisplay
 from web_dashboard import WebDashboard
 from active_listener import ActiveListener
+from dogbehavior import DogBehavior
 
 POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
 
-# Audio default theo /etc/asound.conf
 MIC_DEVICE = "default"
 SPK_DEVICE = "default"
 
-# UART (ESP32 / N8R8 -> Pi)
 SERIAL_PORT = "/dev/ttyUSB0"
 BAUD_RATE = 115200
 
-# Thresholds
 SAFE_DIST_CM = 50.0
 EMERGENCY_STOP_CM = 10.0
-
-# Special behavior
-STAND_HOLD_SEC = 3.0
-TURN_RIGHT_SEC = 5.0
 
 
 def run(cmd):
@@ -47,10 +41,6 @@ def set_volumes():
 
 
 class UartSensorReader:
-    """
-    Đọc line format: timestamp,temp,humidity,ultrasonic_cm
-    Lưu latest values + error để show lên web.
-    """
     def __init__(self, port: str, baud: int):
         self.port = port
         self.baud = baud
@@ -157,12 +147,28 @@ class UartSensorReader:
             pass
 
 
+def listener_is_recording(listener) -> bool:
+    # cố gắng bắt nhiều tên biến khác nhau
+    for k in ("is_recording", "recording", "mic_recording", "mic_busy", "listening"):
+        v = getattr(listener, k, None)
+        if isinstance(v, bool):
+            return v
+    return False
+
+
+def listener_is_playing(listener) -> bool:
+    for k in ("is_playing", "playing", "speaking", "speaker_busy", "tts_playing"):
+        v = getattr(listener, k, None)
+        if isinstance(v, bool):
+            return v
+    return False
+
+
 def main():
-    # giảm conflict audio backend
     os.environ.setdefault("SDL_AUDIODRIVER", "alsa")
     os.environ.setdefault("JACK_NO_START_SERVER", "1")
 
-    # 1) perception (camera sectors + minimap)
+    # 1) perception (camera)
     planner = PerceptionPlanner(
         cam_dev="/dev/video0",
         w=640, h=480, fps=30,
@@ -180,12 +186,10 @@ def main():
     planner.start()
 
     # 2) motion
-    # ✅ giả định MotionController đã có enable_head_wiggle=False để khỏi lắc P10
-    motion = MotionController(pose_file=POSE_FILE)
+    motion = MotionController(pose_file=POSE_FILE, enable_head_wiggle=False)
     motion.boot()
     set_volumes()
-
-    dog = motion.dog  # pidog instance
+    dog = motion.dog
 
     def set_led(mode: str, color: str, bps: float = 0.6):
         try:
@@ -209,9 +213,19 @@ def main():
     )
     listener.start()
 
-    # 5) UART direct reader (để chắc chắn web có data)
+    # 5) UART reader
     sensor = UartSensorReader(SERIAL_PORT, BAUD_RATE)
     sensor.start()
+
+    # 6) DogBehavior
+    behavior = DogBehavior(
+        safe_dist_cm=SAFE_DIST_CM,
+        emergency_stop_cm=EMERGENCY_STOP_CM,
+        rotate_sec=5.0,            # xoay 360 trong 5s
+        walk_rest_every_sec=60.0,  # 1 phút
+        rest_sit_sec=3.0,          # sit 3s
+        after_avoid_cooldown_sec=1.2
+    )
 
     # manual override
     manual = {"move": None, "ts": 0.0}
@@ -224,28 +238,17 @@ def main():
     def manual_active():
         return manual["move"] and (time.time() - manual["ts"] < manual_timeout_sec)
 
-    # special sequence state
-    seq = {"state": "NONE", "until": 0.0}  # NONE | STAND | TURN_RIGHT
-
-    def block_density(sectors):
-        n = len(sectors)
-        c = n // 2
-        center3 = [sectors[c-1], sectors[c], sectors[c+1]] if n >= 3 else sectors
-        center_blocked = sum(1 for s in center3 if s == "blocked")
-        total_blocked = sum(1 for s in sectors if s == "blocked")
-        return center_blocked, total_blocked
-
     def status_payload():
         st = planner.get_status_dict()
         st.update(sensor.snapshot())
         st.update({
             "manual_move": manual["move"],
             "manual_active": bool(manual_active()),
-            "listener_transcript": listener.last_transcript,
-            "listener_label": listener.last_label,
-            "mode": "AUTO",
-            "seq_state": seq["state"],
-            "seq_until": seq["until"],
+            "listener_transcript": getattr(listener, "last_transcript", None),
+            "listener_label": getattr(listener, "last_label", None),
+            "listener_is_recording": listener_is_recording(listener),
+            "listener_is_playing": listener_is_playing(listener),
+            "behavior_state": behavior.state,
         })
         return st
 
@@ -259,9 +262,17 @@ def main():
     )
     threading.Thread(target=web.run, daemon=True).start()
 
+    # helper: SIT action (motion.execute không có SIT)
+    def do_sit_blocking():
+        try:
+            if dog:
+                dog.do_action("sit", speed=20)
+                dog.wait_all_done()
+        except Exception:
+            pass
+
     # main loop
     try:
-        # init led
         set_led("breath", "white", bps=0.4)
 
         while True:
@@ -269,75 +280,43 @@ def main():
             s = sensor.snapshot()
             dist = s.get("uart_dist_cm")
 
-            # base decision from camera
-            decision = st.decision
-
-            # manual override
-            if manual_active():
-                decision = manual["move"]
-            else:
+            # manual
+            m_active = bool(manual_active())
+            m_move = manual["move"] if m_active else None
+            if not m_active:
                 manual["move"] = None
 
-            # evaluate obstacles
-            center_blocked, total_blocked = block_density(st.sector_states)
-            now = time.time()
+            # listener states
+            rec = listener_is_recording(listener)
+            play = listener_is_playing(listener)
 
-            # emergency stop by ultrasonic
-            if dist is not None and dist < EMERGENCY_STOP_CM:
-                decision = "STOP"
+            # base camera decision (chỉ là input cho behavior; behavior sẽ ưu tiên sensor trước)
+            camera_decision = st.decision
 
-            # trigger when too many obstacles ahead OR too near
-            trigger = (center_blocked >= 2) or (dist is not None and dist < SAFE_DIST_CM)
+            out = behavior.update(
+                dist_cm=dist,
+                sector_states=st.sector_states,
+                camera_decision=camera_decision,
+                cam_blocked=st.cam_blocked,
+                imu_bump=st.imu_bump,
+                manual_active=m_active,
+                manual_move=m_move,
+                is_recording=rec,
+                is_playing=play,
+            )
 
-            # sequence: stand 3s -> turn right 5s -> resume
-            if seq["state"] == "NONE":
-                if (not manual_active()) and trigger:
-                    seq["state"] = "STAND"
-                    seq["until"] = now + STAND_HOLD_SEC
-
-            elif seq["state"] == "STAND":
-                if now >= seq["until"]:
-                    seq["state"] = "TURN_RIGHT"
-                    seq["until"] = now + TURN_RIGHT_SEC
-
-            elif seq["state"] == "TURN_RIGHT":
-                if now >= seq["until"]:
-                    seq["state"] = "NONE"
-                    seq["until"] = 0.0
-
-            # apply sequence override (không override manual)
-            if not manual_active():
-                if seq["state"] == "STAND":
-                    decision = "STOP"
-                elif seq["state"] == "TURN_RIGHT":
-                    decision = "TURN_RIGHT"
-
-            # LED rule
-            danger = (seq["state"] != "NONE") or (center_blocked >= 2) or (dist is not None and dist < SAFE_DIST_CM)
-            if danger:
-                set_led("breath", "red", bps=0.8)
-            else:
-                if decision == "FORWARD":
-                    set_led("breath", "blue", bps=0.6)
-                elif decision in ("TURN_LEFT", "TURN_RIGHT"):
-                    set_led("breath", "white", bps=0.6)
-                else:
-                    set_led("breath", "white", bps=0.4)
-
-            # face (optional)
-            if danger:
-                face.set_face("angry")
-            elif decision == "FORWARD":
-                face.set_face("music")
-            elif decision in ("TURN_LEFT", "TURN_RIGHT"):
-                face.set_face("what_is_it")
-            elif decision == "BACK":
-                face.set_face("angry")
-            else:
-                face.set_face("what_is_it")
+            # LED + face
+            set_led(out.led_mode, out.led_color, bps=out.led_bps)
+            try:
+                face.set_face(out.face)
+            except Exception:
+                pass
 
             # ACT
-            motion.execute(decision)
+            if out.decision == "SIT":
+                do_sit_blocking()
+            else:
+                motion.execute(out.decision)
 
             time.sleep(0.02)
 
