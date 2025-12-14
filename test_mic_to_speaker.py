@@ -36,14 +36,32 @@ def record_wav(path: str, sec: int) -> bool:
     cmd = ["arecord","-D",MIC_DEVICE,"-f",FMT,"-r",str(RATE),"-c",str(CH),"-d",str(int(sec)),"-q",path]
     return subprocess.run(cmd, check=False).returncode == 0
 
+def free_snd_devices():
+    # tìm PID đang giữ /dev/snd/*
+    p = subprocess.run(["sudo", "fuser", "-v", "/dev/snd/*"],
+                       text=True, capture_output=True)
+    txt = (p.stdout or "") + (p.stderr or "")
+    pids = sorted(set(re.findall(r"\b(\d+)\b", txt)), key=int)
+
+    # không có ai giữ
+    if not pids:
+        return
+
+    print("[AUDIO] busy, killing:", " ".join(pids))
+    for pid in pids:
+        subprocess.run(["sudo", "kill", "-9", pid], check=False)
+    time.sleep(0.2)
 
 def play_wav(device: str, path: str) -> bool:
+    free_snd_devices()  # ✅ giải phóng trước khi play
+
     for _ in range(12):
         p = subprocess.run(["aplay", "-D", device, "-q", path], check=False)
         if p.returncode == 0:
             return True
         time.sleep(0.2)
     return False
+
 
 
 def main():
