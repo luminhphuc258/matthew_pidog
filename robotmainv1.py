@@ -47,15 +47,21 @@ def main():
         w=640, h=480, fps=30,
         sector_n=9,
         map_h=80,
-        serial_port="/dev/ttyUSB0",
-        baud=115200,
         safe_dist_cm=50.0,
         emergency_stop_cm=10.0,
         enable_imu=False,
         enable_camera=True,
-        uart_debug=False,
-        uart_filter_window=5,
-    )
+
+        # ✅ MQTT config (đúng như bạn đang dùng trên N8R8)
+        enable_mqtt=True,
+        mqtt_host="rfff7184.ala.us-east-1.emqxsl.com",
+        mqtt_port=8883,
+        mqtt_user="robot_matthew",
+        mqtt_pass="29061992abCD!yesokmen",
+        mqtt_topic="/pidog/sensorhubdata",
+        mqtt_client_id="pidog-perception-pi",
+        mqtt_debug=False,
+        )
     planner.start()
 
     # 2) motion
