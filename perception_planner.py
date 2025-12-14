@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import time, threading, math
+import time, threading
 from dataclasses import dataclass, asdict
 from typing import List, Optional, Tuple, Dict
 
@@ -26,6 +26,8 @@ class PerceptionState:
     decision: str                    # "FORWARD" | "TURN_LEFT" | "TURN_RIGHT" | "BACK" | "STOP"
     reason: str
     uart_dist_cm: Optional[float] = None
+    uart_temp_c: Optional[float] = None
+    uart_humid: Optional[float] = None
     imu_bump: bool = False
     cam_blocked: bool = False
 
@@ -34,7 +36,7 @@ class PerceptionPlanner:
     """
     - Camera obstacle detection -> sector_states (9 sectors)
     - Mini-map 2D time history (robot at center logic: dùng history dạng "rows")
-    - UART ESP32 (distance/temp/humid/ultra)
+    - UART ESP32 (timestamp,temp,humid,ultrasonic_cm)
     - IMU bump (optional)
     -> compute decision
     """
@@ -76,11 +78,15 @@ class PerceptionPlanner:
         self.current_decision = "STOP"
         self.reason = "init"
 
+        # UART readings
         self.uart_dist_cm: Optional[float] = None
+        self.uart_temp_c: Optional[float] = None
+        self.uart_humid: Optional[float] = None
+
         self.imu_bump = False
         self.cam_blocked = False
 
-        # tuning (copy tinh thần từ script bạn đã test)
+        # tuning
         self.CANNY1, self.CANNY2 = 50, 150
         self.DILATE_ITER = 2
         self.BLUR_K = (5, 5)
@@ -127,6 +133,8 @@ class PerceptionPlanner:
                 decision=self.current_decision,
                 reason=self.reason,
                 uart_dist_cm=self.uart_dist_cm,
+                uart_temp_c=self.uart_temp_c,
+                uart_humid=self.uart_humid,
                 imu_bump=self.imu_bump,
                 cam_blocked=self.cam_blocked,
             )
@@ -136,7 +144,6 @@ class PerceptionPlanner:
         return asdict(st)
 
     def get_mini_map_png(self) -> bytes:
-        # trả PNG bytes để web render
         with self._lock:
             vis = cv2.resize(self.mini_map, (self.map_w * 10, self.map_h * 10), interpolation=cv2.INTER_NEAREST)
         ok, buf = cv2.imencode(".png", vis)
@@ -165,7 +172,6 @@ class PerceptionPlanner:
         return mask
 
     def _update_mini_map(self, sector_states: List[str]):
-        # shift up, append new row
         self.mini_map[:-1, :, :] = self.mini_map[1:, :, :]
         row = np.zeros((self.map_w, 3), dtype=np.uint8)
         for i, s in enumerate(sector_states):
@@ -178,13 +184,12 @@ class PerceptionPlanner:
         self.mini_map[-1, :, :] = row
 
     def _compute_decision(self, sector_states: List[str]) -> Tuple[str, str]:
-        # rule-based đơn giản + ổn định
         if self.imu_bump:
             return "BACK", "IMU_BUMP"
         if self.cam_blocked:
             return "BACK", "CAM_BLOCKED"
+
         if self.uart_dist_cm is not None and self.uart_dist_cm < self.safe_dist_cm:
-            # gần quá thì ưu tiên rẽ
             left = sector_states[: self.sector_n // 3]
             center = sector_states[self.sector_n // 3: 2 * self.sector_n // 3]
             right = sector_states[2 * self.sector_n // 3:]
@@ -195,14 +200,13 @@ class PerceptionPlanner:
                 return "TURN_RIGHT", f"UART_NEAR({self.uart_dist_cm:.1f}cm)"
             return "STOP", f"UART_NEAR_BLOCKED({self.uart_dist_cm:.1f}cm)"
 
-        # camera sectors
         center_idx = self.sector_n // 2
         center = sector_states[center_idx]
         if center == "free":
             return "FORWARD", "CENTER_FREE"
-        # ưu tiên rẽ về phía nhiều free hơn
+
         left_free = sum(1 for s in sector_states[:center_idx] if s == "free")
-        right_free = sum(1 for s in sector_states[center_idx+1:] if s == "free")
+        right_free = sum(1 for s in sector_states[center_idx + 1:] if s == "free")
         if left_free > right_free:
             return "TURN_LEFT", "CENTER_BLOCKED_LEFT_MORE_FREE"
         if right_free > left_free:
@@ -228,18 +232,15 @@ class PerceptionPlanner:
                 time.sleep(0.02)
                 continue
 
-            # --- blocked detector (blur + edge density) ---
             gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             lap_var = cv2.Laplacian(gray_full, cv2.CV_64F).var()
             edges_full = cv2.Canny(gray_full, self.CANNY1, self.CANNY2)
             edge_density = float(np.mean(edges_full > 0))
             self.cam_blocked = (lap_var < self.BLUR_TH) or (edge_density < self.EDGE_LOW_TH)
 
-            # --- floor ROI detect ---
             gray = cv2.GaussianBlur(gray_full, self.BLUR_K, 0)
             edges = cv2.Canny(gray, self.CANNY1, self.CANNY2)
             edges = cv2.dilate(edges, kernel, iterations=self.DILATE_ITER)
-
             edges = cv2.bitwise_and(edges, edges, mask=floor_mask)
 
             contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -259,28 +260,23 @@ class PerceptionPlanner:
                 aspect = (h / float(w + 1e-6))
                 if aspect < self.MIN_ASPECT:
                     continue
-                # near bottom => likely obstacle on floor
                 if (y + h) / float(H) < self.NEAR_BOTTOM:
                     continue
                 bboxes.append((x, y, w, h, area))
 
-            # mark sectors blocked by bbox coverage
             for (x, y, ww, hh, area) in bboxes:
                 x_center = x + ww / 2.0
                 sec = int(x_center / W * self.sector_n)
                 sec = max(0, min(self.sector_n - 1, sec))
                 sector_states[sec] = "blocked"
 
-                # very near -> also block neighbors
                 if (area / float(W * H) > self.NEAR_AREA_RATIO) or (hh / float(H) > self.NEAR_H_RATIO):
                     for nb in (sec - 1, sec + 1):
                         if 0 <= nb < self.sector_n:
                             sector_states[nb] = "blocked"
 
-                # draw bbox
                 cv2.rectangle(frame, (x, y), (x + ww, y + hh), (0, 0, 255), 2)
 
-            # draw sectors overlay
             y0 = int(H * 0.05)
             y1 = int(H * 0.12)
             for i, s in enumerate(sector_states):
@@ -289,9 +285,10 @@ class PerceptionPlanner:
                 color = (0, 200, 0) if s == "free" else (0, 0, 255)
                 overlay = frame.copy()
                 cv2.rectangle(overlay, (x0, y0), (x1, y1), color, -1)
-                frame[y0:y1, x0:x1] = cv2.addWeighted(overlay[y0:y1, x0:x1], 0.35, frame[y0:y1, x0:x1], 0.65, 0)
+                frame[y0:y1, x0:x1] = cv2.addWeighted(
+                    overlay[y0:y1, x0:x1], 0.35, frame[y0:y1, x0:x1], 0.65, 0
+                )
 
-            # mini-map update
             with self._lock:
                 self.current_sector_states = sector_states
                 self._update_mini_map(sector_states)
@@ -299,7 +296,6 @@ class PerceptionPlanner:
                 decision, reason = self._compute_decision(sector_states)
                 self.current_decision, self.reason = decision, reason
 
-                # encode jpeg for web
                 ok2, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
                 if ok2:
                     self.latest_jpeg = buf.tobytes()
@@ -323,12 +319,19 @@ class PerceptionPlanner:
                 line = raw.decode("utf-8", errors="ignore").strip()
                 if not line:
                     continue
-                # format bạn từng log: timestamp,temp,humidity,ultrasonic_cm  :contentReference[oaicite:2]{index=2}
+
+                # format: timestamp,temp,humidity,ultrasonic_cm
                 parts = line.split(",")
                 if len(parts) >= 4:
+                    temp_c = float(parts[1])
+                    humid = float(parts[2])
                     dist = float(parts[3])
+
                     with self._lock:
+                        self.uart_temp_c = temp_c
+                        self.uart_humid = humid
                         self.uart_dist_cm = dist
+
             except Exception:
                 time.sleep(0.05)
 
@@ -338,7 +341,6 @@ class PerceptionPlanner:
             pass
 
     def _imu_loop(self):
-        # optional: nếu bạn muốn bật bump logic giống script tổng hợp
         if SMBus is None:
             return
         try:
@@ -349,9 +351,7 @@ class PerceptionPlanner:
         last_bump = 0.0
         while not self._stop.is_set():
             try:
-                # TODO: bạn thay bằng register read SH3001 thật của bạn
-                # Hiện để placeholder “no bump”
-                bump = False
+                bump = False  # TODO: replace by real SH3001 bump logic
                 now = time.time()
                 if bump:
                     last_bump = now
