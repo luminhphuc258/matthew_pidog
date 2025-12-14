@@ -186,7 +186,7 @@ def main():
     planner.start()
 
     # 2) motion
-    motion = MotionController(pose_file=POSE_FILE, enable_head_wiggle=False)
+    motion = MotionController(pose_file=POSE_FILE)
     motion.boot()
     set_volumes()
     dog = motion.dog
