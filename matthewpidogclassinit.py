@@ -24,7 +24,7 @@ class MatthewPidogBootClass:
 
     def __init__(
         self,
-        speaker_device: str = "plughw:3,0",
+        speaker_device: str = "plughw:0,0",
         pose_file: str | Path = "pidog_pose_config.txt",
         leg_pins=None,
         head_pins=None,

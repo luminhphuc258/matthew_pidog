@@ -14,7 +14,7 @@ from motion_controller import MotionController
 POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
 
 # ====== chỉnh 2 cái này đúng với máy bạn ======
-MIC_DEVICE = "plughw:4,0"        # USB microphone
+MIC_DEVICE = "plughw:3,0"        # USB microphone
 SPEAKER_DEVICE = "plughw:0,0"    # Robot HAT / SunFounder speaker card
 # ============================================
 
@@ -46,22 +46,7 @@ def _prime_speaker(device: str):
     subprocess.run(["aplay", "-D", device, "-q", silence], check=False)
 
 
-def unlock_sunfounder_speaker(device: str) -> bool:
-    """
-    Thử mở khóa speaker theo 2 pin phổ biến:
-      - GPIO12 (googlevoicehat-soundcard)
-      - GPIO20 (hifiberry-dac)
-    """
-    for pin in (12, 20):
-        _set_gpio_high(pin)
-        _prime_speaker(device)
-        # test: nếu aplay prime chạy xong coi như ok
-        # (không có cách "confirm" tuyệt đối, nhưng thực tế đủ dùng)
-        print(f"[SPK] Tried unlock with GPIO{pin}")
-        return True
 
-    print("[SPK] Cannot unlock (missing pinctrl/raspi-gpio?)")
-    return False
 
 
 def record_wav(path: str, seconds: int):
@@ -84,14 +69,9 @@ def play_wav(path: str):
 
 
 def main():
-    # 1) boot motion (đúng cách bạn yêu cầu)
     motion = MotionController(pose_file=POSE_FILE)
-    motion.boot()
+    motion.boot()  # bên trong đã unlock speaker rồi
 
-    # 2) unlock speaker trước
-    unlock_sunfounder_speaker(SPEAKER_DEVICE)
-
-    # 3) record 4s rồi phát lại
     fd, wav_path = tempfile.mkstemp(suffix=".wav", prefix="mic_")
     os.close(fd)
 
@@ -103,12 +83,9 @@ def main():
     print("[TEST] Playing back to SunFounder speaker...")
     play_wav(wav_path)
 
-    try:
-        os.unlink(wav_path)
-    except Exception:
-        pass
-
+    os.unlink(wav_path)
     print("[DONE] Mic loopback finished.")
+
 
 
 if __name__ == "__main__":
