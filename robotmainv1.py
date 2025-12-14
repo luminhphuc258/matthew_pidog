@@ -44,10 +44,12 @@ def main():
 
     # 4) active listening (mic + speaker)
     listener = ActiveListener(
-        mic_device="plughw:4,0",
-        speaker_device="plughw:3,0",
-        threshold=2500,
-        nodejs_upload_url="https://embeddedprogramming-healtheworldserver.up.railway.app/upload_audio",
+    mic_device="default",
+    speaker_device="default",
+    threshold=2500,
+    cooldown_sec=1.0,
+    nodejs_upload_url="https://embeddedprogramming-healtheworldserver.up.railway.app/upload_audio",
+    debug=False,
     )
     listener.start()
 
@@ -108,6 +110,7 @@ def main():
     finally:
         print("[SHUTDOWN] Cleaning up...")
         listener.stop()
+        listener.join(2.0)
         planner.stop()
         motion.close()
         face.stop()

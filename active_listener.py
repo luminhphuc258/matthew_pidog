@@ -1,22 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, time, wave, struct, tempfile, subprocess
+import os
+import time
+import wave
+import struct
+import tempfile
+import subprocess
 import threading
+from typing import Optional, Dict, Callable
+
 import requests
-from typing import Optional, Dict
+from shutil import which as _which
 
 
 class ActiveListener:
     def __init__(
         self,
-        mic_device="plughw:3,0",
-        speaker_device="plughw:1,0",
-        sample_rate=16000,
-        detect_chunk_sec=1,
-        record_sec=4,
-        threshold=2500,
-        nodejs_upload_url="https://embeddedprogramming-healtheworldserver.up.railway.app/upload_audio",
+        mic_device: str = "default",
+        speaker_device: str = "default",
+        sample_rate: int = 16000,
+        detect_chunk_sec: int = 1,
+        record_sec: int = 4,
+        threshold: int = 2500,
+        cooldown_sec: float = 1.0,              # chống trigger spam
+        post_play_silence_sec: float = 0.6,     # ✅ đợi sau khi phát để mic không ăn tiếng loa
+        nodejs_upload_url: str = "https://embeddedprogramming-healtheworldserver.up.railway.app/upload_audio",
+        on_result: Optional[Callable[[str, str, Optional[str]], None]] = None,
+        debug: bool = False,
     ):
         self.mic_device = mic_device
         self.speaker_device = speaker_device
@@ -24,24 +35,46 @@ class ActiveListener:
         self.detect_chunk_sec = int(detect_chunk_sec)
         self.record_sec = int(record_sec)
         self.threshold = int(threshold)
+        self.cooldown_sec = float(cooldown_sec)
+        self.post_play_silence_sec = float(post_play_silence_sec)
         self.nodejs_upload_url = nodejs_upload_url
+        self.on_result = on_result
+        self.debug = bool(debug)
 
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
-        self.last_transcript = ""
-        self.last_label = ""
-        self.last_audio_url = None
+        # ✅ flag: đang phát âm thanh => không record
+        self._playing = threading.Event()
+
+        self.last_transcript: str = ""
+        self.last_label: str = ""
+        self.last_audio_url: Optional[str] = None
+        self.last_ts: float = 0.0
+
+    # ------------- public -------------
 
     def start(self):
+        if self._thread and self._thread.is_alive():
+            return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread = threading.Thread(target=self._loop, name="ActiveListener", daemon=True)
         self._thread.start()
 
     def stop(self):
         self._stop.set()
 
-    def _record_wav(self, filename, seconds):
+    def join(self, timeout: Optional[float] = 2.0):
+        if self._thread:
+            self._thread.join(timeout=timeout)
+
+    # ------------- utils -------------
+
+    def _log(self, *a):
+        if self.debug:
+            print("[LISTENER]", *a, flush=True)
+
+    def _record_wav(self, filename: str, seconds: int) -> bool:
         cmd = [
             "arecord",
             "-D", self.mic_device,
@@ -52,30 +85,31 @@ class ActiveListener:
             "-q",
             filename,
         ]
-        subprocess.run(cmd, check=False)
+        return subprocess.run(cmd, check=False).returncode == 0
 
-    def _get_max_amplitude(self, filename) -> int:
+    def _get_max_amplitude(self, filename: str) -> int:
         try:
             with wave.open(filename, "rb") as wf:
                 raw = wf.readframes(wf.getnframes())
                 if not raw:
                     return 0
             samples = struct.unpack("<" + "h" * (len(raw) // 2), raw)
-            return max(abs(s) for s in samples)
+            return max(abs(s) for s in samples) if samples else 0
         except Exception:
             return 0
 
-    def _upload(self, filepath) -> Optional[Dict]:
+    def _upload(self, wav_path: str) -> Optional[Dict]:
         try:
-            with open(filepath, "rb") as f:
+            with open(wav_path, "rb") as f:
                 files = {"audio": ("voice.wav", f, "audio/wav")}
                 resp = requests.post(self.nodejs_upload_url, files=files, timeout=60)
             resp.raise_for_status()
             return resp.json()
-        except Exception:
+        except Exception as e:
+            self._log("upload error:", e)
             return None
 
-    def _download(self, url) -> Optional[str]:
+    def _download(self, url: str) -> Optional[str]:
         try:
             r = requests.get(url, stream=True, timeout=60)
             r.raise_for_status()
@@ -86,42 +120,102 @@ class ActiveListener:
                     if chunk:
                         f.write(chunk)
             return path
-        except Exception:
+        except Exception as e:
+            self._log("download error:", e)
             return None
 
-    def _convert_mp3_to_wav(self, mp3_path):
-        wav_path = mp3_path.replace(".mp3", ".wav")
-        cmd = ["ffmpeg", "-y", "-i", mp3_path, "-ac", "1", "-ar", str(self.sample_rate), wav_path]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return wav_path
+    def _play_audio(self, filepath: str):
+    """
+    Tắt mic đúng bằng thời gian đang phát:
+    - set _playing trước khi play
+    - play BLOCKING (mpg123/aplay) => khi xong mới clear
+    - thêm post_play_silence_sec để tránh mic ăn lại đuôi âm
+    """
+    self._playing.set()
+    try:
+        # mp3 -> mpg123 (blocking)
+        if filepath.endswith(".mp3") and shutil_which("mpg123"):
+            subprocess.run(
+                ["mpg123", "-q", "-a", self.speaker_device, filepath],
+                check=False
+            )
+            return
 
-    def _play(self, filepath):
+        # fallback: mp3 -> wav -> aplay (blocking)
         if filepath.endswith(".mp3"):
-            filepath = self._convert_mp3_to_wav(filepath)
-        cmd = ["aplay", "-D", self.speaker_device, "-q", filepath]
-        subprocess.run(cmd, check=False)
+            wav_path = filepath[:-4] + ".wav"
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", filepath, "-ac", "1", "-ar", str(self.sample_rate), wav_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            filepath = wav_path
+
+        # wav -> aplay (blocking)
+        subprocess.run(["aplay", "-D", self.speaker_device, "-q", filepath], check=False)
+
+    finally:
+        # ✅ play xong mới bật mic lại
+        self._playing.clear()
+
+        # ✅ đệm thêm 0.3–1.0s tuỳ loa gần mic
+        if self.post_play_silence_sec > 0:
+            time.sleep(self.post_play_silence_sec)
+
+        # cleanup wav temp nếu có
+        if filepath.endswith(".wav") and "reply_" in os.path.basename(filepath):
+            try:
+                os.unlink(filepath)
+            except Exception:
+                pass
+
+
+    # ------------- main loop -------------
 
     def _loop(self):
-        while not self._stop.is_set():
-            # 1) detect
-            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            detect_file = tmp.name
-            tmp.close()
+        self._log("start", "mic=", self.mic_device, "spk=", self.speaker_device)
 
-            self._record_wav(detect_file, self.detect_chunk_sec)
-            level = self._get_max_amplitude(detect_file)
+        while not self._stop.is_set():
+            # ✅ nếu đang phát âm thanh => không ghi âm/detect
+            if self._playing.is_set():
+                time.sleep(0.05)
+                continue
+
+            # 1) detect chunk
+            fd, detect_file = tempfile.mkstemp(suffix=".wav", prefix="det_")
+            os.close(fd)
+
+            ok = self._record_wav(detect_file, self.detect_chunk_sec)
+            level = self._get_max_amplitude(detect_file) if ok else 0
             try:
                 os.unlink(detect_file)
             except Exception:
                 pass
 
+            if self.debug:
+                self._log("level=", level)
+
             if level < self.threshold:
+                time.sleep(0.03)
+                continue
+
+            # cooldown chống spam
+            now = time.time()
+            if now - self.last_ts < self.cooldown_sec:
                 time.sleep(0.05)
                 continue
 
-            # 2) record full sentence
+            # ✅ nếu vừa phát xong thì skip luôn (an toàn)
+            if self._playing.is_set():
+                time.sleep(0.05)
+                continue
+
+            # 2) record full
             fd, record_file = tempfile.mkstemp(suffix=".wav", prefix="voice_")
             os.close(fd)
+
+            self._log("TRIGGER -> recording", self.record_sec)
             self._record_wav(record_file, self.record_sec)
 
             # 3) upload
@@ -130,22 +224,36 @@ class ActiveListener:
                 os.unlink(record_file)
             except Exception:
                 pass
+
             if not resp:
-                time.sleep(0.2)
+                time.sleep(0.1)
                 continue
 
-            self.last_transcript = resp.get("transcript", "")
-            self.last_label = resp.get("label", "")
-            self.last_audio_url = resp.get("audio_url")
+            transcript = resp.get("transcript", "") or ""
+            label = resp.get("label", "") or ""
+            audio_url = resp.get("audio_url", None)
+
+            self.last_transcript = transcript
+            self.last_label = label
+            self.last_audio_url = audio_url
+            self.last_ts = time.time()
+
+            if self.on_result:
+                try:
+                    self.on_result(transcript, label, audio_url)
+                except Exception as e:
+                    self._log("on_result error:", e)
 
             # 4) download + play
-            if self.last_audio_url:
-                reply = self._download(self.last_audio_url)
+            if audio_url and not self._stop.is_set():
+                reply = self._download(audio_url)
                 if reply:
-                    self._play(reply)
+                    self._play_audio(reply)
                     try:
                         os.unlink(reply)
                     except Exception:
                         pass
 
-            time.sleep(0.2)
+            time.sleep(0.05)
+
+        self._log("stop")
