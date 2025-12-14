@@ -6,20 +6,18 @@ from perception_planner import PerceptionPlanner
 
 def main():
     planner = PerceptionPlanner(
-        cam_dev="/dev/video0",
-        w=640, h=480, fps=30,
-        sector_n=9,
-        map_h=80,
-        serial_port="/dev/ttyUSB0",   # đổi nếu ESP32 là /dev/ttyACM0
+        serial_port="/dev/ttyUSB0",
         baud=115200,
-        safe_dist_cm=50.0,
+        safe_dist_cm=10.0,        # chỉnh tuỳ bạn
+        enable_camera=False,      # ✅ tắt camera để test UART cho chắc
         enable_imu=False,
+        uart_debug=True,          # ✅ in raw UART giống code bạn test
+        uart_print_every=0.2,
     )
 
     planner.start()
-    print("Logging temp + humid + distance (Ctrl+C để dừng)")
-    print("UART format mong đợi: timestamp,temp,humidity,ultrasonic_cm")
-    print("-" * 80)
+    print("✅ Test SensorHub: temp/hum/dist (Ctrl+C để dừng)")
+    print("-" * 90)
 
     try:
         while True:
@@ -33,7 +31,7 @@ def main():
             )
             time.sleep(0.5)
     except KeyboardInterrupt:
-        print("Stopped.")
+        print("\n🛑 Stopped.")
     finally:
         planner.stop()
 
