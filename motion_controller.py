@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import json
-import time
-import random
-import threading
+import json, time, random, threading
 from pathlib import Path
 from typing import Optional
 
@@ -39,15 +36,10 @@ class MotionController:
         head_p9_fixed=-70,
         head_p10_a=70,
         head_p10_b=90,
-        head_p10_fixed=80,          # ✅ P10 đứng yên khi wiggle off
-        enable_head_wiggle=False,   # ✅ mặc định: không lắc P10
     ):
         self.pose_file = Path(pose_file)
         self.servo_ports = [f"P{i}" for i in range(12)]
         self.angle_min, self.angle_max = -90, 90
-
-        # head
-        self.enable_head_wiggle = bool(enable_head_wiggle)
 
         # leg pre-move params
         self.P5_START = p5_start
@@ -67,6 +59,7 @@ class MotionController:
         self.P3_TARGET = p3_target
 
         self.P1_INVERT = bool(p1_invert)
+
         self.DELAY = 0.05
 
         # head controller params
@@ -74,7 +67,6 @@ class MotionController:
         self.head_p9_fixed = head_p9_fixed
         self.head_p10_a = head_p10_a
         self.head_p10_b = head_p10_b
-        self.head_p10_fixed = head_p10_fixed
 
         self._dog = None
         self._head_stop_evt: Optional[threading.Event] = None
@@ -137,15 +129,17 @@ class MotionController:
         if settle_sec and settle_sec > 0:
             time.sleep(settle_sec)
 
-    # ---------------- boot sequence ----------------
+    # ---------------- boot sequence (NEW) ----------------
     def _pre_move_legs_before_pose(self):
         """
+        Làm đúng y như script bạn đưa:
         1) init P0..P7
         2) lock P4/P6
         3) move rear P5/P7 alternating
         4) set front hip P0/P2
         5) move front knee P1/P3 alternating (P1 invert)
         """
+        # init servos P0..P7
         s0 = Servo("P0")
         s1 = Servo("P1")
         s2 = Servo("P2")
@@ -221,14 +215,7 @@ class MotionController:
 
         time.sleep(0.3)
 
-    # ---------------- head controller ----------------
     def start_head_controller(self, write_interval=0.08, hold_range=(0.6, 1.6)):
-        """
-        ✅ Luôn giữ lực P8/P9
-        ✅ P10:
-           - enable_head_wiggle=True  -> flip giữa a/b
-           - enable_head_wiggle=False -> giữ cố định head_p10_fixed
-        """
         stop_evt = threading.Event()
         try:
             s8 = Servo("P8")
@@ -240,30 +227,17 @@ class MotionController:
         def worker():
             target = self.head_p10_b
             next_flip = time.time() + random.uniform(*hold_range)
-
             while not stop_evt.is_set():
                 now = time.time()
-
-                # luôn giữ P8/P9
+                if now >= next_flip:
+                    target = self.head_p10_a if target == self.head_p10_b else self.head_p10_b
+                    next_flip = now + random.uniform(*hold_range)
                 try:
                     s8.angle(self.clamp(self.head_p8_fixed))
                     s9.angle(self.clamp(self.head_p9_fixed))
+                    s10.angle(self.clamp(target))
                 except Exception:
                     pass
-
-                # xử lý P10
-                try:
-                    if self.enable_head_wiggle:
-                        if now >= next_flip:
-                            target = self.head_p10_a if target == self.head_p10_b else self.head_p10_b
-                            next_flip = now + random.uniform(*hold_range)
-                        s10.angle(self.clamp(target))
-                    else:
-                        # ✅ không lắc, giữ cố định
-                        s10.angle(self.clamp(self.head_p10_fixed))
-                except Exception:
-                    pass
-
                 time.sleep(write_interval)
 
         t = threading.Thread(target=worker, daemon=True)
@@ -272,16 +246,16 @@ class MotionController:
 
     def boot(self):
         """
-        BOOT FLOW:
-        A) pre-move legs (rear+front) with lock P4/P6
+        BOOT FLOW (NEW):
+        A) pre-move 4 legs (rear+front) with lock P4/P6
         B) apply pose from cfg (all servos)
         C) boot MatthewPidogBootClass -> stand
-        D) start head controller (P8/P9 giữ lực; P10 tùy flag)
+        D) start head controller
         """
         # A) pre-move legs
         self._pre_move_legs_before_pose()
 
-        # B) apply cfg pose
+        # B) apply cfg pose (all servos)
         cfg = self.load_pose_config()
         self.apply_pose_from_cfg(cfg, per_servo_delay=0.03, settle_sec=1.0)
 
@@ -303,7 +277,7 @@ class MotionController:
         except Exception:
             pass
 
-        # D) head controller (always on to keep P8/P9 torque)
+        # D) head lock/wiggle
         self._head_stop_evt, self._head_thread = self.start_head_controller()
 
     def close(self):
