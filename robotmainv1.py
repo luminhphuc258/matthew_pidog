@@ -19,12 +19,15 @@ from dogbehavior import DogBehavior
 
 POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
 
+# Audio default theo /etc/asound.conf
 MIC_DEVICE = "default"
 SPK_DEVICE = "default"
 
+# UART (ESP32 / N8R8 -> Pi)
 SERIAL_PORT = "/dev/ttyUSB0"
 BAUD_RATE = 115200
 
+# Thresholds
 SAFE_DIST_CM = 50.0
 EMERGENCY_STOP_CM = 10.0
 
@@ -41,6 +44,10 @@ def set_volumes():
 
 
 class UartSensorReader:
+    """
+    Đọc line format: timestamp,temp,humidity,ultrasonic_cm
+    Lưu latest values + timestamp để tính 'freshness'.
+    """
     def __init__(self, port: str, baud: int):
         self.port = port
         self.baud = baud
@@ -110,9 +117,10 @@ class UartSensorReader:
                 if not line:
                     continue
 
+                now = time.time()
                 with self._lock:
                     self.last_line = line
-                    self.last_rx_ts = time.time()
+                    self.last_rx_ts = now
 
                 parts = line.split(",")
                 if len(parts) != 4:
@@ -148,27 +156,41 @@ class UartSensorReader:
 
 
 def listener_is_recording(listener) -> bool:
-    # cố gắng bắt nhiều tên biến khác nhau
+    # bool flags
     for k in ("is_recording", "recording", "mic_recording", "mic_busy", "listening"):
         v = getattr(listener, k, None)
         if isinstance(v, bool):
             return v
+    # threading.Event flags
+    for k in ("record_evt", "recording_evt", "mic_evt", "listening_evt"):
+        ev = getattr(listener, k, None)
+        if hasattr(ev, "is_set"):
+            return bool(ev.is_set())
     return False
 
 
 def listener_is_playing(listener) -> bool:
+    # bool flags
     for k in ("is_playing", "playing", "speaking", "speaker_busy", "tts_playing"):
         v = getattr(listener, k, None)
         if isinstance(v, bool):
             return v
+    # threading.Event flags
+    for k in ("play_evt", "playing_evt", "speak_evt", "speaking_evt"):
+        ev = getattr(listener, k, None)
+        if hasattr(ev, "is_set"):
+            return bool(ev.is_set())
     return False
 
 
 def main():
+    # giảm conflict audio backend
     os.environ.setdefault("SDL_AUDIODRIVER", "alsa")
     os.environ.setdefault("JACK_NO_START_SERVER", "1")
 
-    # 1) perception (camera)
+    print("[BOOT] Matthew PiDog – AUTO MODE")
+
+    # 1) perception (camera sectors + minimap)
     planner = PerceptionPlanner(
         cam_dev="/dev/video0",
         w=640, h=480, fps=30,
@@ -185,11 +207,11 @@ def main():
     )
     planner.start()
 
-    # 2) motion
+    # 2) motion (head P10 đã tắt wiggle trong MotionController theo bản bạn sửa)
     motion = MotionController(pose_file=POSE_FILE)
     motion.boot()
     set_volumes()
-    dog = motion.dog
+    dog = motion.dog  # pidog instance
 
     def set_led(mode: str, color: str, bps: float = 0.6):
         try:
@@ -198,7 +220,7 @@ def main():
         except Exception:
             pass
 
-    # 3) face
+    # 3) face display
     face = FaceDisplay(default_face="what_is_it", fps=60, fullscreen=True)
     face.start()
 
@@ -213,18 +235,21 @@ def main():
     )
     listener.start()
 
-    # 5) UART reader
+    # 5) UART direct reader (để web chắc chắn có data)
     sensor = UartSensorReader(SERIAL_PORT, BAUD_RATE)
     sensor.start()
 
-    # 6) DogBehavior
+    # 6) behavior (sensor freshness + back + rotate)
     behavior = DogBehavior(
         safe_dist_cm=SAFE_DIST_CM,
         emergency_stop_cm=EMERGENCY_STOP_CM,
-        rotate_sec=5.0,            # xoay 360 trong 5s
-        walk_rest_every_sec=60.0,  # 1 phút
-        rest_sit_sec=3.0,          # sit 3s
-        after_avoid_cooldown_sec=1.2
+        sensor_fresh_sec=0.35,      # ✅ UART quá 0.35s coi như stale
+        back_sec=0.7,               # ✅ lùi 0.7s rồi mới xoay
+        rotate_sec=5.0,             # ✅ xoay 5s
+        cooldown_sec=1.2,           # ✅ cooldown
+        walk_rest_every_sec=60.0,   # ✅ 1 phút
+        rest_sit_sec=3.0,
+        camera_trigger_center_blocked=2,
     )
 
     # manual override
@@ -238,10 +263,26 @@ def main():
     def manual_active():
         return manual["move"] and (time.time() - manual["ts"] < manual_timeout_sec)
 
+    # SIT helper
+    def do_sit_blocking():
+        try:
+            if dog:
+                dog.do_action("sit", speed=20)
+                dog.wait_all_done()
+        except Exception:
+            pass
+
+    # status payload for web
     def status_payload():
         st = planner.get_status_dict()
-        st.update(sensor.snapshot())
+        snap = sensor.snapshot()
+        st.update(snap)
+
+        last_rx = snap.get("uart_last_rx_ts")
+        dist_age = (time.time() - last_rx) if last_rx else None
+
         st.update({
+            "uart_dist_age_sec": dist_age,
             "manual_move": manual["move"],
             "manual_active": bool(manual_active()),
             "listener_transcript": getattr(listener, "last_transcript", None),
@@ -249,9 +290,11 @@ def main():
             "listener_is_recording": listener_is_recording(listener),
             "listener_is_playing": listener_is_playing(listener),
             "behavior_state": behavior.state,
+            "mode": "AUTO",
         })
         return st
 
+    # web dashboard
     web = WebDashboard(
         host="0.0.0.0",
         port=8000,
@@ -262,23 +305,17 @@ def main():
     )
     threading.Thread(target=web.run, daemon=True).start()
 
-    # helper: SIT action (motion.execute không có SIT)
-    def do_sit_blocking():
-        try:
-            if dog:
-                dog.do_action("sit", speed=20)
-                dog.wait_all_done()
-        except Exception:
-            pass
-
     # main loop
     try:
         set_led("breath", "white", bps=0.4)
 
         while True:
             st = planner.get_state()
-            s = sensor.snapshot()
-            dist = s.get("uart_dist_cm")
+            snap = sensor.snapshot()
+
+            dist = snap.get("uart_dist_cm")
+            last_rx = snap.get("uart_last_rx_ts")
+            dist_age = (time.time() - last_rx) if last_rx else None
 
             # manual
             m_active = bool(manual_active())
@@ -286,17 +323,16 @@ def main():
             if not m_active:
                 manual["move"] = None
 
-            # listener states
+            # listener flags
             rec = listener_is_recording(listener)
             play = listener_is_playing(listener)
 
-            # base camera decision (chỉ là input cho behavior; behavior sẽ ưu tiên sensor trước)
-            camera_decision = st.decision
-
+            # behavior decision
             out = behavior.update(
                 dist_cm=dist,
+                dist_age_sec=dist_age,
                 sector_states=st.sector_states,
-                camera_decision=camera_decision,
+                camera_decision=st.decision,
                 cam_blocked=st.cam_blocked,
                 imu_bump=st.imu_bump,
                 manual_active=m_active,
