@@ -43,36 +43,61 @@ class WebDashboard:
   <meta charset="utf-8"/>
   <title>Matthew Robot Dashboard</title>
   <style>
-    body { font-family: Arial; margin: 14px; }
+    body { font-family: Arial; margin: 14px; background:#0b0b0b; color:#eee; }
     .row { display:flex; gap:14px; align-items:flex-start; }
-    img { border:1px solid #444; }
-    button { padding:10px 14px; margin:4px; }
-    pre { background:#111; color:#0f0; padding:10px; width:420px; }
+    img { border:1px solid #444; border-radius:8px; }
+    button { padding:10px 14px; margin:4px; border-radius:10px; border:0; cursor:pointer; }
+    pre { background:#111; color:#0f0; padding:10px; width:460px; border-radius:10px; }
+    .card { background:#131313; padding:10px; border-radius:12px; border:1px solid #2a2a2a; margin-bottom:10px; }
+    .kv { display:flex; gap:12px; flex-wrap:wrap; }
+    .pill { background:#1b1b1b; border:1px solid #333; padding:6px 10px; border-radius:999px; }
   </style>
 </head>
 <body>
   <h2>Matthew Robot Dashboard</h2>
+
   <div class="row">
     <div>
-      <div><b>Live Camera</b></div>
-      <img src="/mjpeg" width="640" height="480"/>
-      <div style="margin-top:10px"><b>Mini-map</b></div>
-      <img id="minimap" src="/minimap.png" width="200"/>
+      <div class="card">
+        <div><b>Live Camera</b></div>
+        <img src="/mjpeg" width="640" height="480"/>
+      </div>
+      <div class="card">
+        <div><b>Mini-map</b></div>
+        <img id="minimap" src="/minimap.png" width="220"/>
+      </div>
     </div>
-    <div>
-      <div><b>Status</b></div>
-      <pre id="status">loading...</pre>
-      <div><b>Manual Control</b></div>
-      <div>
-        <button onclick="cmd('FORWARD')">FORWARD</button>
+
+    <div style="width:520px;">
+      <div class="card">
+        <b>Quick Status</b>
+        <div class="kv" style="margin-top:10px;">
+          <div class="pill">Decision: <span id="d">...</span></div>
+          <div class="pill">Reason: <span id="r">...</span></div>
+          <div class="pill">Dist(cm): <span id="dist">...</span></div>
+          <div class="pill">Temp(°C): <span id="t">...</span></div>
+          <div class="pill">Hum(%): <span id="h">...</span></div>
+        </div>
       </div>
-      <div>
-        <button onclick="cmd('TURN_LEFT')">LEFT</button>
-        <button onclick="cmd('STOP')">STOP</button>
-        <button onclick="cmd('TURN_RIGHT')">RIGHT</button>
+
+      <div class="card">
+        <div><b>Status JSON</b></div>
+        <pre id="status">loading...</pre>
       </div>
-      <div>
-        <button onclick="cmd('BACK')">BACK</button>
+
+      <div class="card">
+        <div><b>Manual Control</b></div>
+        <div>
+          <button onclick="cmd('FORWARD')">FORWARD</button>
+        </div>
+        <div>
+          <button onclick="cmd('TURN_LEFT')">LEFT</button>
+          <button onclick="cmd('STOP')">STOP</button>
+          <button onclick="cmd('TURN_RIGHT')">RIGHT</button>
+        </div>
+        <div>
+          <button onclick="cmd('BACK')">BACK</button>
+        </div>
       </div>
     </div>
   </div>
@@ -82,10 +107,17 @@ async function refresh(){
   try{
     const r = await fetch('/status');
     const j = await r.json();
+
     document.getElementById('status').textContent = JSON.stringify(j, null, 2);
     document.getElementById('minimap').src = '/minimap.png?t=' + Date.now();
+
+    document.getElementById('d').textContent = j.decision ?? 'NA';
+    document.getElementById('r').textContent = j.reason ?? 'NA';
+    document.getElementById('dist').textContent = (j.uart_dist_cm ?? j.uart_dist_raw_cm ?? 'NA');
+    document.getElementById('t').textContent = (j.uart_temp_c ?? 'NA');
+    document.getElementById('h').textContent = (j.uart_humid ?? 'NA');
   }catch(e){}
-  setTimeout(refresh, 300);
+  setTimeout(refresh, 250);
 }
 async function cmd(m){
   await fetch('/cmd?move=' + m);
