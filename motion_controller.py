@@ -7,7 +7,7 @@ from typing import Optional
 
 from robot_hat import Servo
 from matthewpidogclassinit import MatthewPidogBootClass
-from pidog.preset_actions import bark
+from pidog.preset_actions import bark, push_up
 
 
 class MotionController:
@@ -73,6 +73,10 @@ class MotionController:
         self._head_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
 
+        # tránh spam stand/stop liên tục
+        self._last_stand_ts = 0.0
+        self._stand_cooldown = 0.25
+
     @property
     def dog(self):
         return self._dog
@@ -129,17 +133,14 @@ class MotionController:
         if settle_sec and settle_sec > 0:
             time.sleep(settle_sec)
 
-    # ---------------- boot sequence (NEW) ----------------
+    # ---------------- boot sequence ----------------
     def _pre_move_legs_before_pose(self):
         """
-        Làm đúng y như script bạn đưa:
-        1) init P0..P7
-        2) lock P4/P6
-        3) move rear P5/P7 alternating
-        4) set front hip P0/P2
-        5) move front knee P1/P3 alternating (P1 invert)
+        1) lock P4/P6
+        2) move rear P5/P7 alternating
+        3) set front hip P0/P2
+        4) move front knee P1/P3 alternating (P1 invert)
         """
-        # init servos P0..P7
         s0 = Servo("P0")
         s1 = Servo("P1")
         s2 = Servo("P2")
@@ -246,38 +247,27 @@ class MotionController:
 
     def boot(self):
         """
-        BOOT FLOW (NEW):
         A) pre-move 4 legs (rear+front) with lock P4/P6
         B) apply pose from cfg (all servos)
         C) boot MatthewPidogBootClass -> stand
         D) start head controller
         """
-        # A) pre-move legs
         self._pre_move_legs_before_pose()
-
-        # B) apply cfg pose (all servos)
         cfg = self.load_pose_config()
         self.apply_pose_from_cfg(cfg, per_servo_delay=0.03, settle_sec=1.0)
 
-        # C) boot dog + stand
         boot = MatthewPidogBootClass()
         self._dog = boot.create()
         time.sleep(1.0)
-        try:
-            self._dog.do_action("stand", speed=30)
-            self._dog.wait_all_done()
-            time.sleep(0.5)
-        except Exception:
-            pass
+        self.stand(speed=30)
 
-        # optional bark
+        # optional bark once
         try:
             bark(self._dog, [0, 0, -40])
             time.sleep(0.2)
         except Exception:
             pass
 
-        # D) head lock/wiggle
         self._head_stop_evt, self._head_thread = self.start_head_controller()
 
     def close(self):
@@ -286,28 +276,101 @@ class MotionController:
         if self._head_thread is not None:
             self._head_thread.join(timeout=0.5)
 
+    # ---------------- high-level actions ----------------
+    def stand(self, speed=10, force=False):
+        """Stand nhẹ, có cooldown để khỏi spam."""
+        if self._dog is None:
+            return
+        now = time.time()
+        if (not force) and (now - self._last_stand_ts < self._stand_cooldown):
+            return
+        self._last_stand_ts = now
+        try:
+            self._dog.do_action("stand", speed=speed)
+            self._dog.wait_all_done()
+        except Exception:
+            pass
+
+    def sit(self, speed=20):
+        if self._dog is None:
+            return
+        # nhiều lib có "sit", nếu không có thì fallback stand
+        try:
+            self._dog.do_action("sit", speed=speed)
+            self._dog.wait_all_done()
+            return
+        except Exception:
+            pass
+        self.stand(speed=10)
+
+    def do_push_up(self):
+        if self._dog is None:
+            return
+        try:
+            push_up(self._dog)
+        except Exception:
+            # fallback: đứng
+            self.stand(speed=10)
+
+    def do_bark(self):
+        if self._dog is None:
+            return
+        try:
+            bark(self._dog, [0, 0, -40])
+        except Exception:
+            pass
+
+    # ---------------- decision executor ----------------
     def execute(self, decision: str):
         """
-        decision: FORWARD | TURN_LEFT | TURN_RIGHT | BACK | STOP
+        decision (string):
+          - Auto: FORWARD | TURN_LEFT | TURN_RIGHT | BACK | STOP
+          - Manual buttons: LEFT | RIGHT
+          - Idle actions: STAND | SIT | PUSH_UP | BARK
         """
         if self._dog is None:
             return
+
+        d = (decision or "STOP").upper().strip()
+        # alias
+        if d == "LEFT":
+            d = "TURN_LEFT"
+        if d == "RIGHT":
+            d = "TURN_RIGHT"
+
         with self._lock:
             try:
-                if decision == "FORWARD":
+                if d == "FORWARD":
                     self._dog.do_action("forward", speed=250)
                     self._dog.wait_all_done()
-                elif decision == "BACK":
+
+                elif d == "BACK":
                     self._dog.do_action("backward", speed=250)
                     self._dog.wait_all_done()
-                elif decision == "TURN_LEFT":
+
+                elif d == "TURN_LEFT":
                     self._dog.do_action("turn_left", step_count=1, speed=230)
                     self._dog.wait_all_done()
-                elif decision == "TURN_RIGHT":
+
+                elif d == "TURN_RIGHT":
                     self._dog.do_action("turn_right", step_count=1, speed=230)
                     self._dog.wait_all_done()
+
+                elif d == "SIT":
+                    self.sit(speed=20)
+
+                elif d == "STAND":
+                    self.stand(speed=10, force=True)
+
+                elif d == "PUSH_UP":
+                    self.do_push_up()
+
+                elif d == "BARK":
+                    self.do_bark()
+
                 else:
-                    self._dog.do_action("stand", speed=5)
-                    self._dog.wait_all_done()
+                    # STOP: chỉ giữ stand nhẹ thôi, không spam
+                    self.stand(speed=5, force=False)
+
             except Exception:
                 pass
