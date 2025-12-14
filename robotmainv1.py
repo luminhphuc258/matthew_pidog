@@ -181,7 +181,7 @@ def main():
 
     # 2) motion
     # ✅ giả định MotionController đã có enable_head_wiggle=False để khỏi lắc P10
-    motion = MotionController(pose_file=POSE_FILE, enable_head_wiggle=False)
+    motion = MotionController(pose_file=POSE_FILE)
     motion.boot()
     set_volumes()
 

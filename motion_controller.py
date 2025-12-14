@@ -34,7 +34,7 @@ class MotionController:
         # ===== head controller =====
         head_p8_fixed=80,
         head_p9_fixed=-70,
-        head_p10_a=70,
+        head_p10_a=90,
         head_p10_b=90,
     ):
         self.pose_file = Path(pose_file)
