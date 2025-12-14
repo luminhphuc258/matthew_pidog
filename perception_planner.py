@@ -23,8 +23,8 @@ class PerceptionState:
     decision: str                    # "FORWARD" | "TURN_LEFT" | "TURN_RIGHT" | "BACK" | "STOP"
     reason: str
 
-    # SensorHub from MQTT
-    uart_dist_raw_cm: Optional[float] = None   # keep name for your old web UI
+    # SensorHub from MQTT (keep old names for web UI)
+    uart_dist_raw_cm: Optional[float] = None
     uart_dist_cm: Optional[float] = None
     uart_temp_c: Optional[float] = None
     uart_humid: Optional[float] = None
@@ -150,25 +150,40 @@ class PerceptionPlanner:
         self.imu_bump = False
         self.cam_blocked = False
 
-        # ===== NEW camera tuning (stable) =====
-        # ROI trapezoid (focus on floor / lower half)
-        self.ROI_Y_TOP = 0.52          # start ROI a bit lower (camera mounted high)
+        # =========================================================
+        # CAMERA TUNING (nhạy hơn + ổn định)
+        # =========================================================
+        # ROI trapezoid: kéo lên cao hơn một chút (camera gắn cao)
+        self.ROI_Y_TOP = 0.45      # trước 0.52 -> quá thấp, dễ bỏ lỡ vật cao (ghế, thùng)
         self.ROI_Y_BOT = 0.98
-        self.ROI_TOP_RATIO = 0.50     # top width ratio
-        self.ROI_BOT_RATIO = 1.00     # bottom width ratio
+        self.ROI_TOP_RATIO = 0.55
+        self.ROI_BOT_RATIO = 1.00
 
-        # edge detection
-        self.CANNY1, self.CANNY2 = 60, 160
-        self.BLUR_K = (5, 5)
+        # Canny nhạy hơn
+        self.CANNY1, self.CANNY2 = 40, 130   # trước 60,160
 
-        # sector decision by edge density
-        # (higher => more “blocked”)
-        self.SECTOR_EDGE_TH = 0.060   # 0.04~0.08 thường hợp lý
-        self.CENTER_BOOST = 1.10      # center stricter a bit
+        # blur nhẹ hơn để giữ cạnh (nhạy hơn)
+        self.BLUR_K = (3, 3)                 # trước (5,5)
 
-        # cam blocked heuristic
-        self.BLUR_LAPLACE_TH = 30.0
-        self.EDGE_DENSITY_MIN = 0.006
+        # Sector edge threshold:
+        # nhỏ hơn => dễ bị "blocked" hơn (nhạy hơn)
+        self.SECTOR_EDGE_TH_BASE = 0.040     # trước 0.060
+
+        # Center sector hơi nhạy hơn 1 chút thôi (đừng làm quá)
+        self.CENTER_BOOST = 1.05             # trước 1.10
+
+        # Auto threshold theo môi trường (đỡ full xanh / full đỏ)
+        self.AUTO_TH = True
+        self.AUTO_TH_ALPHA = 0.15            # smoothing
+        self._auto_th = self.SECTOR_EDGE_TH_BASE
+
+        # cam blocked heuristic (giảm bớt nhạy để khỏi STOP linh tinh)
+        self.BLUR_LAPLACE_TH = 18.0          # trước 30.0 (bị coi blur quá dễ)
+        self.EDGE_DENSITY_MIN = 0.003        # trước 0.006 (bị coi “no edge” quá dễ)
+
+        # Morphology: nối cạnh đứt (nhạy + chắc hơn)
+        self.DILATE_ITER = 1
+        self._kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
 
         self._threads: List[threading.Thread] = []
 
@@ -248,7 +263,6 @@ class PerceptionPlanner:
             if right_free > left_free and right_free > 0:
                 return "TURN_RIGHT", f"NEAR({dist:.1f})_RIGHT_MORE_FREE"
 
-            # if both bad
             return "BACK", f"NEAR({dist:.1f})_NO_CLEAR"
 
         # normal camera navigation
@@ -322,17 +336,31 @@ class PerceptionPlanner:
 
             gray = cv2.GaussianBlur(gray_full, self.BLUR_K, 0)
             edges = cv2.Canny(gray, self.CANNY1, self.CANNY2)
+            edges = cv2.dilate(edges, self._kernel, iterations=self.DILATE_ITER)
 
-            # only ROI
             edges_roi = cv2.bitwise_and(edges, edges, mask=roi_mask)
             edge_density_all = float(np.mean(edges_roi > 0))
+
             cam_blocked = (lap_var < self.BLUR_LAPLACE_TH) or (edge_density_all < self.EDGE_DENSITY_MIN)
 
-            # sector edge density
+            # Auto threshold (đỡ full xanh / full đỏ)
+            # target_th = base + k*(edge_density_all - ref)
+            # ref ~ 0.02-0.03 (tùy)
+            if self.AUTO_TH:
+                ref = 0.020
+                k = 0.80
+                target = float(np.clip(self.SECTOR_EDGE_TH_BASE + k * (edge_density_all - ref), 0.020, 0.080))
+                self._auto_th = (1.0 - self.AUTO_TH_ALPHA) * self._auto_th + self.AUTO_TH_ALPHA * target
+                th_base = self._auto_th
+            else:
+                th_base = self.SECTOR_EDGE_TH_BASE
+
             sector_states = ["free"] * self.sector_n
             y0 = int(H * self.ROI_Y_TOP)
             y1 = int(H * self.ROI_Y_BOT)
 
+            # sector-by-sector density
+            densities = []
             for i in range(self.sector_n):
                 x0 = int(i * W / self.sector_n)
                 x1 = int((i + 1) * W / self.sector_n)
@@ -340,13 +368,13 @@ class PerceptionPlanner:
                 patch = edges_roi[y0:y1, x0:x1]
                 if patch.size == 0:
                     sector_states[i] = "unknown"
+                    densities.append(0.0)
                     continue
 
                 den = float(np.mean(patch > 0))
-                th = self.SECTOR_EDGE_TH
-                if i == self.sector_n // 2:
-                    th *= self.CENTER_BOOST
+                densities.append(den)
 
+                th = th_base * (self.CENTER_BOOST if i == self.sector_n // 2 else 1.0)
                 sector_states[i] = "blocked" if den >= th else "free"
 
                 # draw sector bar
@@ -360,15 +388,13 @@ class PerceptionPlanner:
                     frame[bar_y0:bar_y1, x0:x1], 0.65, 0
                 )
 
-            # draw ROI trapezoid outline
-            # (optional visual)
-            # cv2.polylines(frame, [np.column_stack(np.where(roi_mask > 0))], ... )  # too heavy
-            # instead draw simple rectangle-ish guide:
-            cv2.putText(frame, f"lapVar={lap_var:.1f} edgeDen={edge_density_all:.4f}", (10, H - 12),
+            # debug text
+            txt = f"lapVar={lap_var:.1f} edgeDen={edge_density_all:.4f} th={th_base:.4f}"
+            cv2.putText(frame, txt, (10, H - 12),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
             with self._lock:
-                self.cam_blocked = cam_blocked
+                self.cam_blocked = bool(cam_blocked)
                 self.current_sector_states = sector_states
                 self._update_mini_map(sector_states)
 
@@ -456,10 +482,10 @@ class PerceptionPlanner:
             if parsed:
                 temp, humid, dist = parsed
                 with self._lock:
-                    self.uart_temp_c = temp
-                    self.uart_humid = humid
-                    self.uart_dist_raw_cm = dist
-                    self.uart_dist_cm = dist  # simple (no filter)
+                    self.uart_temp_c = float(temp)
+                    self.uart_humid = float(humid)
+                    self.uart_dist_raw_cm = float(dist)
+                    self.uart_dist_cm = float(dist)
             else:
                 if self.mqtt_debug:
                     print("[MQTT] unparsed payload:", payload[:120])
@@ -473,7 +499,7 @@ class PerceptionPlanner:
         if self.mqtt_user:
             client.username_pw_set(self.mqtt_user, self.mqtt_pass)
 
-        # TLS insecure mode (no cert verify) because you asked
+        # TLS insecure mode
         try:
             client.tls_set(cert_reqs=ssl.CERT_NONE)
             client.tls_insecure_set(True if self.mqtt_insecure else False)
@@ -492,10 +518,8 @@ class PerceptionPlanner:
                 client.connect(self.mqtt_host, self.mqtt_port, keepalive=30)
                 client.loop_start()
 
-                # keep thread alive
                 while not self._stop.is_set():
                     time.sleep(0.2)
-
                 break
             except Exception as e:
                 with self._lock:
