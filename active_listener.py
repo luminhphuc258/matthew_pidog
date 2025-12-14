@@ -11,7 +11,7 @@ class ActiveListener:
     def __init__(
         self,
         mic_device="plughw:3,0",
-        speaker_device="plughw:0,0",
+        speaker_device="plughw:1,0",
         sample_rate=16000,
         detect_chunk_sec=1,
         record_sec=4,

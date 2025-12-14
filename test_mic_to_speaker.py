@@ -12,8 +12,8 @@ from motion_controller import MotionController
 POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
 
 # ===== CHỈNH ĐÚNG THIẾT BỊ CỦA BẠN =====
-MIC_DEVICE = "plughw:3,0"      # USB mic (card 3) – hoặc "plughw:4,0" cho BRIO
-SPK_DEVICE = "plughw:0,0"      # SunFounder speaker (card 0)
+MIC_DEVICE = "plughw:4,0"      # USB mic (card 3) – hoặc "plughw:4,0" cho BRIO
+SPK_DEVICE = "plughw:1,0"      # SunFounder speaker (card 1)
 # =====================================
 
 RATE = 16000
