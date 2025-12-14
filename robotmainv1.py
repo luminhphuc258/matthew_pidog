@@ -15,8 +15,7 @@ POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
 
 
 def main():
-    print("[BOOT] Matthew PiDog – AUTO MOVE (Camera + UART)")
-
+    # 1) perception
     planner = PerceptionPlanner(
         cam_dev="/dev/video0",
         w=640, h=480, fps=30,
@@ -25,7 +24,7 @@ def main():
         serial_port="/dev/ttyUSB0",
         baud=115200,
         safe_dist_cm=50.0,
-        emergency_stop_cm=10.0,
+        emergency_stop_cm=10.0,   # nếu bạn có param này
         enable_imu=False,
         enable_camera=True,
         uart_debug=False,
@@ -33,109 +32,89 @@ def main():
     )
     planner.start()
 
+    # 2) motion
     motion = MotionController(pose_file=POSE_FILE)
     motion.boot()
 
+    # 3) face
     face = FaceDisplay(default_face="what_is_it", fps=60, fullscreen=True)
     face.start()
 
+    # 4) active listening
     listener = ActiveListener(
-        mic_device="default",
-        speaker_device="default",
+        mic_device="plughw:4,0",
+        speaker_device="plughw:3,0",
         threshold=2500,
-        cooldown_sec=1.0,
         nodejs_upload_url="https://embeddedprogramming-healtheworldserver.up.railway.app/upload_audio",
-        debug=False,
     )
     listener.start()
 
-    # manual override from web
+    # manual override
     manual = {"move": None, "ts": 0.0}
-    MANUAL_HOLD_SEC = 1.2
+    manual_timeout_sec = 1.2
 
     def on_manual_cmd(move: str):
         manual["move"] = move
         manual["ts"] = time.time()
 
-    def manual_active() -> bool:
-        return manual["move"] is not None and (time.time() - manual["ts"]) <= MANUAL_HOLD_SEC
+    def manual_active():
+        return manual["move"] and (time.time() - manual["ts"] < manual_timeout_sec)
 
-    # status payload (đảm bảo luôn trả dict serializable)
-    def status_payload():
-        st = planner.get_status_dict()
-        st.update({
-            "manual_move": manual["move"],
-            "manual_active": manual_active(),
-            "listener_transcript": listener.last_transcript,
-            "listener_label": listener.last_label,
-            "mode": "AUTO_MOVE",
-            "jpeg_ok": bool(planner.latest_jpeg),
-        })
-        return st
-
+    # 5) web dashboard
     web = WebDashboard(
         host="0.0.0.0",
         port=8000,
         get_jpeg=lambda: planner.latest_jpeg,
-        get_status=status_payload,
+        get_status=lambda: {
+            **planner.get_status_dict(),
+            "manual_move": manual["move"],
+            "manual_active": bool(manual_active()),
+            "listener_transcript": listener.last_transcript,
+            "listener_label": listener.last_label,
+        },
         get_minimap_png=planner.get_mini_map_png,
         on_manual_cmd=on_manual_cmd,
     )
     threading.Thread(target=web.run, daemon=True).start()
 
-    # ===== movement scheduler (quan trọng) =====
-    last_exec_ts = 0.0
-
-    def interval_for(decision: str) -> float:
-        # nhịp gọi action (vì motion.execute blocking & action đi theo "bước")
-        if decision in ("TURN_LEFT", "TURN_RIGHT"):
-            return 0.9
-        if decision in ("FORWARD", "BACK"):
-            return 0.6
-        return 0.3  # STOP
-
+    # main loop
     try:
         while True:
             st = planner.get_state()
 
-            # auto from planner
+            # choose decision
             decision = st.decision
-
-            # manual override (nhưng emergency stop luôn thắng)
             if manual_active():
-                decision = manual["move"] or decision
+                decision = manual["move"]
+            else:
+                manual["move"] = None
 
-            # safety
-            if st.uart_dist_cm is not None and st.uart_dist_cm < planner.emergency_stop_cm:
+            # safety override (nếu distance quá gần)
+            # dùng uart_dist_cm nếu có, fallback uart_dist_raw_cm
+            dist = st.uart_dist_cm if getattr(st, "uart_dist_cm", None) is not None else getattr(st, "uart_dist_raw_cm", None)
+            if dist is not None and dist < 10.0:
                 decision = "STOP"
 
-            # face logic
-            if decision == "STOP" and st.uart_dist_cm is not None and st.uart_dist_cm < planner.safe_dist_cm:
-                face.set_face("angry")
-            elif listener.last_label in ("music", "singing"):
+            # face mapping
+            if decision == "FORWARD":
                 face.set_face("music")
-            elif listener.last_label in ("happy", "laugh"):
-                face.set_face("love_eyes")
-            elif listener.last_label in ("sleep",):
-                face.set_face("sleep")
-            else:
+            elif decision in ("TURN_LEFT", "TURN_RIGHT"):
                 face.set_face("what_is_it")
+            elif decision in ("BACK",):
+                face.set_face("angry")
+            else:
+                face.set_face("sad" if (st.cam_blocked or st.imu_bump) else "what_is_it")
 
-            # gọi motion.execute theo nhịp (không cần decision đổi vẫn gọi)
-            now = time.time()
-            if (now - last_exec_ts) >= interval_for(decision):
-                motion.execute(decision)
-                last_exec_ts = now
+            # ACT (giống main của bạn: gọi liên tục)
+            motion.execute(decision)
 
-            time.sleep(0.05)
+            time.sleep(0.02)
 
     except KeyboardInterrupt:
         print("\n[EXIT] Ctrl+C")
     finally:
-        print("[SHUTDOWN] Cleaning up...")
         try:
             listener.stop()
-            listener.join(2.0)
         except Exception:
             pass
         try:

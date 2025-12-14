@@ -88,7 +88,7 @@ class PerceptionPlanner:
         self.uart_print_every = float(uart_print_every)
         self.uart_filter_window = int(max(1, uart_filter_window))
 
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._stop = threading.Event()
 
         # outputs for other classes
