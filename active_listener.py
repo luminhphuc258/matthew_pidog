@@ -9,6 +9,8 @@ import tempfile
 import subprocess
 import threading
 from typing import Optional, Dict, Callable
+import shutil
+
 
 import requests
 from shutil import which as _which
@@ -134,7 +136,7 @@ class ActiveListener:
         self._playing.set()
         try:
             # mp3 -> mpg123 (blocking)
-            if filepath.endswith(".mp3") and shutil_which("mpg123"):
+            if filepath.endswith(".mp3") and shutil.which("mpg123"):
                 subprocess.run(
                     ["mpg123", "-q", "-a", self.speaker_device, filepath],
                     check=False

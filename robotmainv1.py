@@ -82,6 +82,7 @@ def main():
     # =========================
     try:
         while True:
+            face.set_face("what_is_it")
             st = planner.get_state()
 
             # ❌ KHÔNG di chuyển
