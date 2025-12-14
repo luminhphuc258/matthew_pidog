@@ -125,50 +125,50 @@ class ActiveListener:
             return None
 
     def _play_audio(self, filepath: str):
-    """
-    Tắt mic đúng bằng thời gian đang phát:
-    - set _playing trước khi play
-    - play BLOCKING (mpg123/aplay) => khi xong mới clear
-    - thêm post_play_silence_sec để tránh mic ăn lại đuôi âm
-    """
-    self._playing.set()
-    try:
-        # mp3 -> mpg123 (blocking)
-        if filepath.endswith(".mp3") and shutil_which("mpg123"):
-            subprocess.run(
-                ["mpg123", "-q", "-a", self.speaker_device, filepath],
-                check=False
-            )
-            return
+        """
+        Tắt mic đúng bằng thời gian đang phát:
+        - set _playing trước khi play
+        - play BLOCKING (mpg123/aplay) => khi xong mới clear
+        - thêm post_play_silence_sec để tránh mic ăn lại đuôi âm
+        """
+        self._playing.set()
+        try:
+            # mp3 -> mpg123 (blocking)
+            if filepath.endswith(".mp3") and shutil_which("mpg123"):
+                subprocess.run(
+                    ["mpg123", "-q", "-a", self.speaker_device, filepath],
+                    check=False
+                )
+                return
 
-        # fallback: mp3 -> wav -> aplay (blocking)
-        if filepath.endswith(".mp3"):
-            wav_path = filepath[:-4] + ".wav"
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", filepath, "-ac", "1", "-ar", str(self.sample_rate), wav_path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-            filepath = wav_path
+            # fallback: mp3 -> wav -> aplay (blocking)
+            if filepath.endswith(".mp3"):
+                wav_path = filepath[:-4] + ".wav"
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", filepath, "-ac", "1", "-ar", str(self.sample_rate), wav_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                filepath = wav_path
 
-        # wav -> aplay (blocking)
-        subprocess.run(["aplay", "-D", self.speaker_device, "-q", filepath], check=False)
+            # wav -> aplay (blocking)
+            subprocess.run(["aplay", "-D", self.speaker_device, "-q", filepath], check=False)
 
-    finally:
-        # ✅ play xong mới bật mic lại
-        self._playing.clear()
+        finally:
+            # ✅ play xong mới bật mic lại
+            self._playing.clear()
 
-        # ✅ đệm thêm 0.3–1.0s tuỳ loa gần mic
-        if self.post_play_silence_sec > 0:
-            time.sleep(self.post_play_silence_sec)
+            # ✅ đệm thêm 0.3–1.0s tuỳ loa gần mic
+            if self.post_play_silence_sec > 0:
+                time.sleep(self.post_play_silence_sec)
 
-        # cleanup wav temp nếu có
-        if filepath.endswith(".wav") and "reply_" in os.path.basename(filepath):
-            try:
-                os.unlink(filepath)
-            except Exception:
-                pass
+            # cleanup wav temp nếu có
+            if filepath.endswith(".wav") and "reply_" in os.path.basename(filepath):
+                try:
+                    os.unlink(filepath)
+                except Exception:
+                    pass
 
 
     # ------------- main loop -------------
