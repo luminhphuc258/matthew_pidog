@@ -15,7 +15,7 @@ POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
 
 # ====== chỉnh 2 cái này đúng với máy bạn ======
 MIC_DEVICE = "plughw:4,0"        # USB microphone
-SPEAKER_DEVICE = "plughw:3,0"    # Robot HAT / SunFounder speaker card
+SPEAKER_DEVICE = "plughw:0,0"    # Robot HAT / SunFounder speaker card
 # ============================================
 
 SAMPLE_RATE = 16000
