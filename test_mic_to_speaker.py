@@ -64,8 +64,14 @@ def record_wav(path: str, seconds: int):
 
 
 def play_wav(path: str):
-    cmd = ["aplay", "-D", SPEAKER_DEVICE, "-q", path]
-    subprocess.run(cmd, check=False)
+    for _ in range(10):
+        p = subprocess.run(["aplay", "-D", SPEAKER_DEVICE, "-q", path], check=False)
+        if p.returncode == 0:
+            return True
+        time.sleep(0.2)
+    print("[PLAY ERROR] Speaker still busy.")
+    return False
+
 
 
 def main():
