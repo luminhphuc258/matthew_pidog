@@ -1,18 +1,72 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import time, json
-from typing import Optional, Callable, Dict
+import time
+from typing import Optional, Callable, Dict, Any
 from flask import Flask, Response, request, jsonify
+
+try:
+    import numpy as np
+except Exception:
+    np = None
+
+
+def _to_py_scalar(v):
+    """Convert numpy scalar to python scalar."""
+    if np is not None:
+        try:
+            if isinstance(v, (np.bool_,)):
+                return bool(v)
+            if isinstance(v, (np.integer,)):
+                return int(v)
+            if isinstance(v, (np.floating,)):
+                return float(v)
+        except Exception:
+            pass
+    return v
+
+
+def json_safe(obj: Any, _depth: int = 0) -> Any:
+    """
+    Recursively convert obj to JSON-serializable types.
+    - numpy scalar -> python scalar
+    - dict keys -> str
+    - set/tuple -> list
+    - unknown object -> str(obj)
+    """
+    if _depth > 12:
+        return str(obj)
+
+    obj = _to_py_scalar(obj)
+
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            out[str(k)] = json_safe(v, _depth + 1)
+        return out
+
+    if isinstance(obj, (list, tuple, set)):
+        return [json_safe(v, _depth + 1) for v in obj]
+
+    # bytes -> show length only (avoid huge json)
+    if isinstance(obj, (bytes, bytearray)):
+        return {"__bytes__": len(obj)}
+
+    # fallback
+    return str(obj)
 
 
 class WebDashboard:
     """
-    - /            HTML simple
+    - /            HTML dashboard
     - /mjpeg       live video
-    - /status      decision + sectors + reason + uart + extras
+    - /status      decision + sectors + reason + uart/mqtt + extras
     - /minimap.png mini-map
     - /cmd?move=FORWARD|BACK|TURN_LEFT|TURN_RIGHT|STOP
+    - /health      quick health ping
     """
 
     def __init__(
@@ -34,6 +88,10 @@ class WebDashboard:
         self._setup_routes()
 
     def _setup_routes(self):
+        @self.app.get("/health")
+        def health():
+            return jsonify({"ok": True, "ts": time.time()})
+
         @self.app.get("/")
         def index():
             return """
@@ -52,6 +110,7 @@ class WebDashboard:
     .kv { display:flex; gap:12px; flex-wrap:wrap; margin-top:10px; }
     .pill { background:#1b1b1b; border:1px solid #333; padding:6px 10px; border-radius:999px; }
     .err { color:#ff6b6b; }
+    .ok { color:#7CFC90; }
   </style>
 </head>
 <body>
@@ -80,6 +139,7 @@ class WebDashboard:
           <div class="pill">Temp(°C): <span id="t">...</span></div>
           <div class="pill">Hum(%): <span id="h">...</span></div>
           <div class="pill">Manual: <span id="m">...</span></div>
+          <div class="pill">MQTT: <span id="mq">...</span></div>
         </div>
         <div class="err" id="err"></div>
       </div>
@@ -126,6 +186,10 @@ async function refresh(){
       document.getElementById('t').textContent = (j.uart_temp_c ?? 'NA');
       document.getElementById('h').textContent = (j.uart_humid ?? 'NA');
       document.getElementById('m').textContent = (j.manual_active ? (j.manual_move ?? 'NA') : 'OFF');
+
+      const mq = (j.mqtt_ok === true) ? ('OK dt=' + (j.mqtt_dt_ms ?? 'NA') + 'ms') : ('ERR');
+      document.getElementById('mq').textContent = mq;
+
       document.getElementById('minimap').src = '/minimap.png?t=' + Date.now();
     }
   }catch(e){
@@ -147,25 +211,37 @@ refresh();
         @self.app.get("/mjpeg")
         def mjpeg():
             def gen():
+                # fallback black jpeg (tiny) if camera not ready
+                black = None
+                try:
+                    import cv2, numpy as np
+                    img = np.zeros((480, 640, 3), dtype=np.uint8)
+                    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+                    if ok:
+                        black = buf.tobytes()
+                except Exception:
+                    black = None
+
                 while True:
                     try:
                         frame = self.get_jpeg() if self.get_jpeg else None
+                        if not frame:
+                            frame = black
                         if frame:
                             yield (b"--frame\r\n"
                                    b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
                         else:
-                            # tránh treo stream
-                            time.sleep(0.03)
+                            time.sleep(0.05)
                     except Exception:
                         time.sleep(0.1)
+
             return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
         @self.app.get("/status")
         def status():
             try:
                 data = self.get_status() if self.get_status else {}
-                # đảm bảo json-serializable
-                return jsonify(data)
+                return jsonify(json_safe(data))
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)})
 
@@ -188,4 +264,5 @@ refresh();
             return jsonify({"ok": True, "move": move})
 
     def run(self):
+        # threaded=True để /mjpeg + /status chạy cùng lúc mượt
         self.app.run(host=self.host, port=self.port, threaded=True)

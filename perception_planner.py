@@ -1,38 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import time, threading
+import time, threading, json
 from dataclasses import dataclass, asdict
 from typing import List, Optional, Tuple, Dict
 
 import cv2
 import numpy as np
 
+# MQTT
 try:
+    import ssl
     import paho.mqtt.client as mqtt
 except Exception:
     mqtt = None
-
-try:
-    from smbus2 import SMBus
-except Exception:
-    SMBus = None
 
 
 @dataclass
 class PerceptionState:
     ts: float
-    sector_states: List[str]          # len=9: "free" | "blocked" | "unknown"
+    sector_states: List[str]          # len=sector_n: "free" | "blocked" | "unknown"
     decision: str                    # "FORWARD" | "TURN_LEFT" | "TURN_RIGHT" | "BACK" | "STOP"
     reason: str
 
-    # SensorHub data (giữ tên uart_* để main/web cũ vẫn chạy)
-    uart_dist_raw_cm: Optional[float] = None
+    # SensorHub from MQTT
+    uart_dist_raw_cm: Optional[float] = None   # keep name for your old web UI
     uart_dist_cm: Optional[float] = None
     uart_temp_c: Optional[float] = None
     uart_humid: Optional[float] = None
 
-    # MQTT health
+    # mqtt health
     mqtt_ok: bool = False
     mqtt_error: Optional[str] = None
     mqtt_last_rx_ts: Optional[float] = None
@@ -47,55 +44,75 @@ class PerceptionState:
     manual_override: Optional[str] = None
 
 
+def _to_py(x):
+    """Convert numpy scalars to python scalars to avoid JSON serialization bugs."""
+    try:
+        import numpy as _np
+        if isinstance(x, (_np.bool_,)):
+            return bool(x)
+        if isinstance(x, (_np.integer,)):
+            return int(x)
+        if isinstance(x, (_np.floating,)):
+            return float(x)
+    except Exception:
+        pass
+    return x
+
+
+def _json_safe(obj):
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(_to_py(v)) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(_to_py(v)) for v in obj]
+    return _to_py(obj)
+
+
 class PerceptionPlanner:
     """
-    - Camera obstacle detection -> N sectors
-    - SensorHub via MQTT -> topic /pidog/sensorhubdata
-      payload JSON (example):
-        {"ts_ms":123,"temp_c":29.6,"humid":20.0,"dist_cm":11.44}
-    - Priority: DIST first, then camera
+    Camera obstacle detection (edge-density per sector) + SensorHub via MQTT.
+    Decision priority:
+      1) emergency stop by dist
+      2) near avoidance by dist + camera side free
+      3) normal navigation by camera
     """
 
     def __init__(
         self,
-        # camera
         cam_dev="/dev/video0",
-        w=640, h=480, fps=30,
+        w=640,
+        h=480,
+        fps=30,
         sector_n=9,
         map_h=80,
-        enable_camera=True,
 
-        # decision thresholds
         safe_dist_cm=50.0,
         emergency_stop_cm=10.0,
 
-        # mqtt
+        enable_camera=True,
+        enable_imu=False,   # kept for compatibility (not implemented)
+
+        # MQTT
         enable_mqtt=True,
-        mqtt_host="rfff7184.ala.us-east-1.emqxsl.com",
+        mqtt_host="localhost",
         mqtt_port=8883,
-        mqtt_user="robot_matthew",
-        mqtt_pass="29061992abCD!yesokmen",
+        mqtt_user="",
+        mqtt_pass="",
         mqtt_topic="/pidog/sensorhubdata",
         mqtt_client_id="pidog-perception-pi",
         mqtt_debug=False,
-
-        # imu
-        enable_imu=False,
-        i2c_bus=1,
-        addr_acc=0x36,
+        mqtt_insecure=True,
     ):
-        # camera
-        self.cam_dev, self.w, self.h, self.fps = cam_dev, w, h, fps
+        self.cam_dev, self.w, self.h, self.fps = cam_dev, int(w), int(h), int(fps)
         self.sector_n = int(sector_n)
         self.map_h = int(map_h)
         self.map_w = self.sector_n
-        self.enable_camera = bool(enable_camera)
 
-        # thresholds
         self.safe_dist_cm = float(safe_dist_cm)
         self.emergency_stop_cm = float(emergency_stop_cm)
 
-        # mqtt
+        self.enable_camera = bool(enable_camera)
+        self.enable_imu = bool(enable_imu)
+
         self.enable_mqtt = bool(enable_mqtt)
         self.mqtt_host = mqtt_host
         self.mqtt_port = int(mqtt_port)
@@ -104,11 +121,7 @@ class PerceptionPlanner:
         self.mqtt_topic = mqtt_topic
         self.mqtt_client_id = mqtt_client_id
         self.mqtt_debug = bool(mqtt_debug)
-
-        # imu
-        self.enable_imu = bool(enable_imu)
-        self.i2c_bus = i2c_bus
-        self.addr_acc = addr_acc
+        self.mqtt_insecure = bool(mqtt_insecure)
 
         self._lock = threading.RLock()
         self._stop = threading.Event()
@@ -120,45 +133,44 @@ class PerceptionPlanner:
         self.current_decision = "STOP"
         self.reason = "init"
 
-        # sensorhub values (mapped to uart_* for compatibility)
+        # sensorhub (store in uart_* fields to keep your web UI unchanged)
         self.uart_dist_raw_cm: Optional[float] = None
         self.uart_dist_cm: Optional[float] = None
         self.uart_temp_c: Optional[float] = None
         self.uart_humid: Optional[float] = None
 
         # mqtt health
-        self.mqtt_ok: bool = False
+        self.mqtt_ok = False
         self.mqtt_error: Optional[str] = None
         self.mqtt_last_rx_ts: Optional[float] = None
         self.mqtt_dt_ms: Optional[int] = None
-        self._mqtt_prev_rx_ts: Optional[float] = None
+        self._mqtt_prev_rx: Optional[float] = None
 
         # flags
         self.imu_bump = False
         self.cam_blocked = False
 
-        # camera tuning (bạn có thể chỉnh dần)
-        self.CANNY1, self.CANNY2 = 40, 120
-        self.DILATE_ITER = 2
+        # ===== NEW camera tuning (stable) =====
+        # ROI trapezoid (focus on floor / lower half)
+        self.ROI_Y_TOP = 0.52          # start ROI a bit lower (camera mounted high)
+        self.ROI_Y_BOT = 0.98
+        self.ROI_TOP_RATIO = 0.50     # top width ratio
+        self.ROI_BOT_RATIO = 1.00     # bottom width ratio
+
+        # edge detection
+        self.CANNY1, self.CANNY2 = 60, 160
         self.BLUR_K = (5, 5)
 
-        # ROI trapezoid: nâng vùng nhìn lên chút để bắt vật cao (kệ/ bàn)
-        self.TRAP_Y_TOP = 0.25          # (cũ 0.45) -> nhìn cao hơn
-        self.TRAP_TOP_RATIO = 0.70      # (cũ 0.55)
-        self.TRAP_BOTTOM_RATIO = 1.00
+        # sector decision by edge density
+        # (higher => more “blocked”)
+        self.SECTOR_EDGE_TH = 0.060   # 0.04~0.08 thường hợp lý
+        self.CENTER_BOOST = 1.10      # center stricter a bit
 
-        # contour filter: bớt “khắt khe” để bắt vật như bàn/kệ
-        self.MIN_AREA = 260
-        self.MIN_H_RATIO = 0.10         # (cũ 0.18)
-        self.NEAR_BOTTOM = 0.60         # (cũ 0.80) -> không bắt buộc sát đáy
-
-        # blur/edge detect camera blocked
-        self.BLUR_TH = 30.0
-        self.EDGE_LOW_TH = 0.008
+        # cam blocked heuristic
+        self.BLUR_LAPLACE_TH = 30.0
+        self.EDGE_DENSITY_MIN = 0.006
 
         self._threads: List[threading.Thread] = []
-
-    # ---------------- public ----------------
 
     def start(self):
         self._stop.clear()
@@ -167,9 +179,6 @@ class PerceptionPlanner:
             self._threads.append(threading.Thread(target=self._mqtt_loop, daemon=True))
         if self.enable_camera:
             self._threads.append(threading.Thread(target=self._camera_loop, daemon=True))
-        if self.enable_imu:
-            self._threads.append(threading.Thread(target=self._imu_loop, daemon=True))
-
         for t in self._threads:
             t.start()
 
@@ -187,18 +196,18 @@ class PerceptionPlanner:
                 uart_dist_cm=self.uart_dist_cm,
                 uart_temp_c=self.uart_temp_c,
                 uart_humid=self.uart_humid,
-                mqtt_ok=self.mqtt_ok,
+                mqtt_ok=bool(self.mqtt_ok),
                 mqtt_error=self.mqtt_error,
                 mqtt_last_rx_ts=self.mqtt_last_rx_ts,
                 mqtt_dt_ms=self.mqtt_dt_ms,
-                imu_bump=self.imu_bump,
-                cam_blocked=self.cam_blocked,
+                imu_bump=bool(self.imu_bump),
+                cam_blocked=bool(self.cam_blocked),
                 mode="AUTO",
                 manual_override=None,
             )
 
     def get_status_dict(self) -> Dict:
-        return asdict(self.get_state())
+        return _json_safe(asdict(self.get_state()))
 
     def get_mini_map_png(self) -> bytes:
         with self._lock:
@@ -209,86 +218,68 @@ class PerceptionPlanner:
     # ---------------- decision combine ----------------
 
     def compute_decision(self) -> Tuple[str, str]:
-        """
-        Priority:
-        1) IMU bump
-        2) DIST emergency stop
-        3) DIST near avoidance (camera used only to pick turn direction)
-        4) camera normal navigation
-        """
         with self._lock:
             dist = self.uart_dist_cm
             sector_states = list(self.current_sector_states)
-            cam_blocked = self.cam_blocked
-            imu_bump = self.imu_bump
+            cam_blocked = bool(self.cam_blocked)
 
-        if imu_bump:
-            return "BACK", "IMU_BUMP"
-
-        # 1) emergency stop always wins (dist ưu tiên cao nhất)
+        # emergency stop always wins
         if dist is not None and dist < self.emergency_stop_cm:
-            return "STOP", f"EMERGENCY_STOP({dist:.2f}cm)"
+            return "STOP", f"EMERGENCY_STOP({dist:.1f}cm)"
 
-        # 2) if distance says near -> decide turn (use camera only for direction)
+        # if camera is blocked/blurred, rely on distance only
+        if cam_blocked:
+            if dist is None:
+                return "STOP", "CAM_BLOCKED_NO_DIST"
+            if dist < self.safe_dist_cm:
+                return "BACK", f"CAM_BLOCKED_NEAR({dist:.1f}cm)"
+            return "FORWARD", "CAM_BLOCKED_DIST_OK"
+
+        # near: choose turn by sectors
         if dist is not None and dist < self.safe_dist_cm:
-            # nếu camera bị block / chưa có sector -> ưu tiên TURN_RIGHT để thoát
-            if (not sector_states) or all(s == "unknown" for s in sector_states) or cam_blocked:
-                return "TURN_RIGHT", f"DIST_NEAR({dist:.2f}cm)_CAM_UNRELIABLE"
-
-            n = len(sector_states)
-            c = n // 2
-            left = sector_states[:c]
-            right = sector_states[c+1:]
+            third = max(1, self.sector_n // 3)
+            left = sector_states[:third]
+            right = sector_states[-third:]
             left_free = sum(1 for s in left if s == "free")
             right_free = sum(1 for s in right if s == "free")
 
             if left_free > right_free and left_free > 0:
-                return "TURN_LEFT", f"DIST_NEAR({dist:.2f}cm)_TURN_LEFT"
+                return "TURN_LEFT", f"NEAR({dist:.1f})_LEFT_MORE_FREE"
             if right_free > left_free and right_free > 0:
-                return "TURN_RIGHT", f"DIST_NEAR({dist:.2f}cm)_TURN_RIGHT"
+                return "TURN_RIGHT", f"NEAR({dist:.1f})_RIGHT_MORE_FREE"
 
-            # không rõ -> lùi nhẹ
-            return "BACK", f"DIST_NEAR({dist:.2f}cm)_NO_CLEAR"
+            # if both bad
+            return "BACK", f"NEAR({dist:.1f})_NO_CLEAR"
 
-        # 3) camera blocked (nhưng dist không near) -> cứ đứng quan sát/đi chậm
-        if cam_blocked:
-            return "STOP", "CAM_BLOCKED"
-
-        # 4) normal camera rule
-        if not sector_states:
-            return "STOP", "NO_SECTORS"
-
-        center_idx = len(sector_states) // 2
-        center = sector_states[center_idx]
+        # normal camera navigation
+        c = self.sector_n // 2
+        center = sector_states[c] if sector_states else "unknown"
         if center == "free":
             return "FORWARD", "CENTER_FREE"
 
-        left_free = sum(1 for s in sector_states[:center_idx] if s == "free")
-        right_free = sum(1 for s in sector_states[center_idx + 1:] if s == "free")
-        if left_free > right_free:
-            return "TURN_LEFT", "CENTER_BLOCKED_LEFT_MORE_FREE"
+        left_free = sum(1 for s in sector_states[:c] if s == "free")
+        right_free = sum(1 for s in sector_states[c + 1:] if s == "free")
         if right_free > left_free:
             return "TURN_RIGHT", "CENTER_BLOCKED_RIGHT_MORE_FREE"
+        if left_free > right_free:
+            return "TURN_LEFT", "CENTER_BLOCKED_LEFT_MORE_FREE"
         return "BACK", "CENTER_BLOCKED_NO_CLEAR"
 
     # ---------------- camera ----------------
 
     def _build_trapezoid_mask(self) -> np.ndarray:
         H, W = self.h, self.w
-        y_top = int(H * self.TRAP_Y_TOP)
-        y_bot = int(H * self.TRAP_BOTTOM_RATIO)
-
-        top_w = int(W * self.TRAP_TOP_RATIO)
-        bot_w = int(W * 1.00)
-
-        x_center = W // 2
+        y_top = int(H * self.ROI_Y_TOP)
+        y_bot = int(H * self.ROI_Y_BOT)
+        top_w = int(W * self.ROI_TOP_RATIO)
+        bot_w = int(W * self.ROI_BOT_RATIO)
+        xc = W // 2
         pts = np.array([
-            [x_center - top_w // 2, y_top],
-            [x_center + top_w // 2, y_top],
-            [x_center + bot_w // 2, y_bot],
-            [x_center - bot_w // 2, y_bot],
+            [xc - top_w // 2, y_top],
+            [xc + top_w // 2, y_top],
+            [xc + bot_w // 2, y_bot],
+            [xc - bot_w // 2, y_bot],
         ], dtype=np.int32)
-
         mask = np.zeros((H, W), dtype=np.uint8)
         cv2.fillPoly(mask, [pts], 255)
         return mask
@@ -316,7 +307,6 @@ class PerceptionPlanner:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.h)
         cap.set(cv2.CAP_PROP_FPS, self.fps)
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         roi_mask = self._build_trapezoid_mask()
 
         while not self._stop.is_set():
@@ -326,63 +316,56 @@ class PerceptionPlanner:
                 continue
 
             H, W = frame.shape[:2]
+
             gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-            # camera health
             lap_var = cv2.Laplacian(gray_full, cv2.CV_64F).var()
-            edges_full = cv2.Canny(gray_full, self.CANNY1, self.CANNY2)
-            edge_density = float(np.mean(edges_full > 0))
-            cam_blocked = (lap_var < self.BLUR_TH) or (edge_density < self.EDGE_LOW_TH)
 
-            # detect edges in ROI
             gray = cv2.GaussianBlur(gray_full, self.BLUR_K, 0)
             edges = cv2.Canny(gray, self.CANNY1, self.CANNY2)
-            edges = cv2.dilate(edges, kernel, iterations=self.DILATE_ITER)
-            edges = cv2.bitwise_and(edges, edges, mask=roi_mask)
 
-            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # only ROI
+            edges_roi = cv2.bitwise_and(edges, edges, mask=roi_mask)
+            edge_density_all = float(np.mean(edges_roi > 0))
+            cam_blocked = (lap_var < self.BLUR_LAPLACE_TH) or (edge_density_all < self.EDGE_DENSITY_MIN)
 
+            # sector edge density
             sector_states = ["free"] * self.sector_n
-            bboxes = []
+            y0 = int(H * self.ROI_Y_TOP)
+            y1 = int(H * self.ROI_Y_BOT)
 
-            for c in contours:
-                area = cv2.contourArea(c)
-                if area < self.MIN_AREA:
-                    continue
-                x, y, ww, hh = cv2.boundingRect(c)
-                h_ratio = hh / float(H)
-                if h_ratio < self.MIN_H_RATIO:
-                    continue
-                if (y + hh) / float(H) < self.NEAR_BOTTOM:
-                    continue
-                bboxes.append((x, y, ww, hh, area))
-
-            for (x, y, ww, hh, area) in bboxes:
-                x_center = x + ww / 2.0
-                sec = int(x_center / W * self.sector_n)
-                sec = max(0, min(self.sector_n - 1, sec))
-                sector_states[sec] = "blocked"
-
-                # mark neighbors (thêm độ “dày” obstacle)
-                for nb in (sec - 1, sec + 1):
-                    if 0 <= nb < self.sector_n:
-                        sector_states[nb] = "blocked"
-
-                cv2.rectangle(frame, (x, y), (x + ww, y + hh), (0, 0, 255), 2)
-
-            # overlay sectors bar
-            y0 = int(H * 0.05)
-            y1 = int(H * 0.12)
-            for i, s in enumerate(sector_states):
+            for i in range(self.sector_n):
                 x0 = int(i * W / self.sector_n)
                 x1 = int((i + 1) * W / self.sector_n)
-                color = (0, 200, 0) if s == "free" else (0, 0, 255)
+
+                patch = edges_roi[y0:y1, x0:x1]
+                if patch.size == 0:
+                    sector_states[i] = "unknown"
+                    continue
+
+                den = float(np.mean(patch > 0))
+                th = self.SECTOR_EDGE_TH
+                if i == self.sector_n // 2:
+                    th *= self.CENTER_BOOST
+
+                sector_states[i] = "blocked" if den >= th else "free"
+
+                # draw sector bar
+                bar_y0 = int(H * 0.05)
+                bar_y1 = int(H * 0.12)
+                color = (0, 200, 0) if sector_states[i] == "free" else (0, 0, 255)
                 overlay = frame.copy()
-                cv2.rectangle(overlay, (x0, y0), (x1, y1), color, -1)
-                frame[y0:y1, x0:x1] = cv2.addWeighted(
-                    overlay[y0:y1, x0:x1], 0.35,
-                    frame[y0:y1, x0:x1], 0.65, 0
+                cv2.rectangle(overlay, (x0, bar_y0), (x1, bar_y1), color, -1)
+                frame[bar_y0:bar_y1, x0:x1] = cv2.addWeighted(
+                    overlay[bar_y0:bar_y1, x0:x1], 0.35,
+                    frame[bar_y0:bar_y1, x0:x1], 0.65, 0
                 )
+
+            # draw ROI trapezoid outline
+            # (optional visual)
+            # cv2.polylines(frame, [np.column_stack(np.where(roi_mask > 0))], ... )  # too heavy
+            # instead draw simple rectangle-ish guide:
+            cv2.putText(frame, f"lapVar={lap_var:.1f} edgeDen={edge_density_all:.4f}", (10, H - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
             with self._lock:
                 self.cam_blocked = cam_blocked
@@ -397,11 +380,41 @@ class PerceptionPlanner:
                 if ok2:
                     self.latest_jpeg = buf.tobytes()
 
-            time.sleep(0.002)
+            time.sleep(0.003)
 
         cap.release()
 
-    # ---------------- MQTT SensorHub ----------------
+    # ---------------- MQTT ----------------
+
+    def _parse_sensor_payload(self, payload: str) -> Optional[Tuple[float, float, float]]:
+        payload = payload.strip()
+        if not payload:
+            return None
+
+        # JSON: {"temp":29.6,"humid":20.0,"dist":11.4}
+        if payload.startswith("{") and payload.endswith("}"):
+            try:
+                o = json.loads(payload)
+                temp = float(o.get("temp", o.get("temperature", o.get("t"))))
+                humid = float(o.get("humid", o.get("humidity", o.get("h"))))
+                dist = float(o.get("dist", o.get("distance", o.get("d"))))
+                return temp, humid, dist
+            except Exception:
+                return None
+
+        # CSV: ts,temp,humid,dist
+        if "," in payload:
+            parts = [p.strip() for p in payload.split(",")]
+            if len(parts) >= 4:
+                try:
+                    temp = float(parts[1])
+                    humid = float(parts[2])
+                    dist = float(parts[3])
+                    return temp, humid, dist
+                except Exception:
+                    return None
+
+        return None
 
     def _mqtt_loop(self):
         if mqtt is None:
@@ -411,8 +424,6 @@ class PerceptionPlanner:
             return
 
         def on_connect(client, userdata, flags, rc):
-            if self.mqtt_debug:
-                print("[MQTT] on_connect rc =", rc)
             with self._lock:
                 self.mqtt_ok = (rc == 0)
                 self.mqtt_error = None if rc == 0 else f"connect rc={rc}"
@@ -420,84 +431,70 @@ class PerceptionPlanner:
                 try:
                     client.subscribe(self.mqtt_topic, qos=0)
                     if self.mqtt_debug:
-                        print("[MQTT] subscribed:", self.mqtt_topic)
+                        print(f"[MQTT] subscribed {self.mqtt_topic}")
                 except Exception as e:
                     with self._lock:
                         self.mqtt_error = f"subscribe fail: {e}"
 
         def on_message(client, userdata, msg):
-            now = time.time()
             try:
-                payload = msg.payload.decode("utf-8", errors="ignore").strip()
-                # payload JSON: {"ts_ms":..,"temp_c":..,"humid":..,"dist_cm":..}
-                import json
-                j = json.loads(payload)
+                payload = msg.payload.decode("utf-8", errors="ignore")
+            except Exception:
+                return
 
-                temp = j.get("temp_c", None)
-                humid = j.get("humid", None)
-                dist = j.get("dist_cm", None)
+            parsed = self._parse_sensor_payload(payload)
+            now = time.time()
 
+            with self._lock:
+                self.mqtt_last_rx_ts = now
+                if self._mqtt_prev_rx is not None:
+                    self.mqtt_dt_ms = int((now - self._mqtt_prev_rx) * 1000.0)
+                self._mqtt_prev_rx = now
+                self.mqtt_ok = True
+                self.mqtt_error = None
+
+            if parsed:
+                temp, humid, dist = parsed
                 with self._lock:
-                    if temp is not None:
-                        self.uart_temp_c = float(temp)
-                    if humid is not None:
-                        self.uart_humid = float(humid)
-                    if dist is not None:
-                        self.uart_dist_raw_cm = float(dist)
-                        self.uart_dist_cm = float(dist)
-
-                    self.mqtt_ok = True
-                    self.mqtt_error = None
-                    self.mqtt_last_rx_ts = now
-
-                    if self._mqtt_prev_rx_ts is not None:
-                        self.mqtt_dt_ms = int((now - self._mqtt_prev_rx_ts) * 1000)
-                    self._mqtt_prev_rx_ts = now
-
-            except Exception as e:
-                with self._lock:
-                    self.mqtt_ok = False
-                    self.mqtt_error = f"parse fail: {e}"
+                    self.uart_temp_c = temp
+                    self.uart_humid = humid
+                    self.uart_dist_raw_cm = dist
+                    self.uart_dist_cm = dist  # simple (no filter)
+            else:
+                if self.mqtt_debug:
+                    print("[MQTT] unparsed payload:", payload[:120])
 
         def on_disconnect(client, userdata, rc):
-            if self.mqtt_debug:
-                print("[MQTT] disconnected rc =", rc)
             with self._lock:
                 self.mqtt_ok = False
-                if rc != 0:
-                    self.mqtt_error = f"disconnect rc={rc}"
+                self.mqtt_error = f"disconnected rc={rc}"
 
         client = mqtt.Client(client_id=self.mqtt_client_id, clean_session=True)
-        client.username_pw_set(self.mqtt_user, self.mqtt_pass)
+        if self.mqtt_user:
+            client.username_pw_set(self.mqtt_user, self.mqtt_pass)
 
-        # Port 8883 => TLS, nhưng cho phép insecure như ESP32 setInsecure()
+        # TLS insecure mode (no cert verify) because you asked
         try:
-            client.tls_set()  # use system CA (but we will allow insecure)
-            client.tls_insecure_set(True)
+            client.tls_set(cert_reqs=ssl.CERT_NONE)
+            client.tls_insecure_set(True if self.mqtt_insecure else False)
         except Exception as e:
             with self._lock:
-                self.mqtt_ok = False
-                self.mqtt_error = f"tls init fail: {e}"
-            return
+                self.mqtt_error = f"tls setup fail: {e}"
 
         client.on_connect = on_connect
         client.on_message = on_message
         client.on_disconnect = on_disconnect
 
-        # auto reconnect loop
         while not self._stop.is_set():
             try:
+                if self.mqtt_debug:
+                    print(f"[MQTT] connecting {self.mqtt_host}:{self.mqtt_port} ...")
                 client.connect(self.mqtt_host, self.mqtt_port, keepalive=30)
                 client.loop_start()
 
-                # watchdog: nếu quá lâu không nhận data -> mqtt_ok = False
+                # keep thread alive
                 while not self._stop.is_set():
-                    time.sleep(0.5)
-                    with self._lock:
-                        if self.mqtt_last_rx_ts is not None:
-                            if (time.time() - self.mqtt_last_rx_ts) > 3.0:
-                                self.mqtt_ok = False
-                                self.mqtt_error = "no data > 3s"
+                    time.sleep(0.2)
 
                 break
             except Exception as e:
@@ -512,33 +509,5 @@ class PerceptionPlanner:
             pass
         try:
             client.disconnect()
-        except Exception:
-            pass
-
-    # ---------------- IMU ----------------
-
-    def _imu_loop(self):
-        if SMBus is None:
-            return
-        try:
-            bus = SMBus(self.i2c_bus)
-        except Exception:
-            return
-
-        last_bump = 0.0
-        while not self._stop.is_set():
-            try:
-                bump = False  # TODO: thay bằng SH3001 thật
-                now = time.time()
-                if bump:
-                    last_bump = now
-                with self._lock:
-                    self.imu_bump = (now - last_bump) < 1.2
-            except Exception:
-                pass
-            time.sleep(0.02)
-
-        try:
-            bus.close()
         except Exception:
             pass
