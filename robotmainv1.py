@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 from typing import Optional, Dict
 
-import serial  # đọc UART trực tiếp giống script test của bạn
+import serial
 
 from perception_planner import PerceptionPlanner
 from motion_controller import MotionController
@@ -18,19 +18,15 @@ from active_listener import ActiveListener
 
 POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
 
-# Audio default theo /etc/asound.conf
 MIC_DEVICE = "default"
 SPK_DEVICE = "default"
 
-# UART (ESP32 / N8R8 -> Pi)
 SERIAL_PORT = "/dev/ttyUSB0"
 BAUD_RATE = 115200
 
-# Thresholds
 SAFE_DIST_CM = 50.0
 EMERGENCY_STOP_CM = 10.0
 
-# Special behavior
 STAND_HOLD_SEC = 3.0
 TURN_RIGHT_SEC = 5.0
 
@@ -47,10 +43,6 @@ def set_volumes():
 
 
 class UartSensorReader:
-    """
-    Đọc line format: timestamp,temp,humidity,ultrasonic_cm
-    Lưu latest values + error để show lên web.
-    """
     def __init__(self, port: str, baud: int):
         self.port = port
         self.baud = baud
@@ -158,11 +150,10 @@ class UartSensorReader:
 
 
 def main():
-    # giảm conflict audio backend
     os.environ.setdefault("SDL_AUDIODRIVER", "alsa")
     os.environ.setdefault("JACK_NO_START_SERVER", "1")
 
-    # 1) perception (camera sectors + minimap)
+    # 1) perception
     planner = PerceptionPlanner(
         cam_dev="/dev/video0",
         w=640, h=480, fps=30,
@@ -180,13 +171,13 @@ def main():
     planner.start()
 
     # 2) motion
-    # ✅ giả định MotionController đã có enable_head_wiggle=False để khỏi lắc P10
+    # ✅ enable_head_wiggle=False -> P10 không lắc (nhưng P8/P9 vẫn giữ lực theo patch bạn sửa)
     motion = MotionController(pose_file=POSE_FILE, enable_head_wiggle=False)
     motion.boot()
     set_volumes()
+    dog = motion.dog
 
-    dog = motion.dog  # pidog instance
-
+    # LED via pidog
     def set_led(mode: str, color: str, bps: float = 0.6):
         try:
             if dog and hasattr(dog, "rgb_strip"):
@@ -209,7 +200,7 @@ def main():
     )
     listener.start()
 
-    # 5) UART direct reader (để chắc chắn web có data)
+    # 5) UART reader (direct)
     sensor = UartSensorReader(SERIAL_PORT, BAUD_RATE)
     sensor.start()
 
@@ -243,9 +234,10 @@ def main():
             "manual_active": bool(manual_active()),
             "listener_transcript": listener.last_transcript,
             "listener_label": listener.last_label,
-            "mode": "AUTO",
             "seq_state": seq["state"],
             "seq_until": seq["until"],
+            "mic_device": MIC_DEVICE,
+            "spk_device": SPK_DEVICE,
         })
         return st
 
@@ -259,9 +251,7 @@ def main():
     )
     threading.Thread(target=web.run, daemon=True).start()
 
-    # main loop
     try:
-        # init led
         set_led("breath", "white", bps=0.4)
 
         while True:
@@ -269,50 +259,43 @@ def main():
             s = sensor.snapshot()
             dist = s.get("uart_dist_cm")
 
-            # base decision from camera
             decision = st.decision
 
-            # manual override
             if manual_active():
                 decision = manual["move"]
             else:
                 manual["move"] = None
 
-            # evaluate obstacles
-            center_blocked, total_blocked = block_density(st.sector_states)
+            center_blocked, _ = block_density(st.sector_states)
             now = time.time()
 
-            # emergency stop by ultrasonic
+            # emergency by ultrasonic
             if dist is not None and dist < EMERGENCY_STOP_CM:
                 decision = "STOP"
 
-            # trigger when too many obstacles ahead OR too near
             trigger = (center_blocked >= 2) or (dist is not None and dist < SAFE_DIST_CM)
 
-            # sequence: stand 3s -> turn right 5s -> resume
+            # sequence: stand 3s -> turn right 5s
             if seq["state"] == "NONE":
                 if (not manual_active()) and trigger:
                     seq["state"] = "STAND"
                     seq["until"] = now + STAND_HOLD_SEC
-
             elif seq["state"] == "STAND":
                 if now >= seq["until"]:
                     seq["state"] = "TURN_RIGHT"
                     seq["until"] = now + TURN_RIGHT_SEC
-
             elif seq["state"] == "TURN_RIGHT":
                 if now >= seq["until"]:
                     seq["state"] = "NONE"
                     seq["until"] = 0.0
 
-            # apply sequence override (không override manual)
             if not manual_active():
                 if seq["state"] == "STAND":
                     decision = "STOP"
                 elif seq["state"] == "TURN_RIGHT":
                     decision = "TURN_RIGHT"
 
-            # LED rule
+            # LED
             danger = (seq["state"] != "NONE") or (center_blocked >= 2) or (dist is not None and dist < SAFE_DIST_CM)
             if danger:
                 set_led("breath", "red", bps=0.8)
@@ -324,7 +307,7 @@ def main():
                 else:
                     set_led("breath", "white", bps=0.4)
 
-            # face (optional)
+            # face
             if danger:
                 face.set_face("angry")
             elif decision == "FORWARD":
@@ -336,9 +319,7 @@ def main():
             else:
                 face.set_face("what_is_it")
 
-            # ACT
             motion.execute(decision)
-
             time.sleep(0.02)
 
     except KeyboardInterrupt:
@@ -348,29 +329,24 @@ def main():
             set_led("breath", "white", bps=0.2)
         except Exception:
             pass
-
         try:
             listener.stop()
             listener.join(2.0)
         except Exception:
             pass
-
         try:
             sensor.stop()
             sensor.join(1.0)
         except Exception:
             pass
-
         try:
             planner.stop()
         except Exception:
             pass
-
         try:
             motion.close()
         except Exception:
             pass
-
         try:
             face.stop()
         except Exception:
