@@ -413,53 +413,92 @@ class PerceptionPlanner:
 
     def _uart_loop(self):
         if serial is None:
-            print("[UART] pyserial not installed. pip3 install pyserial")
             return
 
-        try:
-            ser = serial.Serial(self.serial_port, self.baud, timeout=1)
-            time.sleep(1.5)
-            try:
-                ser.reset_input_buffer()
-            except Exception:
-                pass
-            print(f"[UART] opened {self.serial_port} @ {self.baud}")
-        except Exception as e:
-            print(f"[UART] cannot open {self.serial_port}: {e}")
-            return
-
-        last_dbg = 0.0
-
+        ser = None
+        last_print = 0.0
         while not self._stop.is_set():
+            if ser is None:
+                try:
+                    ser = serial.Serial(
+                        self.serial_port,
+                        self.baud,
+                        timeout=1,
+                        dsrdtr=False,
+                        rtscts=False
+                    )
+                    # ✅ tránh reset board khi open serial
+                    try:
+                        ser.setDTR(False)
+                        ser.setRTS(False)
+                    except Exception:
+                        pass
+
+                    time.sleep(0.4)
+                    try:
+                        ser.reset_input_buffer()
+                    except Exception:
+                        pass
+
+                    if getattr(self, "uart_debug", False):
+                        print(f"[UART] opened {self.serial_port} @ {self.baud}")
+                except Exception as e:
+                    if getattr(self, "uart_debug", False):
+                        print(f"[UART] open fail: {e}")
+                    time.sleep(1.0)
+                    continue
+
             try:
                 raw = ser.readline()
+                if not raw:
+                    continue
+
                 line = raw.decode("utf-8", errors="ignore").strip()
                 if not line:
                     continue
 
-                if self.uart_debug:
+                # in raw để bạn thấy luôn (không spam quá nhiều)
+                if getattr(self, "uart_debug", False):
                     now = time.time()
-                    if (now - last_dbg) >= self.uart_print_every:
+                    if now - last_print >= float(getattr(self, "uart_print_every", 0.2)):
                         print("UART >>", line)
-                        last_dbg = now
+                        last_print = now
 
-                self._parse_uart_line(line)
+                # ✅ chỉ parse đúng CSV 4 phần
+                if "," not in line:
+                    continue
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) != 4:
+                    continue
 
-                # nếu camera không chạy, vẫn update decision bằng UART-only + sectors unknown
-                if not self.enable_camera:
-                    with self._lock:
-                        self.current_sector_states = ["unknown"] * self.sector_n
-                        decision, reason = self.compute_decision()
-                        self.current_decision = decision
-                        self.reason = reason
+                try:
+                    temp = float(parts[1])
+                    humid = float(parts[2])
+                    dist = float(parts[3])
+                except Exception:
+                    continue
 
-            except Exception:
-                time.sleep(0.05)
+                with self._lock:
+                    self.uart_temp_c = temp
+                    self.uart_humid = humid
+                    self.uart_dist_cm = dist
+
+            except Exception as e:
+                if getattr(self, "uart_debug", False):
+                    print(f"[UART] read fail: {e}")
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                ser = None
+                time.sleep(0.5)
 
         try:
-            ser.close()
+            if ser:
+                ser.close()
         except Exception:
             pass
+
 
     # ---------------- IMU ----------------
 
