@@ -36,10 +36,14 @@ class MotionController:
         head_p9_fixed=-70,
         head_p10_a=70,
         head_p10_b=90,
+        enable_head_wiggle=False
     ):
         self.pose_file = Path(pose_file)
         self.servo_ports = [f"P{i}" for i in range(12)]
         self.angle_min, self.angle_max = -90, 90
+
+        #head
+        self.enable_head_wiggle = bool(enable_head_wiggle)
 
         # leg pre-move params
         self.P5_START = p5_start
@@ -278,7 +282,12 @@ class MotionController:
             pass
 
         # D) head lock/wiggle
-        self._head_stop_evt, self._head_thread = self.start_head_controller()
+        # self._head_stop_evt, self._head_thread = self.start_head_controller()
+        if self.enable_head_wiggle:
+            self._head_stop_evt, self._head_thread = self.start_head_controller()
+        else:
+            self._head_stop_evt, self._head_thread = None, None
+
 
     def close(self):
         if self._head_stop_evt is not None:
