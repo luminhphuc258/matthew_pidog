@@ -15,9 +15,8 @@ POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
 
 
 def main():
-    print("[BOOT] Matthew PiDog – AUTO NAV MODE (Camera + UART Distance)")
+    print("[BOOT] Matthew PiDog – AUTO MOVE (Camera + UART)")
 
-    # 1) perception
     planner = PerceptionPlanner(
         cam_dev="/dev/video0",
         w=640, h=480, fps=30,
@@ -25,8 +24,8 @@ def main():
         map_h=80,
         serial_port="/dev/ttyUSB0",
         baud=115200,
-        safe_dist_cm=50.0,          # tránh vật cản khi < 50cm
-        emergency_stop_cm=10.0,     # STOP khẩn cấp khi < 10cm
+        safe_dist_cm=50.0,
+        emergency_stop_cm=10.0,
         enable_imu=False,
         enable_camera=True,
         uart_debug=False,
@@ -34,19 +33,12 @@ def main():
     )
     planner.start()
 
-    # 2) motion
     motion = MotionController(pose_file=POSE_FILE)
     motion.boot()
 
-    # 3) face display
-    face = FaceDisplay(
-        default_face="what_is_it",
-        fps=60,
-        fullscreen=True
-    )
+    face = FaceDisplay(default_face="what_is_it", fps=60, fullscreen=True)
     face.start()
 
-    # 4) active listening
     listener = ActiveListener(
         mic_device="default",
         speaker_device="default",
@@ -57,9 +49,9 @@ def main():
     )
     listener.start()
 
-    # manual override window
+    # manual override from web
     manual = {"move": None, "ts": 0.0}
-    MANUAL_HOLD_SEC = 1.0
+    MANUAL_HOLD_SEC = 1.2
 
     def on_manual_cmd(move: str):
         manual["move"] = move
@@ -68,7 +60,7 @@ def main():
     def manual_active() -> bool:
         return manual["move"] is not None and (time.time() - manual["ts"]) <= MANUAL_HOLD_SEC
 
-    # 5) web dashboard
+    # status payload (đảm bảo luôn trả dict serializable)
     def status_payload():
         st = planner.get_status_dict()
         st.update({
@@ -76,7 +68,8 @@ def main():
             "manual_active": manual_active(),
             "listener_transcript": listener.last_transcript,
             "listener_label": listener.last_label,
-            "mode": "AUTO_NAV",
+            "mode": "AUTO_MOVE",
+            "jpeg_ok": bool(planner.latest_jpeg),
         })
         return st
 
@@ -90,24 +83,29 @@ def main():
     )
     threading.Thread(target=web.run, daemon=True).start()
 
-    # =========================
-    # MAIN LOOP – AUTO MOVE
-    # =========================
-    last_decision = "STOP"
+    # ===== movement scheduler (quan trọng) =====
+    last_exec_ts = 0.0
+
+    def interval_for(decision: str) -> float:
+        # nhịp gọi action (vì motion.execute blocking & action đi theo "bước")
+        if decision in ("TURN_LEFT", "TURN_RIGHT"):
+            return 0.9
+        if decision in ("FORWARD", "BACK"):
+            return 0.6
+        return 0.3  # STOP
 
     try:
         while True:
             st = planner.get_state()
 
-            # decision from planner (combined camera + uart)
-            auto_decision = st.decision
+            # auto from planner
+            decision = st.decision
 
-            # manual override (nhưng vẫn bị EMERGENCY_STOP override để an toàn)
-            decision = auto_decision
+            # manual override (nhưng emergency stop luôn thắng)
             if manual_active():
-                decision = manual["move"] or auto_decision
+                decision = manual["move"] or decision
 
-            # safety: if emergency stop condition happens, force STOP
+            # safety
             if st.uart_dist_cm is not None and st.uart_dist_cm < planner.emergency_stop_cm:
                 decision = "STOP"
 
@@ -123,10 +121,11 @@ def main():
             else:
                 face.set_face("what_is_it")
 
-            # execute motion when decision changes or periodic
-            if decision != last_decision:
+            # gọi motion.execute theo nhịp (không cần decision đổi vẫn gọi)
+            now = time.time()
+            if (now - last_exec_ts) >= interval_for(decision):
                 motion.execute(decision)
-                last_decision = decision
+                last_exec_ts = now
 
             time.sleep(0.05)
 
@@ -134,11 +133,23 @@ def main():
         print("\n[EXIT] Ctrl+C")
     finally:
         print("[SHUTDOWN] Cleaning up...")
-        listener.stop()
-        listener.join(2.0)
-        planner.stop()
-        motion.close()
-        face.stop()
+        try:
+            listener.stop()
+            listener.join(2.0)
+        except Exception:
+            pass
+        try:
+            planner.stop()
+        except Exception:
+            pass
+        try:
+            motion.close()
+        except Exception:
+            pass
+        try:
+            face.stop()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
