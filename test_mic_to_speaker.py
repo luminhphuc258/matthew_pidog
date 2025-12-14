@@ -3,95 +3,76 @@
 
 import os
 import time
-import wave
-import shutil
 import tempfile
 import subprocess
-from pathlib import Path
 
-from motion_controller import MotionController
+# ===== CHỈNH ĐÚNG THIẾT BỊ CỦA BẠN =====
+MIC_DEVICE = "plughw:3,0"      # USB mic (card 3) – hoặc "plughw:4,0" cho BRIO
+SPK_DEVICE = "plughw:0,0"      # SunFounder speaker (card 0)
+# =====================================
 
-POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
-
-# ====== chỉnh 2 cái này đúng với máy bạn ======
-MIC_DEVICE = "plughw:3,0"        # USB microphone
-SPEAKER_DEVICE = "plughw:0,0"    # Robot HAT / SunFounder speaker card
-# ============================================
-
-SAMPLE_RATE = 16000
-CHANNELS = 1
-FORMAT = "S16_LE"
+RATE = 16000
+CH = 1
+FMT = "S16_LE"
+REC_SEC = 4
+LOOP_DELAY = 0.5   # nghỉ giữa các vòng
 
 
-def _set_gpio_high(pin: int) -> bool:
-    """Bật SPK_EN lên HIGH (cần sudo)."""
-    if shutil.which("pinctrl"):
-        subprocess.run(["pinctrl", "set", str(pin), "op", "dh"], check=False)
-        return True
-    if shutil.which("raspi-gpio"):
-        subprocess.run(["raspi-gpio", "set", str(pin), "op", "dh"], check=False)
-        return True
-    return False
-
-
-def _prime_speaker(device: str):
-    """Phát 0.1s silence để 'mở' đường audio."""
-    silence = "/tmp/robothat_silence.wav"
-    if not os.path.exists(silence):
-        with wave.open(silence, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(16000)
-            wf.writeframes(b"\x00\x00" * (16000 // 10))  # 0.1s
-    subprocess.run(["aplay", "-D", device, "-q", silence], check=False)
-
-
-
-
-
-def record_wav(path: str, seconds: int):
+def record_wav(path: str, sec: int):
     cmd = [
         "arecord",
         "-D", MIC_DEVICE,
-        "-f", FORMAT,
-        "-r", str(SAMPLE_RATE),
-        "-c", str(CHANNELS),
-        "-d", str(int(seconds)),
+        "-f", FMT,
+        "-r", str(RATE),
+        "-c", str(CH),
+        "-d", str(int(sec)),
         "-q",
         path
     ]
-    subprocess.run(cmd, check=False)
+    return subprocess.run(cmd, check=False).returncode == 0
 
 
 def play_wav(path: str):
-    for _ in range(10):
-        p = subprocess.run(["aplay", "-D", SPEAKER_DEVICE, "-q", path], check=False)
+    # retry nhẹ để tránh busy
+    for _ in range(8):
+        p = subprocess.run(["aplay", "-D", SPK_DEVICE, "-q", path], check=False)
         if p.returncode == 0:
             return True
         time.sleep(0.2)
-    print("[PLAY ERROR] Speaker still busy.")
     return False
 
 
-
 def main():
-    motion = MotionController(pose_file=POSE_FILE)
-    motion.boot()  # bên trong đã unlock speaker rồi
+    print("=== LOOP RECORD → PLAY (Ctrl+C để dừng) ===")
 
-    fd, wav_path = tempfile.mkstemp(suffix=".wav", prefix="mic_")
-    os.close(fd)
+    while True:
+        try:
+            fd, wav_path = tempfile.mkstemp(suffix=".wav", prefix="mic_")
+            os.close(fd)
 
-    print("[TEST] Recording 4s from USB mic...")
-    record_wav(wav_path, 4)
+            print("[REC] Recording 4s...")
+            if not record_wav(wav_path, REC_SEC):
+                print("[ERROR] arecord failed")
+                os.unlink(wav_path)
+                time.sleep(1)
+                continue
 
-    time.sleep(0.2)
+            time.sleep(0.2)
 
-    print("[TEST] Playing back to SunFounder speaker...")
-    play_wav(wav_path)
+            print("[PLAY] Playback...")
+            if not play_wav(wav_path):
+                print("[ERROR] aplay failed (device busy?)")
 
-    os.unlink(wav_path)
-    print("[DONE] Mic loopback finished.")
+            try:
+                os.unlink(wav_path)
+            except Exception:
+                pass
 
+            time.sleep(LOOP_DELAY)
+
+        except KeyboardInterrupt:
+            print("\n[EXIT] Stopped by user.")
+            break
 
 
 if __name__ == "__main__":
