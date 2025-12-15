@@ -17,6 +17,13 @@ HILITE  = (255, 245, 220)
 THICK_LINE  = 3
 THICK_EYE   = 3
 THICK_MOUTH = 4
+# ===== MUSIC BAR (TOP) =====
+BAR_H = 60          # ✅ nhỏ lại (thử 40–80)
+BAR_Y = 10          # ✅ sát top
+BAR_MARGIN_X = 18
+BAR_GAP = 6
+BAR_N = 22
+
 
 VALID_EMOS = {"love_eyes","music","what_is_it","suprise","sleep","sad","angry"}
 
@@ -30,6 +37,7 @@ EQ_COLORS = [
     (120, 120, 255),  # blue
     (210, 120, 255),  # purple
 ]
+
 
 def clamp(v, lo, hi): return max(lo, min(hi, v))
 
@@ -190,15 +198,52 @@ def draw_equalizer_bg(screen, t, level01: float):
         pygame.draw.rect(screen, col, (x, y, bw, bh), border_radius=6)
 
 # ===== NEW: mouth driven by MOUTH level =====
-def render_face(screen, emo, t, mouth_level01: float):
+def render_face(screen, emo, t, mouth_level: float = 0.0):
+    """
+    emo: love_eyes | music | what_is_it | suprise | sleep | sad | angry
+    mouth_level: 0..1 (optional for lipsync; default 0)
+    """
     W, H = screen.get_size()
+    screen.fill(BG)
 
-    # background equalizer first
-    draw_equalizer_bg(screen, t, mouth_level01)
+    # =========================
+    # ✅ MUSIC BAR TOP (low height)
+    # =========================
+    # config (bạn có thể đổi nhanh tại đây)
+    BAR_H = 55
+    BAR_Y = 6
+    BAR_MARGIN_X = 18
+    BAR_GAP = 6
+    BAR_N = 22
 
-    cx, cy = W//2, H//2
+    def draw_music_bar_top():
+        # nền mờ cho vùng top
+        pygame.draw.rect(screen, (10, 10, 10), pygame.Rect(0, 0, W, BAR_Y + BAR_H + 8))
 
-    # layout
+        usable_w = W - 2 * BAR_MARGIN_X
+        bw = int((usable_w - (BAR_N - 1) * BAR_GAP) / BAR_N)
+        if bw < 2:
+            bw = 2
+
+        for i in range(BAR_N):
+            a = 0.25 + 0.75 * abs(math.sin(t * 3.2 + i * 0.55))
+            bh = int(BAR_H * a)
+
+            x = BAR_MARGIN_X + i * (bw + BAR_GAP)
+            y = BAR_Y + (BAR_H - bh)
+
+            col = pygame.Color(0)
+            col.hsva = ((i * (360 / BAR_N) + (t * 40)) % 360, 90, 100, 100)
+
+            pygame.draw.rect(screen, col, pygame.Rect(x, y, bw, bh), border_radius=4)
+
+    draw_music_bar_top()
+
+    cx, cy = W // 2, H // 2
+
+    # =========================
+    # Layout
+    # =========================
     eye_y   = cy - int(H * 0.14)
     mouth_y = cy + int(H * 0.18)
 
@@ -212,94 +257,115 @@ def render_face(screen, emo, t, mouth_level01: float):
     mouth_w = int(W * 0.56)
     mouth_h = int(H * 0.28)
 
-    # ===== blink nhẹ luôn luôn =====
-    # random-ish blink cycle
-    phase = (t % 3.6)
+    # =========================
+    # ✅ Blink nhẹ + eye motion
+    # =========================
+    phase = (t % 3.3)
     blink = 0.0
-    if phase < 0.10:
-        blink = 1.0 - phase/0.10
-    elif phase < 0.20:
-        blink = (phase-0.10)/0.10
-    blink = clamp(blink, 0.0, 1.0)
+    if phase < 0.08:
+        blink = 1.0 - phase / 0.08
+    elif phase < 0.16:
+        blink = (phase - 0.08) / 0.08
+    blink = clamp(blink, 0.0, 1.0) * 0.45  # ✅ nhẹ thôi
 
-    # “blink nhẹ” thay vì đóng mạnh
-    blink_soft = blink * 0.18
+    pdx = int(math.sin(t * 1.7) * (W * 0.012))
+    pdy = int(math.sin(t * 1.2 + 1.1) * (H * 0.010))
+    wob = int(math.sin(t * 2.4) * (H * 0.010))
 
-    pdx = int(math.sin(t*1.7) * (W * 0.012))
-    pdy = int(math.sin(t*1.2 + 1.1) * (H * 0.010))
-    wob = int(math.sin(t*2.4) * (H * 0.010))
+    # =========================
+    # Optional lipsync:
+    # nếu muốn miệng nhép theo mouth_level (0..1) trong emo music
+    # =========================
+    mouth_level = 0.0 if mouth_level is None else float(mouth_level)
+    mouth_level = clamp(mouth_level, 0.0, 1.0)
 
-    # miệng nhép theo audio (0..1)
-    lvl = clamp(mouth_level01, 0.0, 1.0)
-    # độ mở (nhỏ -> vừa), để nhìn “nhép miệng” đẹp
-    mouth_open_scale = 0.12 + 0.55 * lvl
-    dyn_mouth_h = int(mouth_h * (0.16 + 0.20 * mouth_open_scale))  # cao hơn khi audio mạnh
-    dyn_mouth_w = int(mouth_w * (0.20 + 0.08 * mouth_open_scale))
-
+    # =========================
+    # Render by emotion
+    # =========================
     if emo == "love_eyes":
         heart_size = int(min(W, H) * 0.22)
         draw_heart(screen, lx, eye_y, heart_size, t)
         draw_heart(screen, rx, eye_y, heart_size, t + 0.25)
-        # miệng vẫn nhép nhẹ theo audio để cute
-        mouth_open(screen, cx, mouth_y, dyn_mouth_w, dyn_mouth_h, wob=wob)
+
+        mouth_smile_arc_only(
+            screen, cx, mouth_y,
+            int(mouth_w * 0.36),
+            int(mouth_h * 0.22),
+            t, wob=wob
+        )
 
     elif emo == "music":
         note_size = int(min(W, H) * 0.28)
-        draw_music_note(screen, lx, eye_y - int(H*0.02), note_size, t, flip=False)
-        draw_music_note(screen, rx, eye_y - int(H*0.02), note_size, t + 0.3, flip=True)
-        mouth_open(screen, cx, mouth_y, dyn_mouth_w, dyn_mouth_h, wob=wob)
+        draw_music_note(screen, lx, eye_y - int(H * 0.02), note_size, t, flip=False)
+        draw_music_note(screen, rx, eye_y - int(H * 0.02), note_size, t + 0.3, flip=True)
+
+        # ✅ nếu đang lipsync thì miệng mở/đóng theo mouth_level
+        if mouth_level > 0.02:
+            mh = int(mouth_h * (0.10 + 0.28 * mouth_level))
+            mw = int(mouth_w * (0.18 + 0.18 * mouth_level))
+            mouth_open(screen, cx, mouth_y, mw, mh, wob=wob)
+        else:
+            mouth_smile_arc_only(
+                screen, cx, mouth_y,
+                int(mouth_w * 0.36),
+                int(mouth_h * 0.22),
+                t, wob=wob
+            )
 
     elif emo == "what_is_it":
-        eye_open(screen, lx, eye_y, eye_w, eye_h, -pdx, pdy, blink_soft)
-        eye_open(screen, rx, eye_y, eye_w, eye_h,  pdx, -pdy, blink_soft)
-        # nhép miệng nhẹ theo audio (nếu audio=0 thì gần như flat)
-        if lvl > 0.05:
-            mouth_open(screen, cx, mouth_y, dyn_mouth_w, dyn_mouth_h, wob=wob)
-        else:
-            mouth_flat(screen, cx, mouth_y, int(mouth_w*0.52), wob=wob)
+        eye_open(screen, lx, eye_y, eye_w, eye_h, -pdx, pdy, blink)
+        eye_open(screen, rx, eye_y, eye_w, eye_h,  pdx, -pdy, blink)
+        mouth_flat(screen, cx, mouth_y, int(mouth_w * 0.52), wob=wob)
 
     elif emo == "suprise":
-        eye_open(screen, lx, eye_y, eye_w, eye_h, 0, 0, blink_soft)
-        eye_open(screen, rx, eye_y, eye_w, eye_h, 0, 0, blink_soft)
-        # suprise: miệng mở + nhép theo audio
-        mouth_open(screen, cx, mouth_y, max(int(mouth_w*0.20), dyn_mouth_w), max(int(mouth_h*0.24), dyn_mouth_h), wob=wob)
+        eye_open(screen, lx, eye_y, eye_w, eye_h, 0, 0, blink * 0.15)
+        eye_open(screen, rx, eye_y, eye_w, eye_h, 0, 0, blink * 0.15)
+        mouth_open(screen, cx, mouth_y, int(mouth_w * 0.20), int(mouth_h * 0.24), wob=wob)
         ex_mark(screen, cx, cy, t)
 
     elif emo == "sleep":
-        eye_happy_arc(screen, lx, eye_y + 14, int(eye_w*0.88), int(eye_h*0.62))
-        eye_happy_arc(screen, rx, eye_y + 14, int(eye_w*0.88), int(eye_h*0.62))
-        mouth_flat(screen, cx, mouth_y, int(mouth_w*0.32), wob=wob)
+        eye_happy_arc(screen, lx, eye_y + 14, int(eye_w * 0.88), int(eye_h * 0.62))
+        eye_happy_arc(screen, rx, eye_y + 14, int(eye_w * 0.88), int(eye_h * 0.62))
+        mouth_flat(screen, cx, mouth_y, int(mouth_w * 0.32), wob=wob)
         zzz(screen, cx, cy, t)
 
     elif emo == "sad":
-        eye_open(screen, lx, eye_y, eye_w, eye_h, -pdx, pdy + 10, blink_soft*0.8)
-        eye_open(screen, rx, eye_y, eye_w, eye_h,  pdx, pdy + 10, blink_soft*0.8)
-        rect = pygame.Rect(cx - int(mouth_w*0.36)//2, mouth_y - int(mouth_h*0.22)//2 + wob,
-                           int(mouth_w*0.36), int(mouth_h*0.22))
-        draw_glow_arc(screen, rect, math.pi, 2*math.pi, THICK_MOUTH)
-        tears(screen, lx + int(eye_w*0.22), eye_y + int(eye_h*0.06), t)
+        eye_open(screen, lx, eye_y, eye_w, eye_h, -pdx, pdy + 10, blink * 0.4)
+        eye_open(screen, rx, eye_y, eye_w, eye_h,  pdx, pdy + 10, blink * 0.4)
+
+        rect = pygame.Rect(
+            cx - int(mouth_w * 0.36) // 2,
+            mouth_y - int(mouth_h * 0.22) // 2 + wob,
+            int(mouth_w * 0.36),
+            int(mouth_h * 0.22)
+        )
+        draw_glow_arc(screen, rect, math.pi, 2 * math.pi, THICK_MOUTH)
+        tears(screen, lx + int(eye_w * 0.22), eye_y + int(eye_h * 0.06), t)
 
     elif emo == "angry":
-        jitter = int(math.sin(t*10.0) * 6)
-        eye_open(screen, lx, eye_y, eye_w, eye_h, pdx + jitter, pdy, blink_soft*0.4)
-        eye_open(screen, rx, eye_y, eye_w, eye_h, pdx - jitter, pdy, blink_soft*0.4)
+        jitter = int(math.sin(t * 10.0) * 6)
+        eye_open(screen, lx, eye_y, eye_w, eye_h, pdx + jitter, pdy, blink * 0.25)
+        eye_open(screen, rx, eye_y, eye_w, eye_h, pdx - jitter, pdy, blink * 0.25)
 
-        draw_glow_line(screen, (lx - int(eye_w*0.55), eye_y - int(eye_h*0.52)),
-                       (lx + int(eye_w*0.55), eye_y - int(eye_h*0.18)), THICK_LINE)
-        draw_glow_line(screen, (rx - int(eye_w*0.55), eye_y - int(eye_h*0.18)),
-                       (rx + int(eye_w*0.55), eye_y - int(eye_h*0.52)), THICK_LINE)
+        draw_glow_line(screen,
+                       (lx - int(eye_w * 0.55), eye_y - int(eye_h * 0.52)),
+                       (lx + int(eye_w * 0.55), eye_y - int(eye_h * 0.18)), THICK_LINE)
+        draw_glow_line(screen,
+                       (rx - int(eye_w * 0.55), eye_y - int(eye_h * 0.18)),
+                       (rx + int(eye_w * 0.55), eye_y - int(eye_h * 0.52)), THICK_LINE)
 
         amp = int(H * 0.010)
         pts = []
         w = int(mouth_w * 0.58)
         for i in range(54):
-            x = cx - w//2 + (i/53.0)*w
-            y = mouth_y + wob + math.sin(t*7.0 + i*0.30) * amp
+            x = cx - w // 2 + (i / 53.0) * w
+            y = mouth_y + wob + math.sin(t * 7.0 + i * 0.30) * amp
             pts.append((x, y))
         pygame.draw.lines(screen, ORANGE2, False, pts, THICK_MOUTH + 3)
         pygame.draw.lines(screen, ORANGE,  False, pts, THICK_MOUTH)
 
     pygame.display.flip()
+
 
 
 def main():
