@@ -11,9 +11,7 @@ import threading
 from typing import Optional, Dict, Callable
 import shutil
 
-
 import requests
-from shutil import which as _which
 
 
 class ActiveListener:
@@ -23,10 +21,10 @@ class ActiveListener:
         speaker_device: str = "default",
         sample_rate: int = 16000,
         detect_chunk_sec: int = 1,
-        record_sec: int = 4,
-        threshold: int = 2500,
-        cooldown_sec: float = 1.0,              # chống trigger spam
-        post_play_silence_sec: float = 0.6,     # ✅ đợi sau khi phát để mic không ăn tiếng loa
+        record_sec: int = 6,                 # ✅ ghi âm 6s
+        threshold: int = 2700,
+        cooldown_sec: float = 1.0,
+        post_play_silence_sec: float = 0.3,  # ✅ đệm nhỏ (tuỳ bạn)
         nodejs_upload_url: str = "https://embeddedprogramming-healtheworldserver.up.railway.app/upload_audio",
         on_result: Optional[Callable[[str, str, Optional[str]], None]] = None,
         debug: bool = False,
@@ -126,14 +124,56 @@ class ActiveListener:
             self._log("download error:", e)
             return None
 
+    # ===== NEW: estimate duration of returned audio =====
+    def _audio_duration_sec(self, filepath: str) -> Optional[float]:
+        """
+        Ưu tiên ffprobe để lấy duration chính xác.
+        Fallback: nếu là wav thì đọc header.
+        """
+        # 1) ffprobe (best)
+        try:
+            if shutil.which("ffprobe"):
+                p = subprocess.run(
+                    ["ffprobe", "-v", "error",
+                     "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1",
+                     filepath],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                s = (p.stdout or "").strip()
+                if s:
+                    return float(s)
+        except Exception:
+            pass
+
+        # 2) WAV header fallback
+        try:
+            if filepath.lower().endswith(".wav"):
+                with wave.open(filepath, "rb") as wf:
+                    frames = wf.getnframes()
+                    rate = wf.getframerate() or self.sample_rate
+                    if rate > 0:
+                        return float(frames) / float(rate)
+        except Exception:
+            pass
+
+        return None
+
     def _play_audio(self, filepath: str):
         """
-        Tắt mic đúng bằng thời gian đang phát:
+        ✅ Mic sẽ tắt đúng bằng thời lượng file audio server trả về:
         - set _playing trước khi play
-        - play BLOCKING (mpg123/aplay) => khi xong mới clear
-        - thêm post_play_silence_sec để tránh mic ăn lại đuôi âm
+        - play BLOCKING
+        - sau khi play xong, sleep thêm (duration + post_play_silence_sec)
         """
+        # đo duration ngay từ đầu (mp3/wav)
+        dur = self._audio_duration_sec(filepath)
+
         self._playing.set()
+        t0 = time.time()
         try:
             # mp3 -> mpg123 (blocking)
             if filepath.endswith(".mp3") and shutil.which("mpg123"):
@@ -141,29 +181,40 @@ class ActiveListener:
                     ["mpg123", "-q", "-a", self.speaker_device, filepath],
                     check=False
                 )
-                return
+            else:
+                # fallback: mp3 -> wav -> aplay (blocking)
+                if filepath.endswith(".mp3"):
+                    wav_path = filepath[:-4] + ".wav"
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-i", filepath, "-ac", "1", "-ar", str(self.sample_rate), wav_path],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    )
+                    filepath = wav_path
+                    # nếu lúc đầu chưa có duration, đo lại wav
+                    if dur is None:
+                        dur = self._audio_duration_sec(filepath)
 
-            # fallback: mp3 -> wav -> aplay (blocking)
-            if filepath.endswith(".mp3"):
-                wav_path = filepath[:-4] + ".wav"
-                subprocess.run(
-                    ["ffmpeg", "-y", "-i", filepath, "-ac", "1", "-ar", str(self.sample_rate), wav_path],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-                filepath = wav_path
-
-            # wav -> aplay (blocking)
-            subprocess.run(["aplay", "-D", self.speaker_device, "-q", filepath], check=False)
+                subprocess.run(["aplay", "-D", self.speaker_device, "-q", filepath], check=False)
 
         finally:
-            # ✅ play xong mới bật mic lại
-            self._playing.clear()
+            # play elapsed thực tế
+            elapsed = max(0.0, time.time() - t0)
 
-            # ✅ đệm thêm 0.3–1.0s tuỳ loa gần mic
+            # nếu không đo được duration, fallback dùng elapsed (thực tế)
+            target = dur if (dur is not None and dur > 0) else elapsed
+
+            # ✅ đảm bảo mic tắt đúng bằng độ dài audio (không âm)
+            extra = max(0.0, target - elapsed)
+
+            # tắt mic thêm đúng phần còn thiếu + đệm
+            if extra > 0:
+                time.sleep(extra)
             if self.post_play_silence_sec > 0:
                 time.sleep(self.post_play_silence_sec)
+
+            self._playing.clear()
 
             # cleanup wav temp nếu có
             if filepath.endswith(".wav") and "reply_" in os.path.basename(filepath):
@@ -171,7 +222,6 @@ class ActiveListener:
                     os.unlink(filepath)
                 except Exception:
                     pass
-
 
     # ------------- main loop -------------
 
@@ -208,12 +258,11 @@ class ActiveListener:
                 time.sleep(0.05)
                 continue
 
-            # ✅ nếu vừa phát xong thì skip luôn (an toàn)
             if self._playing.is_set():
                 time.sleep(0.05)
                 continue
 
-            # 2) record full
+            # 2) record full (6s)
             fd, record_file = tempfile.mkstemp(suffix=".wav", prefix="voice_")
             os.close(fd)
 
@@ -246,7 +295,7 @@ class ActiveListener:
                 except Exception as e:
                     self._log("on_result error:", e)
 
-            # 4) download + play
+            # 4) download + play (mic off depends on audio duration)
             if audio_url and not self._stop.is_set():
                 reply = self._download(audio_url)
                 if reply:
