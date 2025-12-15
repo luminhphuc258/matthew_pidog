@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, time, math, socket
+import os, time, math, socket, random
 import pygame
 
 # ===== IMPORTANT for service on desktop =====
@@ -19,6 +19,17 @@ THICK_EYE   = 3
 THICK_MOUTH = 4
 
 VALID_EMOS = {"love_eyes","music","what_is_it","suprise","sleep","sad","angry"}
+
+# ===== Equalizer palette (nhiều màu) =====
+EQ_COLORS = [
+    (255, 80, 80),    # red
+    (255, 160, 60),   # orange
+    (255, 230, 80),   # yellow
+    (140, 255, 120),  # green
+    (80, 220, 255),   # cyan
+    (120, 120, 255),  # blue
+    (210, 120, 255),  # purple
+]
 
 def clamp(v, lo, hi): return max(lo, min(hi, v))
 
@@ -137,11 +148,57 @@ def draw_music_note(screen, x, y, s, t, flip=False):
 
     pygame.draw.circle(screen, HILITE, (hx - head_r//3, hy - head_r//3), max(2, head_r//3))
 
-def render_face(screen, emo, t, mouth_level: float):
+# ===== NEW: Equalizer background =====
+def draw_equalizer_bg(screen, t, level01: float):
     W, H = screen.get_size()
-    screen.fill(BG)
+
+    # vùng equalizer phía sau (dải dưới)
+    y0 = int(H * 0.15)
+    y1 = int(H * 0.95)
+    height = y1 - y0
+
+    bars = 28
+    gap = max(2, int(W * 0.004))
+    bw = max(6, int((W - gap*(bars+1)) / bars))
+
+    # level nhẹ ngay cả khi 0 (cho nó sống động)
+    lvl = clamp(level01, 0.0, 1.0)
+    base = 0.15 + 0.35 * lvl    # base nhảy theo audio
+    gain = 0.40 + 0.70 * lvl
+
+    # nền tối hơi glow
+    # (không dùng alpha để khỏi lag)
+    pygame.draw.rect(screen, (0, 0, 0), (0, 0, W, H))
+
+    for i in range(bars):
+        # nhịp mỗi bar khác nhau
+        phase = t * (2.2 + i * 0.03) + i * 0.35
+        wavev = 0.5 + 0.5 * math.sin(phase)
+        h01 = clamp(base + gain * (wavev * 0.85), 0.05, 1.0)
+
+        bh = int(h01 * height)
+        x = gap + i * (bw + gap)
+        y = y1 - bh
+
+        col = EQ_COLORS[i % len(EQ_COLORS)]
+
+        # “glow” giả lập: vẽ 2 lớp
+        # outer
+        pygame.draw.rect(screen, (min(255, col[0]+40), min(255, col[1]+40), min(255, col[2]+40)),
+                         (x-2, y-2, bw+4, bh+4), border_radius=6)
+        # core
+        pygame.draw.rect(screen, col, (x, y, bw, bh), border_radius=6)
+
+# ===== NEW: mouth driven by MOUTH level =====
+def render_face(screen, emo, t, mouth_level01: float):
+    W, H = screen.get_size()
+
+    # background equalizer first
+    draw_equalizer_bg(screen, t, mouth_level01)
+
     cx, cy = W//2, H//2
 
+    # layout
     eye_y   = cy - int(H * 0.14)
     mouth_y = cy + int(H * 0.18)
 
@@ -155,7 +212,9 @@ def render_face(screen, emo, t, mouth_level: float):
     mouth_w = int(W * 0.56)
     mouth_h = int(H * 0.28)
 
-    phase = (t % 3.3)
+    # ===== blink nhẹ luôn luôn =====
+    # random-ish blink cycle
+    phase = (t % 3.6)
     blink = 0.0
     if phase < 0.10:
         blink = 1.0 - phase/0.10
@@ -163,37 +222,47 @@ def render_face(screen, emo, t, mouth_level: float):
         blink = (phase-0.10)/0.10
     blink = clamp(blink, 0.0, 1.0)
 
+    # “blink nhẹ” thay vì đóng mạnh
+    blink_soft = blink * 0.18
+
     pdx = int(math.sin(t*1.7) * (W * 0.012))
     pdy = int(math.sin(t*1.2 + 1.1) * (H * 0.010))
     wob = int(math.sin(t*2.4) * (H * 0.010))
+
+    # miệng nhép theo audio (0..1)
+    lvl = clamp(mouth_level01, 0.0, 1.0)
+    # độ mở (nhỏ -> vừa), để nhìn “nhép miệng” đẹp
+    mouth_open_scale = 0.12 + 0.55 * lvl
+    dyn_mouth_h = int(mouth_h * (0.16 + 0.20 * mouth_open_scale))  # cao hơn khi audio mạnh
+    dyn_mouth_w = int(mouth_w * (0.20 + 0.08 * mouth_open_scale))
 
     if emo == "love_eyes":
         heart_size = int(min(W, H) * 0.22)
         draw_heart(screen, lx, eye_y, heart_size, t)
         draw_heart(screen, rx, eye_y, heart_size, t + 0.25)
-        mouth_smile_arc_only(screen, cx, mouth_y, int(mouth_w * 0.36), int(mouth_h * 0.22), t, wob=wob)
+        # miệng vẫn nhép nhẹ theo audio để cute
+        mouth_open(screen, cx, mouth_y, dyn_mouth_w, dyn_mouth_h, wob=wob)
 
     elif emo == "music":
         note_size = int(min(W, H) * 0.28)
         draw_music_note(screen, lx, eye_y - int(H*0.02), note_size, t, flip=False)
         draw_music_note(screen, rx, eye_y - int(H*0.02), note_size, t + 0.3, flip=True)
-
-        # ✅ LIP SYNC: mở miệng theo mouth_level
-        mh = int(mouth_h * (0.10 + 0.45 * mouth_level))
-        mouth_open(screen, cx, mouth_y, int(mouth_w*0.22), mh, wob=wob)
+        mouth_open(screen, cx, mouth_y, dyn_mouth_w, dyn_mouth_h, wob=wob)
 
     elif emo == "what_is_it":
-        eye_open(screen, lx, eye_y, eye_w, eye_h, -pdx, pdy, blink*0.25)
-        eye_open(screen, rx, eye_y, eye_w, eye_h,  pdx, -pdy, blink*0.25)
-        mouth_flat(screen, cx, mouth_y, int(mouth_w*0.52), wob=wob)
+        eye_open(screen, lx, eye_y, eye_w, eye_h, -pdx, pdy, blink_soft)
+        eye_open(screen, rx, eye_y, eye_w, eye_h,  pdx, -pdy, blink_soft)
+        # nhép miệng nhẹ theo audio (nếu audio=0 thì gần như flat)
+        if lvl > 0.05:
+            mouth_open(screen, cx, mouth_y, dyn_mouth_w, dyn_mouth_h, wob=wob)
+        else:
+            mouth_flat(screen, cx, mouth_y, int(mouth_w*0.52), wob=wob)
 
     elif emo == "suprise":
-        eye_open(screen, lx, eye_y, eye_w, eye_h, 0, 0, 0.0)
-        eye_open(screen, rx, eye_y, eye_w, eye_h, 0, 0, 0.0)
-
-        # nếu đang lipsync mà emo suprise: cũng nhép miệng theo mouth_level
-        mh = int(mouth_h * (0.12 + 0.50 * mouth_level))
-        mouth_open(screen, cx, mouth_y, int(mouth_w*0.22), mh, wob=wob)
+        eye_open(screen, lx, eye_y, eye_w, eye_h, 0, 0, blink_soft)
+        eye_open(screen, rx, eye_y, eye_w, eye_h, 0, 0, blink_soft)
+        # suprise: miệng mở + nhép theo audio
+        mouth_open(screen, cx, mouth_y, max(int(mouth_w*0.20), dyn_mouth_w), max(int(mouth_h*0.24), dyn_mouth_h), wob=wob)
         ex_mark(screen, cx, cy, t)
 
     elif emo == "sleep":
@@ -203,8 +272,8 @@ def render_face(screen, emo, t, mouth_level: float):
         zzz(screen, cx, cy, t)
 
     elif emo == "sad":
-        eye_open(screen, lx, eye_y, eye_w, eye_h, -pdx, pdy + 10, blink*0.15)
-        eye_open(screen, rx, eye_y, eye_w, eye_h,  pdx, pdy + 10, blink*0.15)
+        eye_open(screen, lx, eye_y, eye_w, eye_h, -pdx, pdy + 10, blink_soft*0.8)
+        eye_open(screen, rx, eye_y, eye_w, eye_h,  pdx, pdy + 10, blink_soft*0.8)
         rect = pygame.Rect(cx - int(mouth_w*0.36)//2, mouth_y - int(mouth_h*0.22)//2 + wob,
                            int(mouth_w*0.36), int(mouth_h*0.22))
         draw_glow_arc(screen, rect, math.pi, 2*math.pi, THICK_MOUTH)
@@ -212,8 +281,9 @@ def render_face(screen, emo, t, mouth_level: float):
 
     elif emo == "angry":
         jitter = int(math.sin(t*10.0) * 6)
-        eye_open(screen, lx, eye_y, eye_w, eye_h, pdx + jitter, pdy, blink*0.05)
-        eye_open(screen, rx, eye_y, eye_w, eye_h, pdx - jitter, pdy, blink*0.05)
+        eye_open(screen, lx, eye_y, eye_w, eye_h, pdx + jitter, pdy, blink_soft*0.4)
+        eye_open(screen, rx, eye_y, eye_w, eye_h, pdx - jitter, pdy, blink_soft*0.4)
+
         draw_glow_line(screen, (lx - int(eye_w*0.55), eye_y - int(eye_h*0.52)),
                        (lx + int(eye_w*0.55), eye_y - int(eye_h*0.18)), THICK_LINE)
         draw_glow_line(screen, (rx - int(eye_w*0.55), eye_y - int(eye_h*0.18)),
@@ -231,6 +301,7 @@ def render_face(screen, emo, t, mouth_level: float):
 
     pygame.display.flip()
 
+
 def main():
     # UDP receive commands
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -238,53 +309,54 @@ def main():
     sock.setblocking(False)
 
     pygame.init()
+
     flags = pygame.FULLSCREEN | pygame.NOFRAME
     screen = pygame.display.set_mode((0, 0), flags)
     pygame.mouse.set_visible(False)
 
     emo = "what_is_it"
 
-    # ✅ mouth level (smoothed)
+    # mouth energy (smoothed)
     mouth_target = 0.0
-    mouth_level = 0.0
-    alpha = 0.35  # smoothing 0..1 (lớn = nhanh)
+    mouth_level  = 0.0
+    last_mouth_ts = 0.0
 
     while True:
         t = time.time()
 
-        # receive cmd (can receive many packets per frame)
-        for _ in range(20):
-            try:
-                data, _ = sock.recvfrom(1024)
-            except BlockingIOError:
-                break
-            except Exception:
-                break
-
+        # receive cmd
+        try:
+            data, _ = sock.recvfrom(2048)
             cmd = data.decode("utf-8", "ignore").strip()
 
-            # old format: "music"
-            if cmd in VALID_EMOS:
-                emo = cmd
-                continue
+            # Supported:
+            # - "music" (old)
+            # - "EMO music"
+            # - "MOUTH 0.53"
+            parts = cmd.split()
 
-            # optional: "EMO music"
-            if cmd.startswith("EMO "):
-                e = cmd.split(" ", 1)[1].strip()
-                if e in VALID_EMOS:
-                    emo = e
-                continue
+            if len(parts) == 1:
+                if parts[0] in VALID_EMOS:
+                    emo = parts[0]
+            elif len(parts) >= 2:
+                if parts[0].upper() == "EMO" and parts[1] in VALID_EMOS:
+                    emo = parts[1]
+                elif parts[0].upper() == "MOUTH":
+                    try:
+                        mouth_target = clamp(float(parts[1]), 0.0, 1.0)
+                        last_mouth_ts = t
+                    except Exception:
+                        pass
 
-            # NEW: "MOUTH 0.123"
-            if cmd.startswith("MOUTH "):
-                try:
-                    v = float(cmd.split(" ", 1)[1].strip())
-                    mouth_target = max(0.0, min(1.0, v))
-                except Exception:
-                    pass
+        except BlockingIOError:
+            pass
 
-        # smooth
-        mouth_level = mouth_level + alpha * (mouth_target - mouth_level)
+        # nếu lâu không nhận MOUTH -> tự về 0 (tránh miệng kẹt)
+        if last_mouth_ts > 0 and (t - last_mouth_ts) > 0.25:
+            mouth_target = 0.0
+
+        # smooth mouth
+        mouth_level = mouth_level + (mouth_target - mouth_level) * 0.22
 
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
@@ -292,6 +364,7 @@ def main():
 
         render_face(screen, emo, t, mouth_level)
         time.sleep(0.016)
+
 
 if __name__ == "__main__":
     try:
