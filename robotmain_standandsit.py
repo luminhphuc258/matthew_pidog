@@ -185,6 +185,9 @@ def main():
         do_stand()
 
         while True:
+            face.set_face("music")
+            face.tick()
+            time.sleep(0.01)
             now = time.time()
 
             # 1) manual override luôn ưu tiên

@@ -41,6 +41,7 @@ def draw_glow_circle(screen, center, r, width):
     pygame.draw.circle(screen, ORANGE2, center, r, max(1, width + 5))
     pygame.draw.circle(screen, ORANGE,  center, r, max(1, width))
 
+
 # --------------------------
 # Eyes / Mouth
 # --------------------------
@@ -76,6 +77,7 @@ def mouth_open(screen, cx, cy, w, h, wob=0):
 def mouth_flat(screen, cx, cy, w, wob=0):
     draw_glow_line(screen, (cx - w//2, cy + wob), (cx + w//2, cy + wob), THICK_MOUTH)
 
+
 # --------------------------
 # Symbols
 # --------------------------
@@ -99,6 +101,7 @@ def tears(screen, x, y, t):
     rect = pygame.Rect(x - 9, y + 18 + bob, 18, 36)
     pygame.draw.ellipse(screen, ORANGE2, rect, 5)
     pygame.draw.ellipse(screen, ORANGE,  rect, 3)
+
 
 # --------------------------
 # Heart & Music eyes
@@ -186,21 +189,13 @@ def render_face(screen, emo, t):
         heart_size = int(min(W, H) * 0.22)
         draw_heart(screen, lx, eye_y, heart_size, t)
         draw_heart(screen, rx, eye_y, heart_size, t + 0.25)
-
-        mouth_smile_arc_only(screen, cx, mouth_y,
-                             int(mouth_w * 0.36),
-                             int(mouth_h * 0.22),
-                             t, wob=wob)
+        mouth_smile_arc_only(screen, cx, mouth_y, int(mouth_w * 0.36), int(mouth_h * 0.22), t, wob=wob)
 
     elif emo == "music":
         note_size = int(min(W, H) * 0.28)
         draw_music_note(screen, lx, eye_y - int(H*0.02), note_size, t, flip=False)
         draw_music_note(screen, rx, eye_y - int(H*0.02), note_size, t + 0.3, flip=True)
-
-        mouth_smile_arc_only(screen, cx, mouth_y,
-                             int(mouth_w * 0.36),
-                             int(mouth_h * 0.22),
-                             t, wob=wob)
+        mouth_smile_arc_only(screen, cx, mouth_y, int(mouth_w * 0.36), int(mouth_h * 0.22), t, wob=wob)
 
     elif emo == "what_is_it":
         eye_open(screen, lx, eye_y, eye_w, eye_h, -pdx, pdy, blink*0.25)
@@ -222,13 +217,8 @@ def render_face(screen, emo, t):
     elif emo == "sad":
         eye_open(screen, lx, eye_y, eye_w, eye_h, -pdx, pdy + 10, blink*0.15)
         eye_open(screen, rx, eye_y, eye_w, eye_h,  pdx, pdy + 10, blink*0.15)
-
-        rect = pygame.Rect(
-            cx - int(mouth_w*0.36)//2,
-            mouth_y - int(mouth_h*0.22)//2 + wob,
-            int(mouth_w*0.36),
-            int(mouth_h*0.22)
-        )
+        rect = pygame.Rect(cx - int(mouth_w*0.36)//2, mouth_y - int(mouth_h*0.22)//2 + wob,
+                           int(mouth_w*0.36), int(mouth_h*0.22))
         draw_glow_arc(screen, rect, math.pi, 2*math.pi, THICK_MOUTH)
         tears(screen, lx + int(eye_w*0.22), eye_y + int(eye_h*0.06), t)
 
@@ -237,11 +227,9 @@ def render_face(screen, emo, t):
         eye_open(screen, lx, eye_y, eye_w, eye_h, pdx + jitter, pdy, blink*0.05)
         eye_open(screen, rx, eye_y, eye_w, eye_h, pdx - jitter, pdy, blink*0.05)
 
-        draw_glow_line(screen,
-                       (lx - int(eye_w*0.55), eye_y - int(eye_h*0.52)),
+        draw_glow_line(screen, (lx - int(eye_w*0.55), eye_y - int(eye_h*0.52)),
                        (lx + int(eye_w*0.55), eye_y - int(eye_h*0.18)), THICK_LINE)
-        draw_glow_line(screen,
-                       (rx - int(eye_w*0.55), eye_y - int(eye_h*0.18)),
+        draw_glow_line(screen, (rx - int(eye_w*0.55), eye_y - int(eye_h*0.18)),
                        (rx + int(eye_w*0.55), eye_y - int(eye_h*0.52)), THICK_LINE)
 
         amp = int(H * 0.010)
@@ -257,10 +245,11 @@ def render_face(screen, emo, t):
 
 class FaceDisplay:
     """
-    Pygame FaceDisplay:
-    - start() chạy nền
-    - set_face() đổi mặt vĩnh viễn
-    - push_face(ttl) đổi mặt tạm thời rồi quay lại
+    Stable version (pygame in main thread):
+    - start(): init pygame
+    - tick(): render 1 frame (non-blocking)
+    - set_face(): đổi mặt vĩnh viễn
+    - push_face(ttl): đổi mặt tạm thời
     """
 
     SUPPORTED = ["love_eyes", "music", "what_is_it", "suprise", "sleep", "sad", "angry"]
@@ -274,9 +263,6 @@ class FaceDisplay:
             default_face = "music"
 
         self._lock = threading.Lock()
-        self._running = False
-        self._thread = None
-
         self._screen = None
         self._clock = None
 
@@ -284,21 +270,21 @@ class FaceDisplay:
         self._stack = []
         self._push_until = 0.0
 
-        self._should_quit = False
+        self._quit = False
+        self._last_tick = 0.0
 
-    # ----- public API -----
     def start(self):
-        if self._running:
-            return
-        self._running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
+        pygame.init()
+        flags = pygame.FULLSCREEN if self.fullscreen else 0
+        self._screen = pygame.display.set_mode((0, 0), flags)
+        pygame.display.set_caption("Robot FaceDisplay")
+        if self.hide_mouse:
+            pygame.mouse.set_visible(False)
+        self._clock = pygame.time.Clock()
+        self._last_tick = time.monotonic()
 
     def stop(self):
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=1.0)
-            self._thread = None
+        self._quit = True
         try:
             pygame.quit()
         except Exception:
@@ -323,86 +309,40 @@ class FaceDisplay:
             self._push_until = now + ttl
 
     def should_quit(self) -> bool:
-        return self._should_quit
+        return self._quit
 
-    # Optional: nếu bạn muốn chạy loop ngay trong main (không thread)
-    def run_forever(self):
-        self._init_pygame()
-        self._run_loop()
+    def tick(self):
+        """Call liên tục trong main loop."""
+        if self._screen is None:
+            return
 
-    # ----- internal -----
-    def _init_pygame(self):
-        pygame.init()
-        flags = pygame.FULLSCREEN if self.fullscreen else 0
-        self._screen = pygame.display.set_mode((0, 0), flags)
-        pygame.display.set_caption("Robot FaceDisplay")
-        if self.hide_mouse:
-            pygame.mouse.set_visible(False)
-        self._clock = pygame.time.Clock()
-
-    def _poll_events(self):
+        # events
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
-                self._should_quit = True
+                self._quit = True
             if e.type == pygame.KEYDOWN:
                 if e.key in (pygame.K_ESCAPE, pygame.K_q):
-                    self._should_quit = True
+                    self._quit = True
 
-    def _loop(self):
-        # Thread entry
-        self._init_pygame()
-        self._run_loop()
+        now = time.monotonic()
+        with self._lock:
+            if self._push_until > 0.0 and now >= self._push_until:
+                if self._stack:
+                    self._face = self._stack.pop()
+                self._push_until = 0.0
+            face = self._face
 
-    def _run_loop(self):
-        while self._running and not self._should_quit:
-            now = time.monotonic()
-
-            # handle push timeout
-            with self._lock:
-                if self._push_until > 0.0 and now >= self._push_until:
-                    if self._stack:
-                        self._face = self._stack.pop()
-                    self._push_until = 0.0
-                face = self._face
-
-            self._poll_events()
-            render_face(self._screen, face, time.time())  # use wall time for smooth motion
-            pygame.display.flip()
-            self._clock.tick(self.fps)
-
-        self._running = False
-        try:
-            pygame.quit()
-        except Exception:
-            pass
+        render_face(self._screen, face, time.time())
+        pygame.display.flip()
+        self._clock.tick(self.fps)
 
 
-# --------------------------
-# Example main usage
-# --------------------------
 if __name__ == "__main__":
     face = FaceDisplay(fps=60, default_face="music", fullscreen=True)
     face.start()
-
     try:
-        # Demo: giả lập output class khác
         while not face.should_quit():
-            face.set_face("music")
-            time.sleep(2)
-
-            face.push_face("suprise", ttl=1.0)  # event tạm
-            time.sleep(2)
-
-            face.set_face("love_eyes")
-            time.sleep(2)
-
-            face.set_face("sad")
-            time.sleep(2)
-
-            face.push_face("angry", ttl=1.3)
-            time.sleep(2)
-
-    except KeyboardInterrupt:
-        pass
+            face.tick()
+            time.sleep(0.001)
     finally:
         face.stop()
