@@ -5,16 +5,32 @@ import os
 import time
 import wave
 import struct
+import math
 import tempfile
 import subprocess
 import threading
 from typing import Optional, Dict, Callable
 import shutil
+import socket
 
 import requests
 
 
 class ActiveListener:
+    """
+    Active listening + auto-reply audio playback + lip-sync (UDP to face3d).
+
+    - Detect sound with short chunks.
+    - If triggered: record full audio (default 6s) -> upload -> receive transcript/label/audio_url.
+    - Download reply audio -> play it (blocking).
+    - During playback:
+        * disable listening (self._playing is set)
+        * lip-sync: send UDP "MOUTH <0..1>" based on WAV RMS (50fps)
+        * set face EMO music
+    - During recording/listening:
+        * set face EMO suprise (optional)
+    """
+
     def __init__(
         self,
         mic_device: str = "default",
@@ -24,10 +40,16 @@ class ActiveListener:
         record_sec: int = 6,                 # ✅ ghi âm 6s
         threshold: int = 2700,
         cooldown_sec: float = 1.0,
-        post_play_silence_sec: float = 0.3,  # ✅ đệm nhỏ (tuỳ bạn)
+        post_play_silence_sec: float = 0.3,  # đệm nhỏ sau khi phát
         nodejs_upload_url: str = "https://embeddedprogramming-healtheworldserver.up.railway.app/upload_audio",
         on_result: Optional[Callable[[str, str, Optional[str]], None]] = None,
         debug: bool = False,
+
+        # UDP to face3d
+        face_host: str = "127.0.0.1",
+        face_port: int = 39393,
+        lipsync_fps: int = 50,
+        lipsync_gain: float = 9000.0,        # normalize RMS -> 0..1 (tự chỉnh)
     ):
         self.mic_device = mic_device
         self.speaker_device = speaker_device
@@ -41,10 +63,15 @@ class ActiveListener:
         self.on_result = on_result
         self.debug = bool(debug)
 
+        self.face_host = face_host
+        self.face_port = int(face_port)
+        self.lipsync_fps = int(lipsync_fps)
+        self.lipsync_gain = float(lipsync_gain)
+
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
-        # ✅ flag: đang phát âm thanh => không record
+        # ✅ flag: đang phát âm thanh => không record/detect
         self._playing = threading.Event()
 
         self.last_transcript: str = ""
@@ -52,7 +79,7 @@ class ActiveListener:
         self.last_audio_url: Optional[str] = None
         self.last_ts: float = 0.0
 
-    # ------------- public -------------
+    # ---------------- public ----------------
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -68,11 +95,23 @@ class ActiveListener:
         if self._thread:
             self._thread.join(timeout=timeout)
 
-    # ------------- utils -------------
+    def is_playing(self) -> bool:
+        return self._playing.is_set()
+
+    # ---------------- utils ----------------
 
     def _log(self, *a):
         if self.debug:
             print("[LISTENER]", *a, flush=True)
+
+    def send_face_cmd(self, msg: str):
+        """Send one UDP command line to face3d service."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.sendto(msg.encode("utf-8"), (self.face_host, self.face_port))
+            s.close()
+        except Exception:
+            pass
 
     def _record_wav(self, filename: str, seconds: int) -> bool:
         cmd = [
@@ -124,112 +163,153 @@ class ActiveListener:
             self._log("download error:", e)
             return None
 
-    # ===== NEW: estimate duration of returned audio =====
-    def _audio_duration_sec(self, filepath: str) -> Optional[float]:
-        """
-        Ưu tiên ffprobe để lấy duration chính xác.
-        Fallback: nếu là wav thì đọc header.
-        """
-        # 1) ffprobe (best)
-        try:
-            if shutil.which("ffprobe"):
-                p = subprocess.run(
-                    ["ffprobe", "-v", "error",
-                     "-show_entries", "format=duration",
-                     "-of", "default=noprint_wrappers=1:nokey=1",
-                     filepath],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    check=False,
-                )
-                s = (p.stdout or "").strip()
-                if s:
-                    return float(s)
-        except Exception:
-            pass
+    # ---------------- lip-sync helpers ----------------
 
-        # 2) WAV header fallback
-        try:
-            if filepath.lower().endswith(".wav"):
-                with wave.open(filepath, "rb") as wf:
-                    frames = wf.getnframes()
-                    rate = wf.getframerate() or self.sample_rate
-                    if rate > 0:
-                        return float(frames) / float(rate)
-        except Exception:
-            pass
+    def _ensure_wav(self, filepath: str) -> Optional[str]:
+        """
+        Ensure we have a WAV file for lip-sync RMS reading.
+        Returns path to wav (may be same as input) or None if cannot.
+        """
+        if filepath.lower().endswith(".wav") and os.path.exists(filepath):
+            return filepath
+
+        if filepath.lower().endswith(".mp3") and os.path.exists(filepath):
+            if not shutil.which("ffmpeg"):
+                return None
+            wav_path = filepath[:-4] + ".wav"
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", filepath, "-ac", "1", "-ar", str(self.sample_rate), wav_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if os.path.exists(wav_path):
+                return wav_path
 
         return None
 
-    def _play_audio(self, filepath: str):
+    def _rms_stream_wav(self, wav_path: str):
         """
-        ✅ Mic sẽ tắt đúng bằng thời lượng file audio server trả về:
-        - set _playing trước khi play
-        - play BLOCKING
-        - sau khi play xong, sleep thêm (duration + post_play_silence_sec)
+        Read wav file progressively and send mouth level at lipsync_fps.
+        NOTE: This reads from file; since aplay plays same wav file,
+        timing is "close enough" for lip-sync (robot style).
         """
-        # đo duration ngay từ đầu (mp3/wav)
-        dur = self._audio_duration_sec(filepath)
+        fps = max(10, self.lipsync_fps)
+        dt = 1.0 / fps
 
-        self._playing.set()
-        t0 = time.time()
         try:
-            # mp3 -> mpg123 (blocking)
-            if filepath.endswith(".mp3") and shutil.which("mpg123"):
-                subprocess.run(
-                    ["mpg123", "-q", "-a", self.speaker_device, filepath],
-                    check=False
-                )
-            else:
-                # fallback: mp3 -> wav -> aplay (blocking)
-                if filepath.endswith(".mp3"):
-                    wav_path = filepath[:-4] + ".wav"
-                    subprocess.run(
-                        ["ffmpeg", "-y", "-i", filepath, "-ac", "1", "-ar", str(self.sample_rate), wav_path],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        check=False,
-                    )
-                    filepath = wav_path
-                    # nếu lúc đầu chưa có duration, đo lại wav
-                    if dur is None:
-                        dur = self._audio_duration_sec(filepath)
+            wf = wave.open(wav_path, "rb")
+            rate = wf.getframerate() or self.sample_rate
+            ch = wf.getnchannels()
+            sw = wf.getsampwidth()
 
-                subprocess.run(["aplay", "-D", self.speaker_device, "-q", filepath], check=False)
+            if sw != 2:
+                wf.close()
+                return
+
+            frames_per = int(rate * dt)
+            if frames_per <= 0:
+                frames_per = 320
+
+            # while playing
+            while self._playing.is_set() and not self._stop.is_set():
+                frames = wf.readframes(frames_per)
+                if not frames:
+                    break
+
+                n = len(frames) // 2
+                if n <= 0:
+                    time.sleep(dt)
+                    continue
+
+                samples = struct.unpack("<" + "h" * n, frames)
+
+                # if stereo, pick first channel
+                if ch > 1:
+                    samples = samples[::ch]
+
+                ss = 0.0
+                for s in samples:
+                    ss += float(s) * float(s)
+                rms = math.sqrt(ss / max(1, len(samples)))
+
+                lvl = rms / self.lipsync_gain
+                lvl = 0.0 if lvl < 0 else (1.0 if lvl > 1.0 else lvl)
+
+                self.send_face_cmd(f"MOUTH {lvl:.3f}")
+                time.sleep(dt)
+
+            wf.close()
+
+        except Exception:
+            pass
+        finally:
+            # close mouth at end
+            self.send_face_cmd("MOUTH 0.0")
+
+    def _play_audio_with_lipsync(self, filepath: str):
+        """
+        Playback audio + lipsync.
+        - Set _playing ON before playback -> main loop pauses listening.
+        - Set face EMO music during playback.
+        - Lipsync based on WAV RMS while aplay is running.
+        """
+        self._playing.set()
+        wav_path = None
+        created_wav = False
+
+        try:
+            # show music face while speaking
+            self.send_face_cmd("EMO music")
+
+            wav_path = self._ensure_wav(filepath)
+            if wav_path and wav_path != filepath and filepath.lower().endswith(".mp3"):
+                created_wav = True
+
+            # start lipsync thread only if wav exists
+            lip_thread = None
+            if wav_path and os.path.exists(wav_path):
+                lip_thread = threading.Thread(target=self._rms_stream_wav, args=(wav_path,), daemon=True)
+                lip_thread.start()
+
+            # play blocking (so mic-off duration equals actual audio duration)
+            if wav_path and os.path.exists(wav_path):
+                subprocess.run(["aplay", "-D", self.speaker_device, "-q", wav_path], check=False)
+            else:
+                # fallback: if mp3 and mpg123 exists
+                if filepath.lower().endswith(".mp3") and shutil.which("mpg123"):
+                    subprocess.run(["mpg123", "-q", "-a", self.speaker_device, filepath], check=False)
+                else:
+                    subprocess.run(["aplay", "-D", self.speaker_device, "-q", filepath], check=False)
+
+            # wait a bit for lipsync thread to send MOUTH 0
+            if lip_thread:
+                lip_thread.join(timeout=0.5)
 
         finally:
-            # play elapsed thực tế
-            elapsed = max(0.0, time.time() - t0)
+            self._playing.clear()
 
-            # nếu không đo được duration, fallback dùng elapsed (thực tế)
-            target = dur if (dur is not None and dur > 0) else elapsed
-
-            # ✅ đảm bảo mic tắt đúng bằng độ dài audio (không âm)
-            extra = max(0.0, target - elapsed)
-
-            # tắt mic thêm đúng phần còn thiếu + đệm
-            if extra > 0:
-                time.sleep(extra)
+            # small post-play delay to avoid mic catching tail
             if self.post_play_silence_sec > 0:
                 time.sleep(self.post_play_silence_sec)
 
-            self._playing.clear()
+            # cleanup wav temp created from mp3
+            try:
+                if created_wav and wav_path and os.path.exists(wav_path):
+                    os.unlink(wav_path)
+            except Exception:
+                pass
 
-            # cleanup wav temp nếu có
-            if filepath.endswith(".wav") and "reply_" in os.path.basename(filepath):
-                try:
-                    os.unlink(filepath)
-                except Exception:
-                    pass
+            # close mouth
+            self.send_face_cmd("MOUTH 0.0")
 
-    # ------------- main loop -------------
+    # ---------------- main loop ----------------
 
     def _loop(self):
         self._log("start", "mic=", self.mic_device, "spk=", self.speaker_device)
 
         while not self._stop.is_set():
-            # ✅ nếu đang phát âm thanh => không ghi âm/detect
+            # if currently playing -> do nothing
             if self._playing.is_set():
                 time.sleep(0.05)
                 continue
@@ -258,9 +338,14 @@ class ActiveListener:
                 time.sleep(0.05)
                 continue
 
+            # safety: if just entered playing state
             if self._playing.is_set():
                 time.sleep(0.05)
                 continue
+
+            # ✅ listening/recording face
+            self.send_face_cmd("EMO suprise")
+            self.send_face_cmd("MOUTH 0.0")
 
             # 2) record full (6s)
             fd, record_file = tempfile.mkstemp(suffix=".wav", prefix="voice_")
@@ -295,15 +380,17 @@ class ActiveListener:
                 except Exception as e:
                     self._log("on_result error:", e)
 
-            # 4) download + play (mic off depends on audio duration)
+            # 4) download + play (mic-off duration equals playback duration)
             if audio_url and not self._stop.is_set():
                 reply = self._download(audio_url)
                 if reply:
-                    self._play_audio(reply)
                     try:
-                        os.unlink(reply)
-                    except Exception:
-                        pass
+                        self._play_audio_with_lipsync(reply)
+                    finally:
+                        try:
+                            os.unlink(reply)
+                        except Exception:
+                            pass
 
             time.sleep(0.05)
 
