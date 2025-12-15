@@ -24,7 +24,6 @@ class MqttSensorState:
     dist_cm: Optional[float] = None
     temp_c: Optional[float] = None
     humid: Optional[float] = None
-    raw: Optional[Dict[str, Any]] = None
     err: Optional[str] = None
 
 
@@ -46,13 +45,14 @@ def _to_float(x):
 
 class WebDashboard:
     """
-    - /            HTML dashboard (camera + quick status + toggles)
+    - /            HTML dashboard
     - /mjpeg       live video
-    - /status      mqtt sensor state + toggles
-    - /cmd         manual command (optional)
-    - /toggle_listen  toggle active listening
-    - /toggle_auto    toggle auto-move
-    - /health      quick ping
+    - /status      mqtt sensor + toggles
+    - /cmd         manual command
+    - /toggle_listen      listen-only
+    - /toggle_auto        auto-move only
+    - /toggle_listen_run  (NEW) listen + auto-move (test)
+    - /health
     """
 
     def __init__(
@@ -60,11 +60,8 @@ class WebDashboard:
         host="0.0.0.0",
         port=8000,
         get_jpeg: Optional[Callable[[], Optional[bytes]]] = None,
-
-        # optional manual command callback (FORWARD/BACK/LEFT/RIGHT/STOP)
         on_manual_cmd: Optional[Callable[[str], None]] = None,
 
-        # MQTT config (subscribe sensors directly here)
         mqtt_enable: bool = True,
         mqtt_host: str = "localhost",
         mqtt_port: int = 1883,
@@ -95,18 +92,18 @@ class WebDashboard:
         self._sensor = MqttSensorState()
 
         # toggles
-        self._listen_on = False
-        self._auto_on = False
+        self._listen_on = False          # listen-only
+        self._auto_on = False            # auto move only
+        self._listen_run_on = False      # NEW: listen + run (test)
 
         self.app = Flask(__name__)
         self._setup_routes()
 
-        # start mqtt background
         self._mqtt_client = None
         if self.mqtt_enable:
             self._start_mqtt()
 
-    # ---------- Public getters for main loop ----------
+    # ===== public getters =====
     def is_listen_on(self) -> bool:
         with self._lock:
             return bool(self._listen_on)
@@ -115,7 +112,11 @@ class WebDashboard:
         with self._lock:
             return bool(self._auto_on)
 
-    # ---------- MQTT ----------
+    def is_listen_run_on(self) -> bool:
+        with self._lock:
+            return bool(self._listen_run_on)
+
+    # ===== MQTT =====
     def _start_mqtt(self):
         if mqtt is None:
             with self._lock:
@@ -129,14 +130,13 @@ class WebDashboard:
             c.username_pw_set(self.mqtt_user, self.mqtt_pass or "")
 
         if self.mqtt_tls:
-            # basic TLS (works with EMQX)
             c.tls_set()
             if self.mqtt_insecure:
                 c.tls_insecure_set(True)
 
         def on_connect(client, userdata, flags, rc):
             if self.mqtt_debug:
-                print("[WebDash MQTT] connect rc=", rc)
+                print("[WebDash MQTT] connect rc=", rc, flush=True)
             if rc == 0:
                 client.subscribe(self.mqtt_topic, qos=0)
                 with self._lock:
@@ -149,20 +149,17 @@ class WebDashboard:
 
         def on_disconnect(client, userdata, rc):
             if self.mqtt_debug:
-                print("[WebDash MQTT] disconnect rc=", rc)
+                print("[WebDash MQTT] disconnect rc=", rc, flush=True)
             with self._lock:
                 self._sensor.ok = False
                 self._sensor.err = f"disconnect rc={rc}"
 
         def on_message(client, userdata, msg):
             now = time.time()
-            payload = msg.payload
             data = None
             err = None
-
-            # decode
             try:
-                s = payload.decode("utf-8", errors="ignore").strip()
+                s = msg.payload.decode("utf-8", errors="ignore").strip()
                 data = json.loads(s)
                 if not isinstance(data, dict):
                     data = {"value": data}
@@ -171,25 +168,21 @@ class WebDashboard:
                 data = None
 
             with self._lock:
-                # dt
                 if self._sensor.last_ts > 0:
                     self._sensor.dt_ms = int((now - self._sensor.last_ts) * 1000)
                 self._sensor.last_ts = now
 
                 if data is not None:
-                    # try multiple possible key names
                     dist = _pick(data, ["uart_dist_cm", "dist_cm", "distance_cm", "distance", "dist", "range_cm"])
                     temp = _pick(data, ["uart_temp_c", "temp_c", "temperature_c", "temperature", "temp", "t"])
                     hum  = _pick(data, ["uart_humid", "humid", "humidity", "hum", "h"])
 
                     self._sensor.dist_cm = _to_float(dist)
-                    self._sensor.temp_c  = _to_float(temp)
-                    self._sensor.humid   = _to_float(hum)
-                    self._sensor.raw = data
+                    self._sensor.temp_c = _to_float(temp)
+                    self._sensor.humid = _to_float(hum)
                     self._sensor.err = None
                     self._sensor.ok = True
                 else:
-                    # keep last values, just note error
                     self._sensor.err = err
                     self._sensor.ok = False
 
@@ -199,7 +192,6 @@ class WebDashboard:
 
         self._mqtt_client = c
 
-        # Connect in background
         def loop():
             try:
                 c.connect(self.mqtt_host, self.mqtt_port, keepalive=30)
@@ -211,7 +203,7 @@ class WebDashboard:
 
         threading.Thread(target=loop, daemon=True).start()
 
-    # ---------- Routes ----------
+    # ===== Routes =====
     def _setup_routes(self):
         @self.app.get("/health")
         def health():
@@ -236,27 +228,51 @@ class WebDashboard:
                     "toggles": {
                         "listening": self._listen_on,
                         "auto_move": self._auto_on,
+                        "listen_run": self._listen_run_on,
                     },
-                    "raw": self._sensor.raw,  # optional debug
                 })
 
+        # listen-only: bật -> tắt auto + tắt listen_run
         @self.app.post("/toggle_listen")
         def toggle_listen():
             with self._lock:
                 self._listen_on = not self._listen_on
-                # rule: bật listening -> tắt auto move luôn để robot đứng yên
                 if self._listen_on:
                     self._auto_on = False
-                return jsonify({"ok": True, "listening": self._listen_on, "auto_move": self._auto_on})
+                    self._listen_run_on = False
+                return jsonify({"ok": True, "toggles": {
+                    "listening": self._listen_on,
+                    "auto_move": self._auto_on,
+                    "listen_run": self._listen_run_on,
+                }})
 
+        # auto-only: bật -> tắt listen + tắt listen_run
         @self.app.post("/toggle_auto")
         def toggle_auto():
             with self._lock:
                 self._auto_on = not self._auto_on
-                # rule: bật auto -> tắt listening (đỡ tốn pin + tránh xung đột)
                 if self._auto_on:
                     self._listen_on = False
-                return jsonify({"ok": True, "auto_move": self._auto_on, "listening": self._listen_on})
+                    self._listen_run_on = False
+                return jsonify({"ok": True, "toggles": {
+                    "listening": self._listen_on,
+                    "auto_move": self._auto_on,
+                    "listen_run": self._listen_run_on,
+                }})
+
+        # NEW: listen&run: bật -> bật auto + tắt listen-only
+        @self.app.post("/toggle_listen_run")
+        def toggle_listen_run():
+            with self._lock:
+                self._listen_run_on = not self._listen_run_on
+                if self._listen_run_on:
+                    self._listen_on = False
+                    self._auto_on = True
+                return jsonify({"ok": True, "toggles": {
+                    "listening": self._listen_on,
+                    "auto_move": self._auto_on,
+                    "listen_run": self._listen_run_on,
+                }})
 
         @self.app.get("/cmd")
         def cmd():
@@ -315,10 +331,11 @@ class WebDashboard:
     .kv { display:flex; gap:12px; flex-wrap:wrap; margin-top:10px; }
     .pill { background:#1b1b1b; border:1px solid #333; padding:6px 10px; border-radius:999px; }
     .err { color:#ff6b6b; }
-    .ok { color:#7CFC90; }
     .btn-on { background:#1f7a3a; color:#fff; }
     .btn-off { background:#444; color:#fff; }
     .btn-warn { background:#8a1f1f; color:#fff; }
+    .btn-test-on { background:#2d4f9e; color:#fff; }
+    .btn-test-off { background:#1f2f55; color:#fff; }
   </style>
 </head>
 <body>
@@ -350,9 +367,7 @@ class WebDashboard:
         <div class="kv">
           <button id="btnListen" class="btn-off" onclick="toggleListen()">Active Listening: OFF</button>
           <button id="btnAuto" class="btn-off" onclick="toggleAuto()">Auto Move: OFF</button>
-        </div>
-        <div style="margin-top:8px; color:#aaa; font-size:13px;">
-          *Listening ON → robot phải đứng yên và Auto Move sẽ tự tắt.
+          <button id="btnListenRun" class="btn-test-off" onclick="toggleListenRun()">Listen & Run (TEST): OFF</button>
         </div>
       </div>
 
@@ -379,16 +394,9 @@ class WebDashboard:
   </div>
 
 <script>
-function setBtn(el, on, labelOn, labelOff){
-  if(on){
-    el.classList.remove('btn-off');
-    el.classList.add('btn-on');
-    el.textContent = labelOn;
-  }else{
-    el.classList.remove('btn-on');
-    el.classList.add('btn-off');
-    el.textContent = labelOff;
-  }
+function setBtn(el, on, labelOn, labelOff, clsOn, clsOff){
+  el.className = on ? clsOn : clsOff;
+  el.textContent = on ? labelOn : labelOff;
 }
 
 async function refresh(){
@@ -409,12 +417,16 @@ async function refresh(){
 
     const listenOn = j?.toggles?.listening === true;
     const autoOn = j?.toggles?.auto_move === true;
+    const lrOn = j?.toggles?.listen_run === true;
 
     setBtn(document.getElementById('btnListen'), listenOn,
-           'Active Listening: ON', 'Active Listening: OFF');
+      'Active Listening: ON', 'Active Listening: OFF', 'btn-on', 'btn-off');
 
     setBtn(document.getElementById('btnAuto'), autoOn,
-           'Auto Move: ON', 'Auto Move: OFF');
+      'Auto Move: ON', 'Auto Move: OFF', 'btn-on', 'btn-off');
+
+    setBtn(document.getElementById('btnListenRun'), lrOn,
+      'Listen & Run (TEST): ON', 'Listen & Run (TEST): OFF', 'btn-test-on', 'btn-test-off');
 
     errEl.textContent = (j?.mqtt?.err ? ('MQTT ERROR: ' + j.mqtt.err) : '');
   }catch(e){
@@ -426,13 +438,14 @@ async function refresh(){
 async function cmd(m){
   await fetch('/cmd?move=' + m, {cache:'no-store'});
 }
-
 async function toggleListen(){
   await fetch('/toggle_listen', {method:'POST'});
 }
-
 async function toggleAuto(){
   await fetch('/toggle_auto', {method:'POST'});
+}
+async function toggleListenRun(){
+  await fetch('/toggle_listen_run', {method:'POST'});
 }
 
 refresh();

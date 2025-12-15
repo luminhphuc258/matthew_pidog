@@ -21,15 +21,12 @@ POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
 MIC_DEVICE = "default"
 SPK_DEVICE = "default"
 
-# ===== FLOW TIMING =====
 WAIT_IDLE_SEC = 9.0
 ACTION_SEC = 2.0
 
-# ===== MANUAL OVERRIDE =====
 manual = {"move": None, "ts": 0.0}
 manual_timeout_sec = 1.2
 
-# ========= FACE SERVICE (UDP) =========
 FACE_HOST = "127.0.0.1"
 FACE_PORT = 39393
 _face_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -40,17 +37,14 @@ def set_face(emo: str):
     except Exception:
         pass
 
-
 def run(cmd):
     return subprocess.run(cmd, check=False)
-
 
 def set_volumes():
     run(["amixer", "-q", "sset", "robot-hat speaker", "100%"])
     run(["amixer", "-q", "sset", "robot-hat speaker Playback Volume", "100%"])
     run(["amixer", "-q", "sset", "robot-hat mic", "100%"])
     run(["amixer", "-q", "sset", "robot-hat mic Capture Volume", "100%"])
-
 
 def json_safe(x):
     if isinstance(x, (np.bool_,)):
@@ -67,13 +61,11 @@ def json_safe(x):
 
 
 def main():
-    # reduce audio backend conflicts
     os.environ.setdefault("SDL_AUDIODRIVER", "alsa")
     os.environ.setdefault("PULSE_SERVER", "")
     os.environ.setdefault("JACK_NO_START_SERVER", "1")
 
-    # 1) perception (CAM + decision)
-    # NOTE: nếu planner cần MQTT để quyết định né vật cản, giữ enable_mqtt=True như bạn đang dùng.
+    # 1) perception
     planner = PerceptionPlanner(
         cam_dev="/dev/video0",
         w=640, h=480, fps=30,
@@ -103,7 +95,6 @@ def main():
 
     dog = getattr(motion, "dog", None)
 
-    # LED helper (pidog rgb_strip)
     def set_led(color: str, bps: float = 0.5):
         try:
             if dog and hasattr(dog, "rgb_strip"):
@@ -113,7 +104,7 @@ def main():
 
     set_led("white", bps=0.4)
 
-    # 3) Active listening (we will recreate this object when toggled ON)
+    # 3) active listener (create/stop on demand)
     listener = None
 
     def start_listener():
@@ -144,10 +135,14 @@ def main():
             pass
         listener = None
 
-    # default: listener ON lúc boot (bạn có thể đổi thành OFF nếu muốn tiết kiệm pin)
-    start_listener()
+    def listener_is_playing() -> bool:
+        # bạn đang dùng self._playing = threading.Event()
+        try:
+            return (listener is not None) and listener._playing.is_set()
+        except Exception:
+            return False
 
-    # manual override
+    # manual
     def on_manual_cmd(move: str):
         manual["move"] = (move or "STOP").upper()
         manual["ts"] = time.time()
@@ -155,7 +150,7 @@ def main():
     def manual_active():
         return manual["move"] and (time.time() - manual["ts"] < manual_timeout_sec)
 
-    # 4) web dashboard (MQTT trực tiếp ở WebDashboard)
+    # 4) web dashboard (3 nút)
     web = WebDashboard(
         host="0.0.0.0",
         port=8000,
@@ -169,13 +164,13 @@ def main():
         mqtt_pass="29061992abCD!yesokmen",
         mqtt_topic="/pidog/sensorhubdata",
         mqtt_client_id="pidog-webdash",
-        mqtt_tls=True,       # EMQX SSL
+        mqtt_tls=True,
         mqtt_insecure=True,
         mqtt_debug=False,
     )
     threading.Thread(target=web.run, daemon=True).start()
 
-    # ===== Helpers =====
+    # helpers
     def apply_pose_config():
         try:
             cfg = motion.load_pose_config()
@@ -190,7 +185,6 @@ def main():
             pass
 
     def do_action_for(action: str, sec: float):
-        """Chạy action trong sec giây, nhưng nếu manual thì thoát ngay."""
         t0 = time.time()
         while time.time() - t0 < sec:
             if manual_active():
@@ -201,26 +195,20 @@ def main():
                 pass
             time.sleep(0.02)
 
-    # normalize command names
     def norm_move(m: str) -> str:
         m = (m or "STOP").upper()
         if m == "BACKWARD":
-            return "BACK"  # nếu MotionController của bạn dùng BACK
+            return "BACK"   # nếu MotionController bạn dùng BACK
         return m
 
-    # ===== Random actions =====
     ACTIONS = ["FORWARD", "BACKWARD", "TURN_LEFT", "TURN_RIGHT", "STOP"]
 
     def pick_random_action():
         return random.choice(ACTIONS)
 
-    # ===== Flow State =====
     state = "IDLE_WAIT"
     until = time.time() + WAIT_IDLE_SEC
     chosen_action = "STOP"
-
-    # ===== Mode cache (để tránh stop/start listener liên tục) =====
-    last_listen_on = None
 
     try:
         do_stand()
@@ -229,46 +217,21 @@ def main():
         while True:
             now = time.time()
 
-            # ===== 0) đọc toggles từ web =====
-            listen_on = web.is_listen_on()
-            auto_on = web.is_auto_on()
+            listen_only = web.is_listen_on()
+            auto_only = web.is_auto_on()
+            listen_run = web.is_listen_run_on()
 
-            # ===== 1) LISTENING MODE: ưu tiên cao nhất -> robot đứng yên tuyệt đối =====
-            if listen_on:
-                # tắt auto move (WebDashboard đã auto tắt khi bật listening, nhưng mình vẫn chặn ở đây)
-                # tắt motion hoàn toàn
-                do_stand()
-                set_led("white", bps=0.25)
-                set_face("sleep")
+            # ===== MODE 1: Listen & Run (TEST) =====
+            if listen_run:
+                start_listener()
 
-                # tắt listener thật để tiết kiệm pin (nếu đang chạy)
-                if last_listen_on is not True:
-                    start_listener()
-                time.sleep(0.05)
-                last_listen_on = True
-                continue
-            else:
-                # listening OFF -> tắt listener để tiết kiệm pin
-                if last_listen_on is not False:
-                    stop_listener()
-                last_listen_on = False
+                # face: nếu đang phát loa => music, còn lại suprise (đang listening)
+                set_face("music" if listener_is_playing() else "suprise")
 
-            # ===== 2) MANUAL OVERRIDE (chỉ khi không Listening) =====
-            if manual_active():
-                set_led("white", bps=0.6)
-                set_face("music")
-                motion.execute(norm_move(manual["move"]))
-                time.sleep(0.02)
-                continue
-            else:
-                manual["move"] = None
-
-            # ===== 3) AUTO MOVE MODE (chỉ khi không Listening) =====
-            if auto_on:
                 st = planner.get_state()
                 decision = norm_move(getattr(st, "decision", "FORWARD") or "FORWARD")
 
-                # hard safety stop (ưu tiên)
+                # safety stop
                 dist = getattr(st, "uart_dist_cm", None)
                 try:
                     if dist is not None and float(dist) < 10.0:
@@ -276,29 +239,51 @@ def main():
                 except Exception:
                     pass
 
-                # face + led
-                if decision == "FORWARD":
-                    set_face("music")
-                    set_led("white", bps=0.5)
-                elif decision in ("TURN_LEFT", "TURN_RIGHT"):
-                    set_face("suprise")
-                    set_led("white", bps=0.8)
-                elif decision in ("BACK", "BACKWARD"):
-                    set_face("sad")
-                    set_led("white", bps=0.8)
-                else:
-                    set_face("what_is_it")
-                    set_led("white", bps=0.3)
-
                 motion.execute(decision)
                 time.sleep(0.02)
                 continue
 
-            # ===== 4) RANDOM FLOW (khi Auto Move OFF) =====
+            # ===== MODE 2: Active Listening (listen-only) =====
+            if listen_only:
+                start_listener()
+                do_stand()
+                set_face("music" if listener_is_playing() else "suprise")
+                time.sleep(0.05)
+                continue
+
+            # ===== MODE 3: Auto Move (move-only) =====
+            if auto_only:
+                stop_listener()
+                st = planner.get_state()
+                decision = norm_move(getattr(st, "decision", "FORWARD") or "FORWARD")
+
+                dist = getattr(st, "uart_dist_cm", None)
+                try:
+                    if dist is not None and float(dist) < 10.0:
+                        decision = "STOP"
+                except Exception:
+                    pass
+
+                # face đơn giản khi auto
+                set_face("what_is_it")
+                motion.execute(decision)
+                time.sleep(0.02)
+                continue
+
+            # ===== NORMAL MODE: random flow + manual =====
+            stop_listener()
+
+            if manual_active():
+                set_face("music")  # manual -> bạn muốn mặt vui
+                motion.execute(norm_move(manual["move"]))
+                time.sleep(0.02)
+                continue
+            else:
+                manual["move"] = None
+
             if state == "IDLE_WAIT":
                 do_stand()
                 set_face("what_is_it")
-                set_led("white", bps=0.25)
                 if now >= until:
                     state = "APPLY_POSE"
 
@@ -310,7 +295,6 @@ def main():
                 state = "DO_RANDOM"
                 until = time.time() + ACTION_SEC
 
-                # face by action
                 if chosen_action == "STOP":
                     set_face("sleep")
                 elif chosen_action == "BACKWARD":
@@ -345,20 +329,13 @@ def main():
 
     finally:
         try:
-            set_led("white", bps=0.2)
-        except Exception:
-            pass
-
-        try:
             stop_listener()
         except Exception:
             pass
-
         try:
             planner.stop()
         except Exception:
             pass
-
         try:
             motion.close()
         except Exception:
