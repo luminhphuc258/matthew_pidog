@@ -7,7 +7,6 @@ import pygame
 # ===== IMPORTANT for service on desktop =====
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 os.environ.setdefault("SDL_VIDEODRIVER", "x11")   # chạy trên desktop X11
-# os.environ.setdefault("DISPLAY", ":0")          # service sẽ set trong systemd
 
 # ===== STYLE =====
 BG = (0, 0, 0)
@@ -138,7 +137,7 @@ def draw_music_note(screen, x, y, s, t, flip=False):
 
     pygame.draw.circle(screen, HILITE, (hx - head_r//3, hy - head_r//3), max(2, head_r//3))
 
-def render_face(screen, emo, t):
+def render_face(screen, emo, t, mouth_level: float):
     W, H = screen.get_size()
     screen.fill(BG)
     cx, cy = W//2, H//2
@@ -178,7 +177,10 @@ def render_face(screen, emo, t):
         note_size = int(min(W, H) * 0.28)
         draw_music_note(screen, lx, eye_y - int(H*0.02), note_size, t, flip=False)
         draw_music_note(screen, rx, eye_y - int(H*0.02), note_size, t + 0.3, flip=True)
-        mouth_smile_arc_only(screen, cx, mouth_y, int(mouth_w * 0.36), int(mouth_h * 0.22), t, wob=wob)
+
+        # ✅ LIP SYNC: mở miệng theo mouth_level
+        mh = int(mouth_h * (0.10 + 0.45 * mouth_level))
+        mouth_open(screen, cx, mouth_y, int(mouth_w*0.22), mh, wob=wob)
 
     elif emo == "what_is_it":
         eye_open(screen, lx, eye_y, eye_w, eye_h, -pdx, pdy, blink*0.25)
@@ -188,7 +190,10 @@ def render_face(screen, emo, t):
     elif emo == "suprise":
         eye_open(screen, lx, eye_y, eye_w, eye_h, 0, 0, 0.0)
         eye_open(screen, rx, eye_y, eye_w, eye_h, 0, 0, 0.0)
-        mouth_open(screen, cx, mouth_y, int(mouth_w*0.20), int(mouth_h*0.24), wob=wob)
+
+        # nếu đang lipsync mà emo suprise: cũng nhép miệng theo mouth_level
+        mh = int(mouth_h * (0.12 + 0.50 * mouth_level))
+        mouth_open(screen, cx, mouth_y, int(mouth_w*0.22), mh, wob=wob)
         ex_mark(screen, cx, cy, t)
 
     elif emo == "sleep":
@@ -227,38 +232,65 @@ def render_face(screen, emo, t):
     pygame.display.flip()
 
 def main():
-    # UDP receive emo commands
+    # UDP receive commands
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("127.0.0.1", 39393))
     sock.setblocking(False)
 
     pygame.init()
-
     flags = pygame.FULLSCREEN | pygame.NOFRAME
     screen = pygame.display.set_mode((0, 0), flags)
     pygame.mouse.set_visible(False)
 
     emo = "what_is_it"
-    last_cmd_ts = time.time()
+
+    # ✅ mouth level (smoothed)
+    mouth_target = 0.0
+    mouth_level = 0.0
+    alpha = 0.35  # smoothing 0..1 (lớn = nhanh)
 
     while True:
         t = time.time()
 
-        # receive cmd
-        try:
-            data, _ = sock.recvfrom(1024)
+        # receive cmd (can receive many packets per frame)
+        for _ in range(20):
+            try:
+                data, _ = sock.recvfrom(1024)
+            except BlockingIOError:
+                break
+            except Exception:
+                break
+
             cmd = data.decode("utf-8", "ignore").strip()
+
+            # old format: "music"
             if cmd in VALID_EMOS:
                 emo = cmd
-                last_cmd_ts = t
-        except BlockingIOError:
-            pass
+                continue
+
+            # optional: "EMO music"
+            if cmd.startswith("EMO "):
+                e = cmd.split(" ", 1)[1].strip()
+                if e in VALID_EMOS:
+                    emo = e
+                continue
+
+            # NEW: "MOUTH 0.123"
+            if cmd.startswith("MOUTH "):
+                try:
+                    v = float(cmd.split(" ", 1)[1].strip())
+                    mouth_target = max(0.0, min(1.0, v))
+                except Exception:
+                    pass
+
+        # smooth
+        mouth_level = mouth_level + alpha * (mouth_target - mouth_level)
 
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
                 return
 
-        render_face(screen, emo, t)
+        render_face(screen, emo, t, mouth_level)
         time.sleep(0.016)
 
 if __name__ == "__main__":
