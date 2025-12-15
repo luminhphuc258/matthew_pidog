@@ -4,8 +4,8 @@
 import os
 import time
 import threading
-import subprocess
 import random
+import subprocess
 from pathlib import Path
 
 from perception_planner import PerceptionPlanner
@@ -48,12 +48,11 @@ def json_safe(x):
 
 
 def main():
-    # reduce audio backend conflicts
     os.environ.setdefault("SDL_AUDIODRIVER", "alsa")
     os.environ.setdefault("PULSE_SERVER", "")
     os.environ.setdefault("JACK_NO_START_SERVER", "1")
 
-    # 1) perception (CAM + MQTT) -> chỉ để hiển thị dashboard / status
+    # 1) perception (CAM + MQTT) - chỉ để hiển thị dashboard / sensor / camera
     planner = PerceptionPlanner(
         cam_dev="/dev/video0",
         w=640, h=480, fps=30,
@@ -83,17 +82,11 @@ def main():
     motion.boot()
     set_volumes()
 
-    # ✅ luôn đứng yên sau boot
-    try:
-        motion.execute("STOP")
-    except Exception:
-        pass
-
     # 3) face
     face = FaceDisplay(default_face="what_is_it", fps=60, fullscreen=True)
     face.start()
 
-    # 4) active listening (chỉ để nghe/đẩy lên server, không chặn motion)
+    # 4) active listening (chỉ để upload + show transcript, KHÔNG block movement nữa)
     listener = ActiveListener(
         mic_device=MIC_DEVICE,
         speaker_device=SPK_DEVICE,
@@ -104,11 +97,9 @@ def main():
     )
     listener.start()
 
-    # ======================
-    # MANUAL OVERRIDE (web)
-    # ======================
+    # manual override (web)
     manual = {"move": None, "ts": 0.0}
-    manual_timeout_sec = 1.2
+    manual_timeout_sec = 2.0
 
     def on_manual_cmd(move: str):
         manual["move"] = (move or "STOP").upper()
@@ -117,53 +108,16 @@ def main():
     def manual_active():
         return manual["move"] and (time.time() - manual["ts"] < manual_timeout_sec)
 
-    # ======================
-    # IDLE ANIMATION
-    # ======================
-    # thỉnh thoảng sit->stand, thỉnh thoảng push up
-    next_idle_ts = time.time() + random.uniform(8.0, 16.0)
-
-    def do_idle_action():
-        """
-        Ưu tiên an toàn: chỉ làm action khi KHÔNG có manual.
-        Action nhẹ, không di chuyển tới.
-        """
-        nonlocal next_idle_ts
-        r = random.random()
-
-        # 70% sit->stand, 30% push_up
-        try:
-            if r < 0.70:
-                face.set_face("what_is_it")
-                # sit
-                motion.execute("SIT")
-                time.sleep(1.0)
-                # stand
-                motion.execute("STAND")
-            else:
-                face.set_face("music")
-                motion.execute("PUSH_UP")
-                time.sleep(0.3)
-                motion.execute("STAND")
-        except Exception:
-            # nếu MotionController chưa support SIT/STAND/PUSH_UP
-            # thì bỏ qua, vẫn không crash
-            pass
-
-        # schedule lần tiếp theo
-        next_idle_ts = time.time() + random.uniform(10.0, 22.0)
-
-    # status builder for web
     def build_status():
         st = planner.get_status_dict()
         st.update({
-            "mode": "IDLE",
             "manual_move": manual["move"],
             "manual_active": bool(manual_active()),
-            "listener_transcript": listener.last_transcript,
-            "listener_label": listener.last_label,
+            "listener_transcript": getattr(listener, "last_transcript", None),
+            "listener_label": getattr(listener, "last_label", None),
             "mic_device": MIC_DEVICE,
             "spk_device": SPK_DEVICE,
+            "mode": "IDLE_STAND",
         })
         return json_safe(st)
 
@@ -178,42 +132,87 @@ def main():
     )
     threading.Thread(target=web.run, daemon=True).start()
 
-    # ======================
-    # MAIN LOOP
-    # ======================
+    # ===== IDLE BEHAVIOR SCHEDULE =====
+    # thỉnh thoảng SIT flow: sit -> stop(sát sàn) -> apply pose -> stand
+    sit_interval_sec = 60.0        # mỗi 1 phút (bạn chỉnh)
+    sit_hold_sec = 3.0             # ngồi 3s
+    stop_after_sit_sec = 1.0       # sau sit, STOP để sát sàn (bạn muốn)
+    settle_pose_sec = 0.6          # chờ sau apply pose config
+
+    # thỉnh thoảng push up
+    pushup_interval_sec = 180.0    # mỗi 3 phút
+    pushup_jitter_sec = 30.0       # random thêm cho tự nhiên
+
+    next_sit_ts = time.time() + sit_interval_sec
+    next_push_ts = time.time() + pushup_interval_sec + random.uniform(-pushup_jitter_sec, pushup_jitter_sec)
+
+    def do_sit_flow():
+        # 1) sit
+        motion.execute("SIT")
+        time.sleep(max(0.1, float(sit_hold_sec)))
+
+        # 2) stop để robot “nằm sát sàn”
+        motion.execute("STOP")
+        time.sleep(max(0.1, float(stop_after_sit_sec)))
+
+        # 3) về pose config
+        try:
+            cfg = motion.load_pose_config()
+            motion.apply_pose_from_cfg(cfg, per_servo_delay=0.02, settle_sec=0.0)
+        except Exception:
+            pass
+        time.sleep(max(0.1, float(settle_pose_sec)))
+
+        # 4) stand
+        motion.execute("STAND")
+
+    # main loop (IDLE)
     try:
+        # giữ stand ngay khi chạy
+        motion.execute("STAND")
+
         while True:
-            # nếu có manual -> robot chỉ làm manual
+            now = time.time()
+
+            # ===== manual override từ web =====
             if manual_active():
-                decision = manual["move"]
+                cmd = manual["move"]
+                # nếu bấm STOP thì giữ stand nhẹ
+                motion.execute(cmd)
+
                 # face theo manual
-                if decision == "FORWARD":
-                    face.set_face("music")
-                elif decision in ("TURN_LEFT", "TURN_RIGHT", "LEFT", "RIGHT"):
+                if cmd in ("FORWARD", "BACK", "TURN_LEFT", "TURN_RIGHT", "LEFT", "RIGHT"):
                     face.set_face("what_is_it")
-                elif decision == "BACK":
-                    face.set_face("angry")
+                elif cmd == "STOP":
+                    face.set_face("what_is_it")
                 else:
                     face.set_face("what_is_it")
 
-                motion.execute(decision)
-
+                time.sleep(0.03)
+                continue
             else:
-                # không manual -> đứng yên + idle action theo lịch
                 manual["move"] = None
-                try:
-                    motion.execute("STOP")
-                except Exception:
-                    pass
 
-                # face idle
+            # ===== idle actions =====
+            if now >= next_sit_ts:
+                face.set_face("sad")  # tuỳ bạn
+                do_sit_flow()
+                next_sit_ts = time.time() + sit_interval_sec
                 face.set_face("what_is_it")
 
-                # thỉnh thoảng sit/stand/pushup
-                if time.time() >= next_idle_ts:
-                    do_idle_action()
+            elif now >= next_push_ts:
+                face.set_face("music")
+                motion.execute("PUSH_UP")
+                motion.execute("STAND")
+                next_push_ts = time.time() + pushup_interval_sec + random.uniform(-pushup_jitter_sec, pushup_jitter_sec)
+                face.set_face("what_is_it")
 
-            time.sleep(0.03)
+            else:
+                # bình thường chỉ đứng yên
+                motion.execute("STOP")
+                face.set_face("what_is_it")
+
+            time.sleep(0.05)
 
     except KeyboardInterrupt:
         print("\n[EXIT] Ctrl+C")
