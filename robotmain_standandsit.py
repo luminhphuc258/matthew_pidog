@@ -23,12 +23,11 @@ SPK_DEVICE = "default"
 
 # ===== FLOW TIMING =====
 WAIT_IDLE_SEC = 9.0
-ACTION_SEC = 2.0   # thời gian thực thi 1 hành động random
+ACTION_SEC = 2.0
 
 # ===== MANUAL OVERRIDE =====
 manual = {"move": None, "ts": 0.0}
 manual_timeout_sec = 1.2
-
 
 # ========= FACE SERVICE (UDP) =========
 FACE_HOST = "127.0.0.1"
@@ -36,7 +35,6 @@ FACE_PORT = 39393
 _face_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 def set_face(emo: str):
-    """Gửi lệnh đổi mặt cho face3d_service.py (đang chạy bằng systemd)."""
     try:
         _face_sock.sendto(emo.encode("utf-8"), (FACE_HOST, FACE_PORT))
     except Exception:
@@ -74,7 +72,8 @@ def main():
     os.environ.setdefault("PULSE_SERVER", "")
     os.environ.setdefault("JACK_NO_START_SERVER", "1")
 
-    # 1) perception (CAM + MQTT) - để show dashboard / status
+    # 1) perception (CAM + decision)
+    # NOTE: nếu planner cần MQTT để quyết định né vật cản, giữ enable_mqtt=True như bạn đang dùng.
     planner = PerceptionPlanner(
         cam_dev="/dev/video0",
         w=640, h=480, fps=30,
@@ -102,7 +101,7 @@ def main():
     motion.boot()
     set_volumes()
 
-    dog = motion.dog
+    dog = getattr(motion, "dog", None)
 
     # LED helper (pidog rgb_strip)
     def set_led(color: str, bps: float = 0.5):
@@ -112,19 +111,41 @@ def main():
         except Exception:
             pass
 
-    # ✅ boot default LED WHITE
     set_led("white", bps=0.4)
 
-    # 3) active listening (upload + show transcript)
-    listener = ActiveListener(
-        mic_device=MIC_DEVICE,
-        speaker_device=SPK_DEVICE,
-        threshold=2500,
-        cooldown_sec=1.0,
-        nodejs_upload_url="https://embeddedprogramming-healtheworldserver.up.railway.app/upload_audio",
-        debug=False,
-    )
-    listener.start()
+    # 3) Active listening (we will recreate this object when toggled ON)
+    listener = None
+
+    def start_listener():
+        nonlocal listener
+        if listener is not None:
+            return
+        listener = ActiveListener(
+            mic_device=MIC_DEVICE,
+            speaker_device=SPK_DEVICE,
+            threshold=2500,
+            cooldown_sec=1.0,
+            nodejs_upload_url="https://embeddedprogramming-healtheworldserver.up.railway.app/upload_audio",
+            debug=False,
+        )
+        listener.start()
+
+    def stop_listener():
+        nonlocal listener
+        if listener is None:
+            return
+        try:
+            listener.stop()
+        except Exception:
+            pass
+        try:
+            listener.join(2.0)
+        except Exception:
+            pass
+        listener = None
+
+    # default: listener ON lúc boot (bạn có thể đổi thành OFF nếu muốn tiết kiệm pin)
+    start_listener()
 
     # manual override
     def on_manual_cmd(move: str):
@@ -134,29 +155,23 @@ def main():
     def manual_active():
         return manual["move"] and (time.time() - manual["ts"] < manual_timeout_sec)
 
-    # build status for dashboard
-    def build_status():
-        st = planner.get_status_dict()
-        st.update({
-            "manual_move": manual["move"],
-            "manual_active": bool(manual_active()),
-            "listener_transcript": getattr(listener, "last_transcript", None),
-            "listener_label": getattr(listener, "last_label", None),
-            "mic_device": MIC_DEVICE,
-            "spk_device": SPK_DEVICE,
-            "flow_wait_idle_sec": WAIT_IDLE_SEC,
-            "action_sec": ACTION_SEC,
-        })
-        return json_safe(st)
-
-    # 4) web dashboard
+    # 4) web dashboard (MQTT trực tiếp ở WebDashboard)
     web = WebDashboard(
         host="0.0.0.0",
         port=8000,
         get_jpeg=lambda: planner.latest_jpeg,
-        get_status=build_status,
-        get_minimap_png=planner.get_mini_map_png,
         on_manual_cmd=on_manual_cmd,
+
+        mqtt_enable=True,
+        mqtt_host="rfff7184.ala.us-east-1.emqxsl.com",
+        mqtt_port=8883,
+        mqtt_user="robot_matthew",
+        mqtt_pass="29061992abCD!yesokmen",
+        mqtt_topic="/pidog/sensorhubdata",
+        mqtt_client_id="pidog-webdash",
+        mqtt_tls=True,       # EMQX SSL
+        mqtt_insecure=True,
+        mqtt_debug=False,
     )
     threading.Thread(target=web.run, daemon=True).start()
 
@@ -186,50 +201,108 @@ def main():
                 pass
             time.sleep(0.02)
 
+    # normalize command names
+    def norm_move(m: str) -> str:
+        m = (m or "STOP").upper()
+        if m == "BACKWARD":
+            return "BACK"  # nếu MotionController của bạn dùng BACK
+        return m
+
     # ===== Random actions =====
-    ACTIONS = [
-        "FORWARD",      # đi tới
-        "BACKWARD",     # lùi
-        "TURN_LEFT",    # xoay trái
-        "TURN_RIGHT",   # xoay phải
-        "STOP",         # đứng yên
-    ]
+    ACTIONS = ["FORWARD", "BACKWARD", "TURN_LEFT", "TURN_RIGHT", "STOP"]
 
     def pick_random_action():
         return random.choice(ACTIONS)
 
     # ===== Flow State =====
-    state = "IDLE_WAIT"     # IDLE_WAIT -> APPLY_POSE -> DO_RANDOM -> STAND_AFTER
+    state = "IDLE_WAIT"
     until = time.time() + WAIT_IDLE_SEC
     chosen_action = "STOP"
 
+    # ===== Mode cache (để tránh stop/start listener liên tục) =====
+    last_listen_on = None
+
     try:
-        # đứng yên lúc bắt đầu
         do_stand()
         set_face("what_is_it")
 
         while True:
             now = time.time()
 
-            # 1) manual override ưu tiên
+            # ===== 0) đọc toggles từ web =====
+            listen_on = web.is_listen_on()
+            auto_on = web.is_auto_on()
+
+            # ===== 1) LISTENING MODE: ưu tiên cao nhất -> robot đứng yên tuyệt đối =====
+            if listen_on:
+                # tắt auto move (WebDashboard đã auto tắt khi bật listening, nhưng mình vẫn chặn ở đây)
+                # tắt motion hoàn toàn
+                do_stand()
+                set_led("white", bps=0.25)
+                set_face("sleep")
+
+                # tắt listener thật để tiết kiệm pin (nếu đang chạy)
+                if last_listen_on is not True:
+                    start_listener()
+                time.sleep(0.05)
+                last_listen_on = True
+                continue
+            else:
+                # listening OFF -> tắt listener để tiết kiệm pin
+                if last_listen_on is not False:
+                    stop_listener()
+                last_listen_on = False
+
+            # ===== 2) MANUAL OVERRIDE (chỉ khi không Listening) =====
             if manual_active():
                 set_led("white", bps=0.6)
-                set_face("music")  # manual đang điều khiển => mặt vui (tuỳ bạn đổi)
-                motion.execute(manual["move"])
+                set_face("music")
+                motion.execute(norm_move(manual["move"]))
                 time.sleep(0.02)
                 continue
             else:
                 manual["move"] = None
 
-            # 2) flow random
+            # ===== 3) AUTO MOVE MODE (chỉ khi không Listening) =====
+            if auto_on:
+                st = planner.get_state()
+                decision = norm_move(getattr(st, "decision", "FORWARD") or "FORWARD")
+
+                # hard safety stop (ưu tiên)
+                dist = getattr(st, "uart_dist_cm", None)
+                try:
+                    if dist is not None and float(dist) < 10.0:
+                        decision = "STOP"
+                except Exception:
+                    pass
+
+                # face + led
+                if decision == "FORWARD":
+                    set_face("music")
+                    set_led("white", bps=0.5)
+                elif decision in ("TURN_LEFT", "TURN_RIGHT"):
+                    set_face("suprise")
+                    set_led("white", bps=0.8)
+                elif decision in ("BACK", "BACKWARD"):
+                    set_face("sad")
+                    set_led("white", bps=0.8)
+                else:
+                    set_face("what_is_it")
+                    set_led("white", bps=0.3)
+
+                motion.execute(decision)
+                time.sleep(0.02)
+                continue
+
+            # ===== 4) RANDOM FLOW (khi Auto Move OFF) =====
             if state == "IDLE_WAIT":
                 do_stand()
                 set_face("what_is_it")
+                set_led("white", bps=0.25)
                 if now >= until:
                     state = "APPLY_POSE"
 
             elif state == "APPLY_POSE":
-                # về pose config trước khi random
                 set_face("what_is_it")
                 apply_pose_config()
 
@@ -237,22 +310,22 @@ def main():
                 state = "DO_RANDOM"
                 until = time.time() + ACTION_SEC
 
-                # đổi mặt theo action
+                # face by action
                 if chosen_action == "STOP":
                     set_face("sleep")
                 elif chosen_action == "BACKWARD":
                     set_face("sad")
                 elif chosen_action in ("TURN_LEFT", "TURN_RIGHT"):
                     set_face("suprise")
-                else:  # FORWARD
+                else:
                     set_face("music")
 
             elif state == "DO_RANDOM":
-                # chạy action trong khoảng ACTION_SEC
-                if chosen_action == "STOP":
+                action = norm_move(chosen_action)
+                if action == "STOP":
                     do_stand()
                 else:
-                    do_action_for(chosen_action, 0.10)  # gọi liên tục từng lát nhỏ
+                    do_action_for(action, 0.10)
 
                 if now >= until:
                     state = "STAND_AFTER"
@@ -277,8 +350,7 @@ def main():
             pass
 
         try:
-            listener.stop()
-            listener.join(2.0)
+            stop_listener()
         except Exception:
             pass
 
