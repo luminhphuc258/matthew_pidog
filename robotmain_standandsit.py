@@ -5,13 +5,14 @@ import os
 import time
 import threading
 import subprocess
+import socket
+import random
 from pathlib import Path
 
 import numpy as np
 
 from perception_planner import PerceptionPlanner
 from motion_controller import MotionController
-from face_display import FaceDisplay
 from web_dashboard import WebDashboard
 from active_listener import ActiveListener
 
@@ -22,11 +23,24 @@ SPK_DEVICE = "default"
 
 # ===== FLOW TIMING =====
 WAIT_IDLE_SEC = 9.0
-WALK_SEC = 2.0
+ACTION_SEC = 2.0   # thời gian thực thi 1 hành động random
 
 # ===== MANUAL OVERRIDE =====
 manual = {"move": None, "ts": 0.0}
 manual_timeout_sec = 1.2
+
+
+# ========= FACE SERVICE (UDP) =========
+FACE_HOST = "127.0.0.1"
+FACE_PORT = 39393
+_face_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+def set_face(emo: str):
+    """Gửi lệnh đổi mặt cho face3d_service.py (đang chạy bằng systemd)."""
+    try:
+        _face_sock.sendto(emo.encode("utf-8"), (FACE_HOST, FACE_PORT))
+    except Exception:
+        pass
 
 
 def run(cmd):
@@ -101,11 +115,7 @@ def main():
     # ✅ boot default LED WHITE
     set_led("white", bps=0.4)
 
-    # 3) face
-    face = FaceDisplay(default_face="what_is_it", fps=60, fullscreen=True)
-    face.start()
-
-    # 4) active listening (chỉ để upload + show transcript)
+    # 3) active listening (upload + show transcript)
     listener = ActiveListener(
         mic_device=MIC_DEVICE,
         speaker_device=SPK_DEVICE,
@@ -135,11 +145,11 @@ def main():
             "mic_device": MIC_DEVICE,
             "spk_device": SPK_DEVICE,
             "flow_wait_idle_sec": WAIT_IDLE_SEC,
-            "flow_walk_sec": WALK_SEC,
+            "action_sec": ACTION_SEC,
         })
         return json_safe(st)
 
-    # 5) web dashboard
+    # 4) web dashboard
     web = WebDashboard(
         host="0.0.0.0",
         port=8000,
@@ -150,11 +160,7 @@ def main():
     )
     threading.Thread(target=web.run, daemon=True).start()
 
-    # ===== FLOW STATE =====
-    state = "IDLE_WAIT"         # IDLE_WAIT -> APPLY_POSE -> STAND_AFTER_POSE -> WALK -> STAND_AFTER_WALK
-    until = time.time() + WAIT_IDLE_SEC
-
-    # helper: apply pose config (không phụ thuộc motion internal)
+    # ===== Helpers =====
     def apply_pose_config():
         try:
             cfg = motion.load_pose_config()
@@ -162,73 +168,99 @@ def main():
         except Exception:
             pass
 
-    # helper: stand
     def do_stand():
         try:
-            motion.execute("STOP")  # bạn dùng STOP = stand trong motion.execute
+            motion.execute("STOP")
         except Exception:
             pass
 
-    # helper: walk forward for duration
-    def do_walk_for(sec: float):
+    def do_action_for(action: str, sec: float):
+        """Chạy action trong sec giây, nhưng nếu manual thì thoát ngay."""
         t0 = time.time()
         while time.time() - t0 < sec:
-            # nếu đang manual thì thoát để ưu tiên manual
             if manual_active():
                 return
-            motion.execute("FORWARD")
+            try:
+                motion.execute(action)
+            except Exception:
+                pass
             time.sleep(0.02)
 
-    # main loop
+    # ===== Random actions =====
+    ACTIONS = [
+        "FORWARD",      # đi tới
+        "BACKWARD",     # lùi
+        "TURN_LEFT",    # xoay trái
+        "TURN_RIGHT",   # xoay phải
+        "STOP",         # đứng yên
+    ]
+
+    def pick_random_action():
+        return random.choice(ACTIONS)
+
+    # ===== Flow State =====
+    state = "IDLE_WAIT"     # IDLE_WAIT -> APPLY_POSE -> DO_RANDOM -> STAND_AFTER
+    until = time.time() + WAIT_IDLE_SEC
+    chosen_action = "STOP"
+
     try:
-        # đảm bảo đang stand lúc bắt đầu
+        # đứng yên lúc bắt đầu
         do_stand()
+        set_face("what_is_it")
 
         while True:
-            face.set_face("music")
-            face.tick()
-            time.sleep(0.01)
             now = time.time()
 
-            # 1) manual override luôn ưu tiên
+            # 1) manual override ưu tiên
             if manual_active():
-                # LED giữ trắng (hoặc bạn muốn đổi màu khi manual thì nói mình)
                 set_led("white", bps=0.6)
+                set_face("music")  # manual đang điều khiển => mặt vui (tuỳ bạn đổi)
                 motion.execute(manual["move"])
                 time.sleep(0.02)
                 continue
             else:
                 manual["move"] = None
 
-            # 2) chạy flow cố định
+            # 2) flow random
             if state == "IDLE_WAIT":
-                # đứng yên chờ 9s
                 do_stand()
-                face.set_face("what_is_it")
+                set_face("what_is_it")
                 if now >= until:
                     state = "APPLY_POSE"
 
             elif state == "APPLY_POSE":
-                # đưa về pose config
-                face.set_face("what_is_it")
+                # về pose config trước khi random
+                set_face("what_is_it")
                 apply_pose_config()
-                state = "STAND_AFTER_POSE"
-                until = time.time() + 0.3
 
-            elif state == "STAND_AFTER_POSE":
-                do_stand()
+                chosen_action = pick_random_action()
+                state = "DO_RANDOM"
+                until = time.time() + ACTION_SEC
+
+                # đổi mặt theo action
+                if chosen_action == "STOP":
+                    set_face("sleep")
+                elif chosen_action == "BACKWARD":
+                    set_face("sad")
+                elif chosen_action in ("TURN_LEFT", "TURN_RIGHT"):
+                    set_face("suprise")
+                else:  # FORWARD
+                    set_face("music")
+
+            elif state == "DO_RANDOM":
+                # chạy action trong khoảng ACTION_SEC
+                if chosen_action == "STOP":
+                    do_stand()
+                else:
+                    do_action_for(chosen_action, 0.10)  # gọi liên tục từng lát nhỏ
+
                 if now >= until:
-                    state = "WALK"
+                    state = "STAND_AFTER"
+                    until = time.time() + 0.25
 
-            elif state == "WALK":
-                face.set_face("music")
-                do_walk_for(WALK_SEC)
-                state = "STAND_AFTER_WALK"
-                until = time.time() + 0.3
-
-            elif state == "STAND_AFTER_WALK":
+            elif state == "STAND_AFTER":
                 do_stand()
-                face.set_face("what_is_it")
+                set_face("what_is_it")
                 if now >= until:
                     state = "IDLE_WAIT"
                     until = time.time() + WAIT_IDLE_SEC
@@ -257,11 +289,6 @@ def main():
 
         try:
             motion.close()
-        except Exception:
-            pass
-
-        try:
-            face.stop()
         except Exception:
             pass
 
