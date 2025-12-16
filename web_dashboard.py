@@ -47,7 +47,7 @@ class WebDashboard:
     """
     - /            HTML dashboard
     - /mjpeg       live video
-    - /status      mqtt sensor + toggles
+    - /status      mqtt sensor + toggles + (avoid_obstacle state)
     - /cmd         manual command
     - /toggle_listen      listen-only
     - /toggle_auto        auto-move only
@@ -59,7 +59,16 @@ class WebDashboard:
         self,
         host="0.0.0.0",
         port=8000,
+
+        # Old mode: provide encoded jpeg bytes
         get_jpeg: Optional[Callable[[], Optional[bytes]]] = None,
+
+        # New mode (recommended): provide BGR frame for overlay
+        get_frame_bgr: Optional[Callable[[], Any]] = None,
+
+        # Optional avoid obstacle module (must provide .draw_overlay(frame_bgr) and .get_state())
+        avoid_obstacle: Optional[Any] = None,
+
         on_manual_cmd: Optional[Callable[[str], None]] = None,
 
         mqtt_enable: bool = True,
@@ -74,7 +83,11 @@ class WebDashboard:
         mqtt_debug: bool = False,
     ):
         self.host, self.port = host, port
+
         self.get_jpeg = get_jpeg
+        self.get_frame_bgr = get_frame_bgr
+        self.avoid_obstacle = avoid_obstacle
+
         self.on_manual_cmd = on_manual_cmd
 
         self.mqtt_enable = mqtt_enable
@@ -94,7 +107,7 @@ class WebDashboard:
         # toggles
         self._listen_on = False          # listen-only
         self._auto_on = False            # auto move only
-        self._listen_run_on = False      # NEW: listen + run (test)
+        self._listen_run_on = False      # listen + run (test)
 
         self.app = Flask(__name__)
         self._setup_routes()
@@ -211,6 +224,13 @@ class WebDashboard:
 
         @self.app.get("/status")
         def status():
+            avoid_state = None
+            if self.avoid_obstacle is not None:
+                try:
+                    avoid_state = self.avoid_obstacle.get_state()
+                except Exception:
+                    avoid_state = {"error": "avoid_obstacle.get_state failed"}
+
             with self._lock:
                 return jsonify({
                     "ok": True,
@@ -230,6 +250,7 @@ class WebDashboard:
                         "auto_move": self._auto_on,
                         "listen_run": self._listen_run_on,
                     },
+                    "avoid_obstacle": avoid_state,  # NEW
                 })
 
         # listen-only: bật -> tắt auto + tắt listen_run
@@ -287,6 +308,7 @@ class WebDashboard:
         @self.app.get("/mjpeg")
         def mjpeg():
             def gen():
+                # Prepare black fallback
                 black = None
                 try:
                     import cv2
@@ -298,16 +320,44 @@ class WebDashboard:
                 except Exception:
                     black = None
 
+                # If we have BGR frames -> we can overlay and encode here
+                use_bgr = self.get_frame_bgr is not None
+
                 while True:
                     try:
-                        frame = self.get_jpeg() if self.get_jpeg else None
-                        if not frame:
-                            frame = black
-                        if frame:
-                            yield (b"--frame\r\n"
-                                   b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+                        if use_bgr:
+                            frame_bgr = self.get_frame_bgr()
+                            if frame_bgr is None:
+                                frame_bytes = black
+                            else:
+                                # overlay
+                                if self.avoid_obstacle is not None:
+                                    try:
+                                        frame_bgr = self.avoid_obstacle.draw_overlay(frame_bgr)
+                                    except Exception:
+                                        pass
+
+                                import cv2
+                                ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+                                frame_bytes = buf.tobytes() if ok else black
+
+                            if frame_bytes:
+                                yield (b"--frame\r\n"
+                                       b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
+                            else:
+                                time.sleep(0.05)
+
                         else:
-                            time.sleep(0.05)
+                            # Old mode: already-jpeg (no overlay)
+                            frame = self.get_jpeg() if self.get_jpeg else None
+                            if not frame:
+                                frame = black
+                            if frame:
+                                yield (b"--frame\r\n"
+                                       b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+                            else:
+                                time.sleep(0.05)
+
                     except Exception:
                         time.sleep(0.1)
 

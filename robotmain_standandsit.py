@@ -10,11 +10,15 @@ import random
 from pathlib import Path
 
 import numpy as np
+import cv2  # NEW
 
 from perception_planner import PerceptionPlanner
 from motion_controller import MotionController
 from web_dashboard import WebDashboard
 from active_listener import ActiveListener
+
+# NEW: avoid obstacle
+from avoid_obstacle import AvoidObstacle, AvoidCfg
 
 POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
 
@@ -58,7 +62,6 @@ def json_safe(x):
     if isinstance(x, (list, tuple)):
         return [json_safe(v) for v in x]
     return x
-
 
 def main():
     os.environ.setdefault("SDL_AUDIODRIVER", "alsa")
@@ -136,7 +139,6 @@ def main():
         listener = None
 
     def listener_is_playing() -> bool:
-        # bạn đang dùng self._playing = threading.Event()
         try:
             return (listener is not None) and listener._playing.is_set()
         except Exception:
@@ -150,11 +152,79 @@ def main():
     def manual_active():
         return manual["move"] and (time.time() - manual["ts"] < manual_timeout_sec)
 
-    # 4) web dashboard (3 nút)
+    # ========= NEW: frame provider for dashboard + avoid_obstacle =========
+    def get_frame_bgr_from_planner():
+        """
+        planner.latest_jpeg -> decode -> BGR
+        (để WebDashboard overlay + AvoidObstacle dùng chung 1 nguồn camera)
+        """
+        jpg = getattr(planner, "latest_jpeg", None)
+        if not jpg:
+            return None
+        try:
+            arr = np.frombuffer(jpg, dtype=np.uint8)
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            return frame
+        except Exception:
+            return None
+
+    def get_ultrasonic_cm_from_planner():
+        """
+        Lấy dist từ planner.get_state() (dict hoặc object).
+        Ưu tiên uart_dist_cm.
+        """
+        try:
+            st = planner.get_state()
+        except Exception:
+            st = None
+
+        # dict-style
+        if isinstance(st, dict):
+            for k in ("uart_dist_cm", "dist_cm", "distance_cm", "distance", "dist"):
+                if k in st and st[k] is not None:
+                    try:
+                        return float(st[k])
+                    except Exception:
+                        return None
+            return None
+
+        # object-style fallback
+        for k in ("uart_dist_cm", "dist_cm", "distance_cm", "distance", "dist"):
+            v = getattr(st, k, None)
+            if v is not None:
+                try:
+                    return float(v)
+                except Exception:
+                    return None
+        return None
+
+    # ========= NEW: AvoidObstacle =========
+    avoid_cfg = AvoidCfg(
+        loop_hz=15.0,
+        roi_y_start_ratio=0.60,
+        sector_n=9,
+        trigger_cm=120.0,
+        server_url="https://embeddedprogramming-healtheworldserver.up.railway.app/avoid_obstacle_vision",
+        send_w=256,
+        send_h=144,
+        jpeg_quality=55,
+        min_trigger_interval_sec=2.0,
+        plan_ttl_sec=8.0,
+    )
+
+    avoid = AvoidObstacle(
+        get_ultrasonic_cm=get_ultrasonic_cm_from_planner,
+        cfg=avoid_cfg,
+        get_frame_bgr=get_frame_bgr_from_planner,  # IMPORTANT: no extra camera
+    )
+    avoid.start()
+
+    # 4) web dashboard (3 nút) — NEW: dùng get_frame_bgr + avoid_obstacle
     web = WebDashboard(
         host="0.0.0.0",
         port=8000,
-        get_jpeg=lambda: planner.latest_jpeg,
+        get_frame_bgr=get_frame_bgr_from_planner,
+        avoid_obstacle=avoid,
         on_manual_cmd=on_manual_cmd,
 
         mqtt_enable=True,
@@ -198,7 +268,7 @@ def main():
     def norm_move(m: str) -> str:
         m = (m or "STOP").upper()
         if m == "BACKWARD":
-            return "BACK"   # nếu MotionController bạn dùng BACK
+            return "BACK"
         return m
 
     ACTIONS = ["FORWARD", "BACKWARD", "TURN_LEFT", "TURN_RIGHT", "STOP"]
@@ -224,15 +294,22 @@ def main():
             # ===== MODE 1: Listen & Run (TEST) =====
             if listen_run:
                 start_listener()
-
-                # face: nếu đang phát loa => music, còn lại suprise (đang listening)
                 set_face("music" if listener_is_playing() else "suprise")
 
-                st = planner.get_state()
-                decision = norm_move(getattr(st, "decision", "FORWARD") or "FORWARD")
+                # decision lấy từ planner (dict hoặc object)
+                st = None
+                try:
+                    st = planner.get_state()
+                except Exception:
+                    st = None
 
-                # safety stop
-                dist = getattr(st, "uart_dist_cm", None)
+                if isinstance(st, dict):
+                    decision = norm_move(st.get("decision", "FORWARD") or "FORWARD")
+                    dist = st.get("uart_dist_cm", None)
+                else:
+                    decision = norm_move(getattr(st, "decision", "FORWARD") or "FORWARD")
+                    dist = getattr(st, "uart_dist_cm", None)
+
                 try:
                     if dist is not None and float(dist) < 10.0:
                         decision = "STOP"
@@ -254,17 +331,26 @@ def main():
             # ===== MODE 3: Auto Move (move-only) =====
             if auto_only:
                 stop_listener()
-                st = planner.get_state()
-                decision = norm_move(getattr(st, "decision", "FORWARD") or "FORWARD")
 
-                dist = getattr(st, "uart_dist_cm", None)
+                st = None
+                try:
+                    st = planner.get_state()
+                except Exception:
+                    st = None
+
+                if isinstance(st, dict):
+                    decision = norm_move(st.get("decision", "FORWARD") or "FORWARD")
+                    dist = st.get("uart_dist_cm", None)
+                else:
+                    decision = norm_move(getattr(st, "decision", "FORWARD") or "FORWARD")
+                    dist = getattr(st, "uart_dist_cm", None)
+
                 try:
                     if dist is not None and float(dist) < 10.0:
                         decision = "STOP"
                 except Exception:
                     pass
 
-                # face đơn giản khi auto
                 set_face("what_is_it")
                 motion.execute(decision)
                 time.sleep(0.02)
@@ -274,7 +360,7 @@ def main():
             stop_listener()
 
             if manual_active():
-                set_face("music")  # manual -> bạn muốn mặt vui
+                set_face("music")
                 motion.execute(norm_move(manual["move"]))
                 time.sleep(0.02)
                 continue
@@ -330,6 +416,10 @@ def main():
     finally:
         try:
             stop_listener()
+        except Exception:
+            pass
+        try:
+            avoid.stop()
         except Exception:
             pass
         try:
