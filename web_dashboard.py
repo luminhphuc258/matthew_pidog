@@ -71,6 +71,9 @@ class WebDashboard:
 
         on_manual_cmd: Optional[Callable[[str], None]] = None,
 
+        # NEW: rotate camera 180 degrees (default ON)
+        rotate180: bool = True,
+
         mqtt_enable: bool = True,
         mqtt_host: str = "localhost",
         mqtt_port: int = 1883,
@@ -89,6 +92,7 @@ class WebDashboard:
         self.avoid_obstacle = avoid_obstacle
 
         self.on_manual_cmd = on_manual_cmd
+        self.rotate180 = bool(rotate180)
 
         self.mqtt_enable = mqtt_enable
         self.mqtt_host = mqtt_host
@@ -250,7 +254,10 @@ class WebDashboard:
                         "auto_move": self._auto_on,
                         "listen_run": self._listen_run_on,
                     },
-                    "avoid_obstacle": avoid_state,  # NEW
+                    "avoid_obstacle": avoid_state,
+                    "video": {
+                        "rotate180": self.rotate180
+                    }
                 })
 
         # listen-only: bật -> tắt auto + tắt listen_run
@@ -281,7 +288,7 @@ class WebDashboard:
                     "listen_run": self._listen_run_on,
                 }})
 
-        # NEW: listen&run: bật -> bật auto + tắt listen-only
+        # listen&run: bật -> bật auto + tắt listen-only
         @self.app.post("/toggle_listen_run")
         def toggle_listen_run():
             with self._lock:
@@ -320,7 +327,6 @@ class WebDashboard:
                 except Exception:
                     black = None
 
-                # If we have BGR frames -> we can overlay and encode here
                 use_bgr = self.get_frame_bgr is not None
 
                 while True:
@@ -330,6 +336,13 @@ class WebDashboard:
                             if frame_bgr is None:
                                 frame_bytes = black
                             else:
+                                import cv2
+
+                                # NEW: rotate first (so overlay matches rotated view)
+                                if self.rotate180:
+                                    frame_bgr = cv2.rotate(frame_bgr, cv2.ROTATE_180)
+                                    # or: frame_bgr = cv2.flip(frame_bgr, -1)
+
                                 # overlay
                                 if self.avoid_obstacle is not None:
                                     try:
@@ -337,7 +350,6 @@ class WebDashboard:
                                     except Exception:
                                         pass
 
-                                import cv2
                                 ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
                                 frame_bytes = buf.tobytes() if ok else black
 
