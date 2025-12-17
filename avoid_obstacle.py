@@ -14,61 +14,56 @@ import requests
 
 @dataclass
 class AvoidCfg:
-    # camera
     cam_dev: str = "/dev/video0"
     cam_w: int = 640
     cam_h: int = 480
     cam_fps: int = 30
 
-    # loop
     loop_hz: float = 15.0
 
-    # ROI near-field (chỉ nhìn gần để tránh “rèm xa”)
-    roi_y_start_ratio: float = 0.60  # lấy 40% phía dưới
+    roi_y_start_ratio: float = 0.60
     roi_y_end_ratio: float = 1.00
 
-    # sector
     sector_n: int = 9
 
-    # ultrasonic trigger
-    trigger_cm: float = 120.0     # dưới ngưỡng này thì gọi server
-    hard_stop_cm: float = 35.0    # cực gần thì dừng ngay (bạn tự dùng)
+    # Trigger thresholds (cm)
+    trigger_cm: float = 120.0
+    hard_stop_cm: float = 35.0
     min_valid_cm: float = 2.0
-    max_valid_cm: float = 400.0
+    max_valid_cm: float = 800.0   # TF-Luna up to ~800cm
 
-    # trigger debounce
-    min_trigger_interval_sec: float = 2.0   # tránh spam server
-    plan_ttl_sec: float = 8.0               # plan “hết hạn” sau vài giây
+    min_trigger_interval_sec: float = 2.0
+    plan_ttl_sec: float = 8.0
 
-    # upload
     server_url: str = "https://YOUR_SERVER.up.railway.app/avoid_obstacle_vision"
     jpeg_quality: int = 55
     send_w: int = 256
     send_h: int = 144
 
-    # local freespace (HSV)
-    floor_sample_h: int = 16       # lấy 16px dưới cùng ROI làm “mẫu sàn”
-    hsv_tolerance: Tuple[int, int, int] = (18, 60, 70)  # (H,S,V)
+    floor_sample_h: int = 16
+    hsv_tolerance: Tuple[int, int, int] = (18, 60, 70)
 
 
 class AvoidObstacle:
     """
-    Local loop: ultrasonic + camera ROI free-space
+    Local loop: distance + camera ROI free-space
     Event trigger -> upload ROI image -> receive GPT plan
     Provide overlay drawing for WebDashboard.
     """
 
     def __init__(
         self,
+        # NOTE: rename logically but keep signature:
         get_ultrasonic_cm: Callable[[], Optional[float]],
         cfg: AvoidCfg = AvoidCfg(),
         session: Optional[requests.Session] = None,
         get_frame_bgr: Optional[Callable[[], Any]] = None,
-
-        # NEW: rotate camera 180 degrees (default ON)
         rotate180: bool = True,
+        # NEW: optional getter for lidar strength (or return tuple)
+        get_lidar_strength: Optional[Callable[[], Optional[float]]] = None,
     ):
-        self.get_ultrasonic_cm = get_ultrasonic_cm
+        self.get_ultrasonic_cm = get_ultrasonic_cm   # now you can pass lidar distance getter here
+        self.get_lidar_strength = get_lidar_strength
         self.cfg = cfg
         self.http = session or requests.Session()
 
@@ -80,14 +75,12 @@ class AvoidObstacle:
         self.rotate180 = bool(rotate180)
 
         self._lock = threading.Lock()
-        self._last_frame = None  # full frame BGR (after rotation, if enabled)
-        self._last_roi = None    # roi BGR (after rotation)
-        self._last_local = {}    # local scores
+        self._last_frame = None
+        self._last_roi = None
+        self._last_local = {}
         self._last_plan: Dict[str, Any] = {}
         self._last_plan_ts = 0.0
         self._last_trigger_ts = 0.0
-
-    # ------------------- Public API -------------------
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -117,16 +110,6 @@ class AvoidObstacle:
             }
 
     def draw_overlay(self, frame_bgr: np.ndarray) -> np.ndarray:
-        """
-        Draw ROI + best sector + GPT plan overlay.
-        NOTE: WebDashboard may rotate the frame too.
-        Best practice:
-          - Either rotate in AvoidObstacle loop and let WebDash NOT rotate,
-          - OR rotate only in WebDash.
-        You asked default rotate everywhere; to keep overlays matching,
-        we rotate in AvoidObstacle loop, and WebDash rotates for display.
-        (If you see overlay mismatch, set WebDash rotate180=False.)
-        """
         if frame_bgr is None:
             return frame_bgr
 
@@ -134,7 +117,6 @@ class AvoidObstacle:
         y0 = int(self.cfg.roi_y_start_ratio * h)
         y1 = int(self.cfg.roi_y_end_ratio * h)
 
-        # ROI boundary
         cv2.rectangle(frame_bgr, (0, y0), (w - 1, y1 - 1), (200, 200, 200), 1)
         cv2.putText(frame_bgr, "ROI near-field", (8, max(18, y0 - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
@@ -144,7 +126,6 @@ class AvoidObstacle:
             plan = dict(self._last_plan or {})
             plan_ts = self._last_plan_ts
 
-        # Local best sector highlight
         best = local.get("best_sector", None)
         if isinstance(best, int) and 0 <= best < self.cfg.sector_n:
             sw = w // self.cfg.sector_n
@@ -154,7 +135,14 @@ class AvoidObstacle:
             cv2.rectangle(overlay, (sx0, y0), (sx1, y1), (0, 255, 0), -1)
             frame_bgr[:] = cv2.addWeighted(overlay, 0.15, frame_bgr, 0.85, 0)
 
-        # GPT overlay (ROI coords)
+        # HUD local lidar
+        ultra = local.get("ultra_cm", None)
+        strg = local.get("lidar_strength", None)
+        conf_local = local.get("confidence", None)
+        hud_local = f"LiDAR={ultra}cm str={strg} local_conf={conf_local}"
+        cv2.putText(frame_bgr, hud_local, (8, 46),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+
         now = time.time()
         if plan and plan_ts and (now - plan_ts) <= self.cfg.plan_ttl_sec:
             roi_w = w
@@ -179,7 +167,7 @@ class AvoidObstacle:
             obstacles = plan.get("obstacles", [])
             if isinstance(obstacles, list):
                 for ob in obstacles[:12]:
-                    bbox = ob.get("bbox", None)  # [x1,y1,x2,y2] in ROI coords
+                    bbox = ob.get("bbox", None)
                     label = str(ob.get("label", "obj"))
                     risk = ob.get("risk", None)
                     if isinstance(bbox, list) and len(bbox) == 4:
@@ -226,7 +214,6 @@ class AvoidObstacle:
 
             frame = None
             ok = False
-
             if self.get_frame_bgr is not None:
                 try:
                     frame = self.get_frame_bgr()
@@ -238,15 +225,18 @@ class AvoidObstacle:
                 ok, frame = self._cap.read() if self._cap else (False, None)
 
             if ok and frame is not None:
-                # NEW: rotate once here so EVERYTHING below uses correct orientation
                 if self.rotate180:
                     frame = cv2.rotate(frame, cv2.ROTATE_180)
 
                 roi = self._extract_roi(frame)
                 local = self._local_freespace_sector(roi)
-                dist = self._read_ultra()
+
+                # distance = lidar distance (uart_dist_cm)
+                dist = self._read_distance_cm()
+                strength = self._read_strength()
 
                 local["ultra_cm"] = dist
+                local["lidar_strength"] = strength
                 local["ts"] = time.time()
 
                 with self._lock:
@@ -268,7 +258,7 @@ class AvoidObstacle:
         y1 = int(self.cfg.roi_y_end_ratio * h)
         return frame_bgr[y0:y1, 0:w].copy()
 
-    def _read_ultra(self) -> Optional[float]:
+    def _read_distance_cm(self) -> Optional[float]:
         try:
             d = self.get_ultrasonic_cm()
             if d is None:
@@ -277,6 +267,17 @@ class AvoidObstacle:
             if d < self.cfg.min_valid_cm or d > self.cfg.max_valid_cm:
                 return None
             return d
+        except Exception:
+            return None
+
+    def _read_strength(self) -> Optional[float]:
+        if self.get_lidar_strength is None:
+            return None
+        try:
+            s = self.get_lidar_strength()
+            if s is None:
+                return None
+            return float(s)
         except Exception:
             return None
 
@@ -317,18 +318,21 @@ class AvoidObstacle:
             "floor_hsv_med": [mh, ms, mv],
         }
 
-    def _should_trigger(self, ultra_cm: Optional[float], local: Dict[str, Any]) -> bool:
+    def _should_trigger(self, dist_cm: Optional[float], local: Dict[str, Any]) -> bool:
         now = time.time()
         if (now - self._last_trigger_ts) < self.cfg.min_trigger_interval_sec:
             return False
 
-        if ultra_cm is not None and ultra_cm <= self.cfg.trigger_cm:
+        # 1) LiDAR near
+        if dist_cm is not None and dist_cm <= self.cfg.trigger_cm:
             return True
 
+        # 2) local confidence low
         conf = local.get("confidence", 0.0)
         if isinstance(conf, (int, float)) and conf < 0.35:
             return True
 
+        # 3) plan expired + local unsure
         with self._lock:
             plan_ts = self._last_plan_ts
         if plan_ts and (now - plan_ts) > self.cfg.plan_ttl_sec and conf < 0.55:
@@ -336,22 +340,17 @@ class AvoidObstacle:
 
         return False
 
-    def _trigger_upload(self, roi_bgr: np.ndarray, ultra_cm: Optional[float], local: Dict[str, Any]):
+    def _trigger_upload(self, roi_bgr: np.ndarray, dist_cm: Optional[float], local: Dict[str, Any]):
         self._last_trigger_ts = time.time()
 
-        # IMPORTANT: You asked "rotate before send".
-        # Here ROI is already rotated because frame rotated in _loop().
-        # If later you disable rotate in _loop(), you can rotate here instead.
-        roi_send = roi_bgr
-
-        # resize + encode
-        send = cv2.resize(roi_send, (self.cfg.send_w, self.cfg.send_h), interpolation=cv2.INTER_AREA)
+        send = cv2.resize(roi_bgr, (self.cfg.send_w, self.cfg.send_h), interpolation=cv2.INTER_AREA)
         ok, jpg = cv2.imencode(".jpg", send, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.cfg.jpeg_quality)])
         if not ok:
             return
 
         meta = {
-            "ultra_cm": ultra_cm,
+            "lidar_cm": dist_cm,
+            "lidar_strength": local.get("lidar_strength"),
             "local_best_sector": local.get("best_sector"),
             "local_scores": local.get("scores"),
             "ts": time.time(),

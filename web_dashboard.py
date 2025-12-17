@@ -21,9 +21,14 @@ class MqttSensorState:
     ok: bool = False
     last_ts: float = 0.0
     dt_ms: Optional[int] = None
-    dist_cm: Optional[float] = None
+
+    # unified
+    dist_cm: Optional[float] = None   # will map from uart_dist_cm
     temp_c: Optional[float] = None
     humid: Optional[float] = None
+    strength: Optional[float] = None  # uart_strength
+
+    src_ts_ms: Optional[int] = None   # ts_ms from ESP32
     err: Optional[str] = None
 
 
@@ -43,6 +48,15 @@ def _to_float(x):
         return None
 
 
+def _to_int(x):
+    try:
+        if x is None:
+            return None
+        return int(float(x))
+    except Exception:
+        return None
+
+
 class WebDashboard:
     """
     - /            HTML dashboard
@@ -51,7 +65,7 @@ class WebDashboard:
     - /cmd         manual command
     - /toggle_listen      listen-only
     - /toggle_auto        auto-move only
-    - /toggle_listen_run  (NEW) listen + auto-move (test)
+    - /toggle_listen_run  listen + auto-move (test)
     - /health
     """
 
@@ -60,18 +74,12 @@ class WebDashboard:
         host="0.0.0.0",
         port=8000,
 
-        # Old mode: provide encoded jpeg bytes
         get_jpeg: Optional[Callable[[], Optional[bytes]]] = None,
-
-        # New mode (recommended): provide BGR frame for overlay
         get_frame_bgr: Optional[Callable[[], Any]] = None,
 
-        # Optional avoid obstacle module (must provide .draw_overlay(frame_bgr) and .get_state())
         avoid_obstacle: Optional[Any] = None,
-
         on_manual_cmd: Optional[Callable[[str], None]] = None,
 
-        # NEW: rotate camera 180 degrees (default ON)
         rotate180: bool = True,
 
         mqtt_enable: bool = True,
@@ -90,8 +98,8 @@ class WebDashboard:
         self.get_jpeg = get_jpeg
         self.get_frame_bgr = get_frame_bgr
         self.avoid_obstacle = avoid_obstacle
-
         self.on_manual_cmd = on_manual_cmd
+
         self.rotate180 = bool(rotate180)
 
         self.mqtt_enable = mqtt_enable
@@ -109,9 +117,9 @@ class WebDashboard:
         self._sensor = MqttSensorState()
 
         # toggles
-        self._listen_on = False          # listen-only
-        self._auto_on = False            # auto move only
-        self._listen_run_on = False      # listen + run (test)
+        self._listen_on = False
+        self._auto_on = False
+        self._listen_run_on = False
 
         self.app = Flask(__name__)
         self._setup_routes()
@@ -120,7 +128,6 @@ class WebDashboard:
         if self.mqtt_enable:
             self._start_mqtt()
 
-    # ===== public getters =====
     def is_listen_on(self) -> bool:
         with self._lock:
             return bool(self._listen_on)
@@ -190,13 +197,27 @@ class WebDashboard:
                 self._sensor.last_ts = now
 
                 if data is not None:
-                    dist = _pick(data, ["uart_dist_cm", "dist_cm", "distance_cm", "distance", "dist", "range_cm"])
-                    temp = _pick(data, ["uart_temp_c", "temp_c", "temperature_c", "temperature", "temp", "t"])
-                    hum  = _pick(data, ["uart_humid", "humid", "humidity", "hum", "h"])
+                    # NEW keys from ESP32: uart_dist_cm, uart_strength, ts_ms
+                    dist = _pick(data, [
+                        "uart_dist_cm", "lidar_cm", "dist_cm", "distance_cm", "distance", "dist", "range_cm"
+                    ])
+                    strength = _pick(data, [
+                        "uart_strength", "strength"
+                    ])
+                    temp = _pick(data, [
+                        "temp_c", "uart_temp_c", "temperature_c", "temperature", "temp", "t"
+                    ])
+                    hum = _pick(data, [
+                        "humid", "uart_humid", "humidity", "hum", "h"
+                    ])
+                    ts_ms = _pick(data, ["ts_ms", "timestamp_ms", "ms"])
 
                     self._sensor.dist_cm = _to_float(dist)
+                    self._sensor.strength = _to_float(strength)
                     self._sensor.temp_c = _to_float(temp)
                     self._sensor.humid = _to_float(hum)
+                    self._sensor.src_ts_ms = _to_int(ts_ms)
+
                     self._sensor.err = None
                     self._sensor.ok = True
                 else:
@@ -243,24 +264,29 @@ class WebDashboard:
                         "ok": self._sensor.ok,
                         "dt_ms": self._sensor.dt_ms,
                         "last_ts": self._sensor.last_ts,
+                        "src_ts_ms": self._sensor.src_ts_ms,
                         "err": self._sensor.err,
                         "topic": self.mqtt_topic,
                     },
-                    "dist_cm": self._sensor.dist_cm,
+
+                    # keep old names for your python code
+                    "dist_cm": self._sensor.dist_cm,          # LiDAR distance
                     "temp_c": self._sensor.temp_c,
                     "humid": self._sensor.humid,
+
+                    # NEW fields
+                    "lidar_cm": self._sensor.dist_cm,
+                    "lidar_strength": self._sensor.strength,
+
                     "toggles": {
                         "listening": self._listen_on,
                         "auto_move": self._auto_on,
                         "listen_run": self._listen_run_on,
                     },
                     "avoid_obstacle": avoid_state,
-                    "video": {
-                        "rotate180": self.rotate180
-                    }
+                    "video": {"rotate180": self.rotate180},
                 })
 
-        # listen-only: bật -> tắt auto + tắt listen_run
         @self.app.post("/toggle_listen")
         def toggle_listen():
             with self._lock:
@@ -274,7 +300,6 @@ class WebDashboard:
                     "listen_run": self._listen_run_on,
                 }})
 
-        # auto-only: bật -> tắt listen + tắt listen_run
         @self.app.post("/toggle_auto")
         def toggle_auto():
             with self._lock:
@@ -288,7 +313,6 @@ class WebDashboard:
                     "listen_run": self._listen_run_on,
                 }})
 
-        # listen&run: bật -> bật auto + tắt listen-only
         @self.app.post("/toggle_listen_run")
         def toggle_listen_run():
             with self._lock:
@@ -315,7 +339,6 @@ class WebDashboard:
         @self.app.get("/mjpeg")
         def mjpeg():
             def gen():
-                # Prepare black fallback
                 black = None
                 try:
                     import cv2
@@ -337,13 +360,9 @@ class WebDashboard:
                                 frame_bytes = black
                             else:
                                 import cv2
-
-                                # NEW: rotate first (so overlay matches rotated view)
                                 if self.rotate180:
                                     frame_bgr = cv2.rotate(frame_bgr, cv2.ROTATE_180)
-                                    # or: frame_bgr = cv2.flip(frame_bgr, -1)
 
-                                # overlay
                                 if self.avoid_obstacle is not None:
                                     try:
                                         frame_bgr = self.avoid_obstacle.draw_overlay(frame_bgr)
@@ -358,9 +377,7 @@ class WebDashboard:
                                        b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
                             else:
                                 time.sleep(0.05)
-
                         else:
-                            # Old mode: already-jpeg (no overlay)
                             frame = self.get_jpeg() if self.get_jpeg else None
                             if not frame:
                                 frame = black
@@ -369,7 +386,6 @@ class WebDashboard:
                                        b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
                             else:
                                 time.sleep(0.05)
-
                     except Exception:
                         time.sleep(0.1)
 
@@ -416,7 +432,8 @@ class WebDashboard:
       <div class="card">
         <b>Quick Status (MQTT Direct)</b>
         <div class="kv">
-          <div class="pill">Dist(cm): <span id="dist">...</span></div>
+          <div class="pill">LiDAR(cm): <span id="lidar">...</span></div>
+          <div class="pill">Strength: <span id="str">...</span></div>
           <div class="pill">Temp(°C): <span id="t">...</span></div>
           <div class="pill">Hum(%): <span id="h">...</span></div>
           <div class="pill">MQTT: <span id="mq">...</span></div>
@@ -473,9 +490,10 @@ async function refresh(){
     const mq = mqttOk ? ('OK dt=' + (j.mqtt.dt_ms ?? 'NA') + 'ms') : ('ERR');
     document.getElementById('mq').textContent = mq;
 
-    document.getElementById('dist').textContent = (j.dist_cm ?? 'NA');
-    document.getElementById('t').textContent = (j.temp_c ?? 'NA');
-    document.getElementById('h').textContent = (j.humid ?? 'NA');
+    document.getElementById('lidar').textContent = (j.lidar_cm ?? 'NA');
+    document.getElementById('str').textContent   = (j.lidar_strength ?? 'NA');
+    document.getElementById('t').textContent     = (j.temp_c ?? 'NA');
+    document.getElementById('h').textContent     = (j.humid ?? 'NA');
 
     const listenOn = j?.toggles?.listening === true;
     const autoOn = j?.toggles?.auto_move === true;
