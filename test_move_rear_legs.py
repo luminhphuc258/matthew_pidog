@@ -1,130 +1,61 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import json
+"""
+FLOW mới:
+1) boot bình thường
+2) apply pose config
+3) stand
+4) sit
+5) body_stop (nằm thực sự)
+6) chờ 2s
+7) làm lại: boot -> apply pose -> stand
+"""
+
 import time
 from pathlib import Path
-from typing import Optional, Dict
+from motion_controller import MotionController
 
-from robot_hat import Servo
+POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
 
 
-class MoveRearLegs:
-    """
-    Safe "soft reboot" flow (NO new PiDog instance → tránh lỗi MCRST busy)
+def main():
+    mc = MotionController()
 
-    Flow:
-      1) sit
-      2) body_stop (nằm hẳn)
-      3) wait 2s
-      4) apply pose config again (Servo raw, smooth)
-      5) stand (reuse existing dog)
-    """
+    # ===== ROUND 1 =====
+    print("[1] BOOT")
+    mc.boot()
+    time.sleep(1.2)
 
-    def __init__(
-        self,
-        pose_file: Path,
-        per_servo_delay: float = 0.03,
-        settle_sec: float = 0.8,
-    ):
-        self.pose_file = Path(pose_file)
-        self.per_servo_delay = float(per_servo_delay)
-        self.settle_sec = float(settle_sec)
+    print("[2] APPLY POSE CONFIG:", POSE_FILE)
+    mc.apply_pose_config(str(POSE_FILE))
+    time.sleep(0.8)
 
-        self.servo_ports = [f"P{i}" for i in range(12)]
-        self.angle_min, self.angle_max = -90, 90
+    print("[3] STAND")
+    mc.stand()
+    time.sleep(1.0)
 
-    # ---------- helpers ----------
-    def _clamp(self, v: float) -> int:
-        try:
-            v = int(v)
-        except Exception:
-            v = 0
-        return max(self.angle_min, min(self.angle_max, v))
+    print("[4] SIT")
+    mc.sit()
+    time.sleep(1.0)
 
-    def _safe_wait(self, dog):
-        try:
-            dog.wait_all_done()
-        except Exception:
-            pass
+    print("[5] BODY_STOP (lie down)")
+    mc.body_stop()
+    time.sleep(2.0)
 
-    def _sit(self, dog, speed=20):
-        try:
-            dog.do_action("sit", speed=speed)
-            self._safe_wait(dog)
-            return True
-        except Exception:
-            return False
+    # ===== ROUND 2 (reboot sequence again) =====
+    print("[6] REBOOT SEQUENCE AGAIN: BOOT -> APPLY POSE -> STAND")
+    mc.boot()
+    time.sleep(1.2)
 
-    def _body_stop(self, dog):
-        try:
-            dog.body_stop()
-            self._safe_wait(dog)
-            return True
-        except Exception:
-            return False
+    mc.apply_pose_config(str(POSE_FILE))
+    time.sleep(0.8)
 
-    def _stand(self, dog, speed=15):
-        try:
-            dog.do_action("stand", speed=speed)
-            self._safe_wait(dog)
-            return True
-        except Exception:
-            return False
+    mc.stand()
+    time.sleep(1.0)
 
-    def load_pose_config(self) -> Dict[str, int]:
-        cfg = {p: 0 for p in self.servo_ports}
-        if not self.pose_file.exists():
-            return cfg
-        try:
-            data = json.loads(self.pose_file.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                for k, v in data.items():
-                    if k in cfg:
-                        cfg[k] = self._clamp(v)
-        except Exception:
-            pass
-        return cfg
+    print("[DONE] Flow completed. Robot is standing.")
 
-    def apply_pose_from_cfg(self, cfg: Dict[str, int]):
-        servos = {}
-        for p in self.servo_ports:
-            try:
-                servos[p] = Servo(p)
-            except Exception:
-                pass
 
-        for p in self.servo_ports:
-            s = servos.get(p)
-            if s is None:
-                continue
-            try:
-                s.angle(self._clamp(cfg.get(p, 0)))
-                time.sleep(self.per_servo_delay)
-            except Exception:
-                pass
-
-        if self.settle_sec > 0:
-            time.sleep(self.settle_sec)
-
-    # ---------- main flow ----------
-    def run(self, dog) -> bool:
-        if dog is None:
-            return False
-
-        print("[MoveRearLegs] SIT …")
-        self._sit(dog, speed=20)
-        time.sleep(0.4)
-
-        print("[MoveRearLegs] BODY STOP (lie down) …")
-        self._body_stop(dog)
-        time.sleep(2.0)
-
-        print("[MoveRearLegs] APPLY POSE CONFIG (soft reboot) …")
-        cfg = self.load_pose_config()
-        self.apply_pose_from_cfg(cfg)
-
-        print("[MoveRearLegs] STAND …")
-        self._stand(dog, speed=15)
-
-        return True
+if __name__ == "__main__":
+    main()
