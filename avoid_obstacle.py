@@ -26,6 +26,7 @@ class AvoidCfg:
 
     sector_n: int = 9
 
+    # LiDAR priority thresholds
     force_stop_cm: float = 40.0
     trigger_cm: float = 120.0
     hard_stop_cm: float = 28.0
@@ -35,7 +36,7 @@ class AvoidCfg:
     min_trigger_interval_sec: float = 1.2
     plan_ttl_sec: float = 6.0
 
-    server_url: str = "https://YOUR_SERVER.up.railway.app/avoid_obstacle_vision"
+    server_url: str = "https://embeddedprogramming-healtheworldserver.up.railway.app/avoid_obstacle_vision"
     jpeg_quality: int = 55
     send_w: int = 256
     send_h: int = 144
@@ -48,25 +49,50 @@ class AvoidCfg:
     bands_n: int = 6
     floor_ok_ratio_band0: float = 0.25
 
-    # corridor detect
+    # corridor detect (from floor mask)
     corridor_floor_threshold: float = 0.45
     corridor_min_width_ratio: float = 0.18
     corridor_min_conf: float = 0.25
 
     narrow_replan_cooldown_sec: float = 2.5
 
+    # plan->action selection
+    min_plan_confidence: float = 0.40
+    min_local_confidence: float = 0.25
+
 
 class AvoidObstacle:
+    """
+    - Local: estimate floor free corridor using HSV floor mask + 6 bottom bands.
+    - Trigger (distance near / floor blocked / low conf / forced): upload ROI to server (GPT vision)
+    - Plan: obstacles + walkway polygon + best_sector (+ optional action)
+    - Provide: draw_overlay() and get_best_action() for main loop.
+    """
+
     def __init__(
         self,
-        get_distance_cm: Callable[[], Optional[float]],
+        get_distance_cm: Optional[Callable[[], Optional[float]]] = None,
         cfg: AvoidCfg = AvoidCfg(),
         session: Optional[requests.Session] = None,
         get_frame_bgr: Optional[Callable[[], Any]] = None,
         rotate180: bool = True,
         get_lidar_strength: Optional[Callable[[], Optional[float]]] = None,
+
+        # compatibility: older call sites
+        get_ultrasonic_cm: Optional[Callable[[], Optional[float]]] = None,
+        **kwargs,
     ):
-        self.get_distance_cm = get_distance_cm
+        # allow passing getter in multiple names
+        self.get_distance_cm = get_distance_cm or get_ultrasonic_cm
+        if self.get_distance_cm is None:
+            # also accept alternative names via kwargs
+            for k in ("get_lidar_cm", "get_dist_cm", "get_distance"):
+                if k in kwargs and kwargs[k] is not None:
+                    self.get_distance_cm = kwargs[k]
+                    break
+        if self.get_distance_cm is None:
+            raise ValueError("AvoidObstacle missing distance getter (get_distance_cm or get_ultrasonic_cm).")
+
         self.get_lidar_strength = get_lidar_strength
         self.cfg = cfg
         self.http = session or requests.Session()
@@ -93,6 +119,8 @@ class AvoidObstacle:
         self._upload_inflight = False
 
         self._last_narrow_replan_ts = 0.0
+
+    # ---------------- public API ----------------
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -122,6 +150,10 @@ class AvoidObstacle:
                 "upload_inflight": bool(self._upload_inflight),
             }
 
+    def force_trigger(self, reason: str = "force_trigger") -> bool:
+        """Force upload latest ROI right now (async)."""
+        return self.request_plan_now(reason=reason, force=True)
+
     def request_plan_now(self, reason: str = "manual_force", force: bool = True) -> bool:
         with self._lock:
             roi = None if self._last_roi is None else self._last_roi.copy()
@@ -132,11 +164,109 @@ class AvoidObstacle:
         local["force_reason"] = reason
         return self._trigger_upload_async(roi, dist, local, force=force)
 
+    def plan_is_fresh(self) -> bool:
+        with self._lock:
+            ts = float(self._last_plan_ts or 0.0)
+        if ts <= 0:
+            return False
+        return (time.time() - ts) <= self.cfg.plan_ttl_sec
+
+    def get_best_action(self) -> Optional[Dict[str, Any]]:
+        """
+        Return dict with:
+          {action, confidence, best_sector, obstacles, walkway_poly, no_path, narrow, walkway_width_ratio}
+        """
+        with self._lock:
+            local = dict(self._last_local or {})
+            plan = dict(self._last_plan or {})
+            plan_ts = float(self._last_plan_ts or 0.0)
+
+        now = time.time()
+        plan_ok = bool(plan) and plan_ts and (now - plan_ts) <= self.cfg.plan_ttl_sec
+
+        # local corridor fallback
+        corridor_poly = local.get("corridor_poly")
+        corridor_conf = float(local.get("corridor_conf", 0.0) or 0.0)
+        corridor_w = float(local.get("corridor_width_ratio", 0.0) or 0.0)
+        floor_blocked = bool(local.get("floor_blocked", False))
+        local_best_sector = local.get("best_sector", None)
+
+        out: Dict[str, Any] = {}
+        if plan_ok:
+            out.update(plan)
+
+        # Normalize walkway poly
+        if "walkway_poly" not in out:
+            if isinstance(out.get("safe_poly"), list):
+                out["walkway_poly"] = out.get("safe_poly")
+            else:
+                out["walkway_poly"] = corridor_poly
+
+        # Normalize confidence
+        if "confidence" not in out or not isinstance(out.get("confidence"), (int, float)):
+            out["confidence"] = corridor_conf
+
+        # Normalize best_sector
+        if "best_sector" not in out or not isinstance(out.get("best_sector"), int):
+            if isinstance(local_best_sector, int):
+                out["best_sector"] = int(local_best_sector)
+            else:
+                out["best_sector"] = self.cfg.sector_n // 2
+
+        # Estimate walkway width ratio if missing
+        if "walkway_width_ratio" not in out or not isinstance(out.get("walkway_width_ratio"), (int, float)):
+            out["walkway_width_ratio"] = corridor_w
+
+        # Determine narrow/no_path
+        wwr = float(out.get("walkway_width_ratio", 0.0) or 0.0)
+        conf = float(out.get("confidence", 0.0) or 0.0)
+
+        narrow = False
+        no_path = False
+        if floor_blocked:
+            no_path = True
+        if wwr > 0 and wwr < self.cfg.corridor_min_width_ratio and conf >= self.cfg.corridor_min_conf:
+            narrow = True
+        if wwr <= 0.10 and conf >= 0.15:
+            no_path = True
+
+        out["narrow"] = bool(out.get("narrow", False) or narrow)
+        out["no_path"] = bool(out.get("no_path", False) or no_path)
+
+        # Decide action if not provided by server:
+        # - if no_path => STOP
+        # - else turn towards best_sector if not center-ish
+        # - else FORWARD
+        if not isinstance(out.get("action"), str):
+            bs = int(out.get("best_sector", self.cfg.sector_n // 2))
+            center = self.cfg.sector_n // 2
+            if out["no_path"]:
+                out["action"] = "STOP"
+            else:
+                if bs <= center - 1:
+                    out["action"] = "LEFT"
+                elif bs >= center + 1:
+                    out["action"] = "RIGHT"
+                else:
+                    out["action"] = "FORWARD"
+
+        # If confidence too low => return minimal (caller can fall back to planner)
+        if float(out.get("confidence", 0.0) or 0.0) < min(self.cfg.min_plan_confidence, 0.25) and not plan_ok:
+            return None
+
+        # keep obstacles as list
+        if not isinstance(out.get("obstacles"), list):
+            out["obstacles"] = []
+
+        return out
+
     def should_rotate_replan(self) -> bool:
+        """If corridor too narrow or floor blocked, suggest rotate 180 + replan (cooldown)."""
         now = time.time()
         with self._lock:
             local = dict(self._last_local or {})
             plan = dict(self._last_plan or {})
+
         if (now - self._last_narrow_replan_ts) < self.cfg.narrow_replan_cooldown_sec:
             return False
 
@@ -149,7 +279,7 @@ class AvoidObstacle:
             bad = True
 
         if isinstance(cw, (int, float)) and isinstance(cc, (int, float)):
-            if cw < self.cfg.corridor_min_width_ratio and cc >= self.cfg.corridor_min_conf:
+            if float(cw) < self.cfg.corridor_min_width_ratio and float(cc) >= self.cfg.corridor_min_conf:
                 bad = True
 
         pw = plan.get("walkway_width_ratio", None)
@@ -162,6 +292,7 @@ class AvoidObstacle:
         return False
 
     def draw_overlay(self, frame_bgr: np.ndarray) -> np.ndarray:
+        """Overlay for WebDashboard: walkway yellow + obstacles red + short HUD."""
         if frame_bgr is None:
             return frame_bgr
 
@@ -178,6 +309,7 @@ class AvoidObstacle:
         now = time.time()
         plan_ok = bool(plan) and plan_ts and (now - plan_ts) <= self.cfg.plan_ttl_sec
 
+        # walkway poly: prefer GPT plan, fallback local corridor
         walkway_poly = None
         if plan_ok and isinstance(plan.get("walkway_poly", None), list):
             walkway_poly = plan.get("walkway_poly")
@@ -197,10 +329,11 @@ class AvoidObstacle:
             if len(pts) >= 3:
                 pts_np = np.array(pts, dtype=np.int32)
                 overlay = frame_bgr.copy()
-                cv2.fillPoly(overlay, [pts_np], (0, 255, 255))   # yellow
+                cv2.fillPoly(overlay, [pts_np], (0, 255, 255))  # yellow
                 frame_bgr[:] = cv2.addWeighted(overlay, 0.22, frame_bgr, 0.78, 0)
                 cv2.polylines(frame_bgr, [pts_np], True, (0, 255, 255), 2)
 
+        # obstacles only from plan (if fresh)
         obstacles = plan.get("obstacles", []) if plan_ok else []
         if isinstance(obstacles, list):
             for ob in obstacles[:12]:
@@ -217,8 +350,16 @@ class AvoidObstacle:
                     txt = label
                     if isinstance(risk, (int, float)):
                         txt += f" {float(risk):.2f}"
-                    cv2.putText(frame_bgr, txt, (x1, y0 + max(14, yb1 - 6)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 255), 2, cv2.LINE_AA)
+                    cv2.putText(
+                        frame_bgr,
+                        txt,
+                        (x1, y0 + max(14, yb1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.52,
+                        (0, 0, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
 
         dist = local.get("dist_cm", None)
         conf = plan.get("confidence", None) if plan_ok else None
@@ -230,6 +371,8 @@ class AvoidObstacle:
         hud = f"d={dist}cm  best={best}  conf={conf}  blocked={int(bool(floor_blocked))}"
         cv2.putText(frame_bgr, hud, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
         return frame_bgr
+
+    # ---------------- internal loop ----------------
 
     def _open_camera(self):
         self._cap = cv2.VideoCapture(self.cfg.cam_dev)
@@ -316,6 +459,8 @@ class AvoidObstacle:
         except Exception:
             return None
 
+    # ---------------- floor + corridor analysis ----------------
+
     def _floor_mask(self, roi_bgr: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
         h, w = roi_bgr.shape[:2]
         hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
@@ -355,6 +500,7 @@ class AvoidObstacle:
 
         floor_blocked = band_ratios[0] < self.cfg.floor_ok_ratio_band0
 
+        # corridor from lower half: find widest good-floor segment
         y_cut = int(0.45 * h)
         m2 = mask_floor[y_cut:h, :]
         col_ratio = np.mean(m2 > 0, axis=0)
@@ -413,8 +559,11 @@ class AvoidObstacle:
             **dbg,
         }
 
+    # ---------------- trigger/upload ----------------
+
     def _should_trigger(self, dist_cm: Optional[float], local: Dict[str, Any], force: bool = False) -> bool:
         now = time.time()
+
         if not force and (now - self._last_trigger_ts) < self.cfg.min_trigger_interval_sec:
             return False
 
@@ -430,12 +579,12 @@ class AvoidObstacle:
             return True
 
         conf = local.get("corridor_conf", 0.0)
-        if isinstance(conf, (int, float)) and conf < 0.20:
+        if isinstance(conf, (int, float)) and float(conf) < 0.20:
             return True
 
         with self._lock:
             plan_ts = self._last_plan_ts
-        if plan_ts and (now - plan_ts) > self.cfg.plan_ttl_sec and conf < 0.45:
+        if plan_ts and (now - plan_ts) > self.cfg.plan_ttl_sec and float(conf) < 0.45:
             return True
 
         return False
@@ -492,27 +641,36 @@ class AvoidObstacle:
 
         try:
             r = self.http.post(self.cfg.server_url, files=files, timeout=8)
-            if r.ok:
-                plan = r.json()
-                if not isinstance(plan, dict):
-                    return
+            if not r.ok:
+                return
 
-                if "walkway_poly" not in plan and "safe_poly" in plan:
-                    plan["walkway_poly"] = plan.get("safe_poly")
+            plan = r.json()
+            if not isinstance(plan, dict):
+                return
 
-                if "walkway_width_ratio" not in plan:
-                    wp = plan.get("walkway_poly", None)
-                    if isinstance(wp, list) and len(wp) >= 2:
-                        try:
-                            xs = [float(p[0]) for p in wp if isinstance(p, list) and len(p) == 2]
-                            if xs:
-                                wroi = max(1.0, float(roi_bgr.shape[1]))
-                                plan["walkway_width_ratio"] = float((max(xs) - min(xs)) / wroi)
-                        except Exception:
-                            pass
+            # normalize: walkway_poly
+            if "walkway_poly" not in plan and "safe_poly" in plan:
+                plan["walkway_poly"] = plan.get("safe_poly")
 
-                with self._lock:
-                    self._last_plan = plan
-                    self._last_plan_ts = time.time()
+            # walkway_width_ratio
+            if "walkway_width_ratio" not in plan:
+                wp = plan.get("walkway_poly", None)
+                if isinstance(wp, list) and len(wp) >= 2:
+                    try:
+                        xs = [float(p[0]) for p in wp if isinstance(p, list) and len(p) == 2]
+                        if xs:
+                            wroi = max(1.0, float(roi_bgr.shape[1]))
+                            plan["walkway_width_ratio"] = float((max(xs) - min(xs)) / wroi)
+                    except Exception:
+                        pass
+
+            # n_obstacles
+            if "n_obstacles" not in plan:
+                obs = plan.get("obstacles", [])
+                plan["n_obstacles"] = len(obs) if isinstance(obs, list) else 0
+
+            with self._lock:
+                self._last_plan = plan
+                self._last_plan_ts = time.time()
         except Exception:
             pass
