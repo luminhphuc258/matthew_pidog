@@ -2,14 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-FLOW mới:
-1) boot bình thường
-2) apply pose config
-3) stand
-4) sit
-5) body_stop (nằm thực sự)
-6) chờ 2s
-7) làm lại: boot -> apply pose -> stand
+FLOW mới (đúng với MotionController hiện tại):
+1) boot bình thường (trong boot đã: pre-move -> load pose -> apply pose -> create dog -> stand)
+2) stand (gọi lại cho chắc)
+3) sit
+4) body_stop
+5) chờ 2s
+6) làm lại "reboot sequence": boot -> stand
 """
 
 import time
@@ -20,45 +19,44 @@ POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
 
 
 def main():
-    print("=== TEST FLOW: BOOT → STAND → SIT → BODY_STOP → REBOOT ===")
+    print("=== TEST FLOW: BOOT → STAND → SIT → BODY_STOP → BOOT AGAIN ===")
 
-    # ✅ BẮT BUỘC truyền pose_file
-    mc = MotionController(pose_file=str(POSE_FILE))
+    # MotionController bắt buộc pose_file
+    mc = MotionController(pose_file=POSE_FILE)
 
     # ===== ROUND 1 =====
-    print("[1] BOOT")
+    print("[1] BOOT (includes pose apply + create dog + stand)")
     mc.boot()
-    time.sleep(1.2)
-
-    print("[2] APPLY POSE CONFIG")
-    mc.apply_pose_config(str(POSE_FILE))
     time.sleep(0.8)
 
-    print("[3] STAND")
-    mc.stand()
-    time.sleep(1.0)
+    print("[2] STAND (confirm)")
+    mc.stand(speed=30, force=True)
+    time.sleep(0.8)
 
-    print("[4] SIT")
-    mc.sit()
-    time.sleep(1.0)
+    print("[3] SIT")
+    mc.sit(speed=20)
+    time.sleep(0.8)
 
-    print("[5] BODY_STOP (robot nằm hẳn)")
-    mc.body_stop()
+    # body_stop là hàm của dog/lib, MotionController chưa wrap -> gọi trực tiếp qua mc.dog
+    print("[4] BODY_STOP (robot nằm thật sự)")
+    if mc.dog is not None:
+        try:
+            mc.dog.body_stop()
+        except Exception as e:
+            print("!! body_stop failed:", e)
+
     time.sleep(2.0)
 
     # ===== ROUND 2 =====
-    print("[6] REBOOT SEQUENCE AGAIN")
-
+    print("[5] BOOT AGAIN (reboot sequence in software)")
     mc.boot()
-    time.sleep(1.2)
-
-    mc.apply_pose_config(str(POSE_FILE))
     time.sleep(0.8)
 
-    mc.stand()
-    time.sleep(1.0)
+    print("[6] STAND (confirm)")
+    mc.stand(speed=30, force=True)
+    time.sleep(0.5)
 
-    print("[DONE] Robot đang đứng ổn định.")
+    print("[DONE] Flow completed.")
 
 
 if __name__ == "__main__":
