@@ -20,14 +20,17 @@ POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
 
 
 def main():
-    mc = MotionController()
+    print("=== TEST FLOW: BOOT → STAND → SIT → BODY_STOP → REBOOT ===")
+
+    # ✅ BẮT BUỘC truyền pose_file
+    mc = MotionController(pose_file=str(POSE_FILE))
 
     # ===== ROUND 1 =====
     print("[1] BOOT")
     mc.boot()
     time.sleep(1.2)
 
-    print("[2] APPLY POSE CONFIG:", POSE_FILE)
+    print("[2] APPLY POSE CONFIG")
     mc.apply_pose_config(str(POSE_FILE))
     time.sleep(0.8)
 
@@ -39,12 +42,13 @@ def main():
     mc.sit()
     time.sleep(1.0)
 
-    print("[5] BODY_STOP (lie down)")
+    print("[5] BODY_STOP (robot nằm hẳn)")
     mc.body_stop()
     time.sleep(2.0)
 
-    # ===== ROUND 2 (reboot sequence again) =====
-    print("[6] REBOOT SEQUENCE AGAIN: BOOT -> APPLY POSE -> STAND")
+    # ===== ROUND 2 =====
+    print("[6] REBOOT SEQUENCE AGAIN")
+
     mc.boot()
     time.sleep(1.2)
 
@@ -54,7 +58,7 @@ def main():
     mc.stand()
     time.sleep(1.0)
 
-    print("[DONE] Flow completed. Robot is standing.")
+    print("[DONE] Robot đang đứng ổn định.")
 
 
 if __name__ == "__main__":
