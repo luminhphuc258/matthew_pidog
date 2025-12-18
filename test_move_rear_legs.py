@@ -3,72 +3,54 @@
 
 import time
 from pathlib import Path
-from typing import Optional
 
-from matthewpidogclassinit import MatthewPidogBootClass
+from motion_controller import MotionController
+from move_rear_legs import MoveRearLegs
+
+POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
 
 
-class MoveRearLegs:
-    """
-    Safe rear-body reset flow using PiDog high-level API
+def set_led_pink(dog):
+    try:
+        strip = dog.rgb_strip
+        strip.set_mode("breath", "pink", bps=0.6)
+    except Exception:
+        pass
 
-    Flow:
-    1) sit
-    2) body_stop (robot nằm hẳn)
-    3) wait 2s
-    4) re-boot sequence (đưa robot về trạng thái chuẩn)
-    """
 
-    def __init__(self, pose_file: Path):
-        self.pose_file = Path(pose_file)
-        self._dog = None
+def set_led_off(dog):
+    try:
+        strip = dog.rgb_strip
+        strip.set_mode("off")
+    except Exception:
+        pass
 
-    # ---------- helpers ----------
-    def _safe_wait(self, dog):
-        try:
-            dog.wait_all_done()
-        except Exception:
-            pass
 
-    def sit(self, dog, speed=20):
-        try:
-            dog.do_action("sit", speed=speed)
-            self._safe_wait(dog)
-            return True
-        except Exception:
-            return False
+def main():
+    print("[TEST] Boot robot …")
+    motion = MotionController(pose_file=POSE_FILE)
+    motion.boot()
+    dog = motion.dog
 
-    def body_stop(self, dog):
-        """
-        PiDog API: nằm xuống thật sự
-        """
-        try:
-            dog.body_stop()
-            self._safe_wait(dog)
-            return True
-        except Exception:
-            return False
+    print("[TEST] SIT 3s + LED pink")
+    set_led_pink(dog)
+    motion.sit(speed=20)
+    time.sleep(3.0)
 
-    # ---------- main flow ----------
-    def run(self, dog) -> Optional[object]:
-        """
-        Execute rear-leg reset flow.
-        Return new dog instance after reboot.
-        """
-        if dog is None:
-            return None
+    print("[TEST] MoveRearLegs flow …")
+    rear = MoveRearLegs(pose_file=POSE_FILE)
+    dog = rear.run(dog)
 
-        print("[MoveRearLegs] SIT …")
-        self.sit(dog, speed=20)
-        time.sleep(0.5)
+    print("[TEST] STAND")
+    set_led_off(dog)
+    try:
+        dog.do_action("stand", speed=15)
+        dog.wait_all_done()
+    except Exception:
+        pass
 
-        print("[MoveRearLegs] BODY STOP (lie down) …")
-        self.body_stop(dog)
-        time.sleep(2.0)
+    print("[TEST] DONE ✅")
 
-        print("[MoveRearLegs] REBOOT SEQUENCE …")
-        boot = MatthewPidogBootClass()
-        new_dog = boot.create()
 
-        time.sleep(1.2)
-        return new_dog
+if __name__ == "__main__":
+    main()
