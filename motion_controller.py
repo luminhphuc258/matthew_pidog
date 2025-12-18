@@ -33,7 +33,7 @@ class MotionController:
         p1_invert=True,
         # ===== head controller =====
         head_p8_fixed=60,
-        head_p9_fixed=-65,
+        head_p9_fixed=-55,
         head_p10_a=90,
         head_p10_b=90,
     ):
