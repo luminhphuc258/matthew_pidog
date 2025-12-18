@@ -411,20 +411,27 @@ class PerceptionPlanner:
         cap.release()
 
     # ---------------- MQTT ----------------
-
     def _parse_sensor_payload(self, payload: str) -> Optional[Tuple[float, float, float]]:
         payload = payload.strip()
         if not payload:
             return None
 
-        # JSON: {"temp":29.6,"humid":20.0,"dist":11.4}
+        # JSON: {"ts_ms":..., "temp_c":..., "humid":..., "uart_dist_cm":..., "uart_strength":...}
         if payload.startswith("{") and payload.endswith("}"):
             try:
                 o = json.loads(payload)
-                temp = float(o.get("temp", o.get("temperature", o.get("t"))))
-                humid = float(o.get("humid", o.get("humidity", o.get("h"))))
-                dist = float(o.get("dist", o.get("distance", o.get("d"))))
-                return temp, humid, dist
+
+                # temp
+                temp = o.get("temp_c", o.get("temp", o.get("temperature", o.get("t"))))
+                # humid
+                humid = o.get("humid", o.get("humidity", o.get("h")))
+                # dist
+                dist = o.get("uart_dist_cm", o.get("lidar_cm", o.get("dist_cm", o.get("dist", o.get("distance", o.get("d"))))))
+
+                if temp is None or humid is None or dist is None:
+                    return None
+
+                return float(temp), float(humid), float(dist)
             except Exception:
                 return None
 
@@ -441,6 +448,7 @@ class PerceptionPlanner:
                     return None
 
         return None
+
 
     def _mqtt_loop(self):
         if mqtt is None:
