@@ -7,6 +7,7 @@ import threading
 import subprocess
 import socket
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import cv2
@@ -22,13 +23,8 @@ FACE_HOST = "127.0.0.1"
 FACE_PORT = 39393
 _face_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-BARK_CANDIDATES = [
-    str(Path(__file__).resolve().parent / "sounds" / "bark.wav"),
-    "/home/pi/sounds/bark.wav",
-    "/usr/share/sounds/alsa/Front_Center.wav",
-]
 
-
+# ===================== utils =====================
 def set_face(emo: str):
     try:
         _face_sock.sendto(emo.encode("utf-8"), (FACE_HOST, FACE_PORT))
@@ -37,10 +33,11 @@ def set_face(emo: str):
 
 
 def run(cmd):
-    return subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return subprocess.run(cmd, check=False)
 
 
 def set_volumes():
+    # Tuỳ máy bạn: có thể khác control name
     run(["amixer", "-q", "sset", "robot-hat speaker", "100%"])
     run(["amixer", "-q", "sset", "robot-hat speaker Playback Volume", "100%"])
     run(["amixer", "-q", "sset", "robot-hat mic", "100%"])
@@ -48,55 +45,160 @@ def set_volumes():
 
 
 def norm_move(m: str) -> str:
-    m = (m or "STOP").upper()
-    if m == "BACKWARD":
+    m = (m or "STOP").upper().strip()
+    if m in ("BACKWARD", "REVERSE"):
         return "BACK"
-    return m
+    if m in ("TURNLEFT", "LEFT_TURN"):
+        return "LEFT"
+    if m in ("TURNRIGHT", "RIGHT_TURN"):
+        return "RIGHT"
+    if m in ("FORWARD", "FWD"):
+        return "FORWARD"
+    if m in ("STOP", "IDLE"):
+        return "STOP"
+    if m in ("LEFT", "RIGHT", "BACK"):
+        return m
+    return "STOP"
 
 
-def safe_get_state(planner):
-    try:
-        return planner.get_state()
-    except Exception:
-        return None
+def dict_get_any(d: dict, keys, default=None):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return default
 
 
-def get_lidar_cm_from_state(st):
+def get_lidar_cm_from_state(st) -> Optional[float]:
     if st is None:
         return None
-    v = getattr(st, "uart_dist_cm", None)
-    try:
-        return float(v) if v is not None else None
-    except Exception:
-        return None
+    if isinstance(st, dict):
+        v = dict_get_any(st, ("uart_dist_cm", "dist_cm", "distance_cm", "distance", "dist"), None)
+        try:
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+    # object style
+    for k in ("uart_dist_cm", "dist_cm", "distance_cm", "distance", "dist"):
+        v = getattr(st, k, None)
+        if v is not None:
+            try:
+                return float(v)
+            except Exception:
+                return None
+    return None
 
 
-def file_exists(p: str) -> bool:
-    try:
-        return Path(p).exists()
-    except Exception:
+def get_decision_from_state(st) -> str:
+    if st is None:
+        return "STOP"
+    if isinstance(st, dict):
+        return norm_move(st.get("decision", "STOP"))
+    return norm_move(getattr(st, "decision", "STOP"))
+
+
+# ===================== PiDog voice + LED helpers =====================
+def pidog_voice(dog, action: str):
+    """
+    action in ["bark", "bark harder", "pant", "howling"]
+    Try multiple APIs because PiDog versions differ.
+    """
+    if dog is None:
         return False
 
+    a = (action or "").strip().lower()
 
-def bark_twice():
-    wav = None
-    for p in BARK_CANDIDATES:
-        if file_exists(p):
-            wav = p
-            break
-    if not wav:
+    # 1) common: dog.speak("bark") / dog.speak(action)
+    for fn in ("speak", "voice", "play_voice", "play_sound", "sound"):
+        try:
+            if hasattr(dog, fn):
+                getattr(dog, fn)(a)
+                return True
+        except Exception:
+            pass
+
+    # 2) some libs: dog.do_action("bark") / dog.action("bark")
+    for fn in ("do_action", "action", "do_voice", "do_voice_action", "voice_action", "do_emotion"):
+        try:
+            if hasattr(dog, fn):
+                getattr(dog, fn)(a)
+                return True
+        except Exception:
+            pass
+
+    # 3) some libs expose list/dict VOICE_ACTIONS and a runner
+    try:
+        va = getattr(dog, "VOICE_ACTIONS", None) or getattr(dog, "voice_actions", None)
+        if va and isinstance(va, (list, tuple)) and a in [x.lower() for x in va]:
+            # try generic executor
+            for fn in ("run", "play", "execute"):
+                if hasattr(dog, fn):
+                    getattr(dog, fn)(a)
+                    return True
+    except Exception:
+        pass
+
+    return False
+
+
+def bark_twice(dog):
+    # bark 2 tiếng, cách nhau 150ms
+    ok1 = pidog_voice(dog, "bark")
+    time.sleep(0.15)
+    ok2 = pidog_voice(dog, "bark")
+    return ok1 or ok2
+
+
+def set_led_mode(dog, mode: str):
+    """
+    mode: "FORWARD" => blue, "BACK" => red, "STOP" => off
+    """
+    if dog is None:
         return
-    run(["aplay", "-q", wav])
-    time.sleep(0.10)
-    run(["aplay", "-q", wav])
+    try:
+        strip = getattr(dog, "rgb_strip", None)
+        if strip is None:
+            return
+
+        m = norm_move(mode)
+        if m == "FORWARD":
+            strip.set_mode("breath", "blue", bps=0.8)
+        elif m == "BACK":
+            strip.set_mode("breath", "red", bps=0.8)
+        else:
+            # tắt để tiết kiệm pin
+            # tuỳ lib: có thể là "off" hoặc set_mode("solid","black")
+            try:
+                strip.set_mode("off")
+            except Exception:
+                try:
+                    strip.set_mode("solid", "black")
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
+# ===================== motion exec wrapper =====================
+def exec_move(motion: MotionController, move: str):
+    mv = norm_move(move)
+    try:
+        motion.execute(mv)
+    except Exception:
+        # fallback: nếu lib bạn tên khác
+        try:
+            motion.run(mv)
+        except Exception:
+            pass
+    return mv
+
+
+# ===================== main =====================
 def main():
     os.environ.setdefault("SDL_AUDIODRIVER", "alsa")
     os.environ.setdefault("PULSE_SERVER", "")
     os.environ.setdefault("JACK_NO_START_SERVER", "1")
 
-    # 1) Planner
+    # ---------- 1) PerceptionPlanner ----------
     planner = PerceptionPlanner(
         cam_dev="/dev/video0",
         w=640, h=480, fps=30,
@@ -105,7 +207,8 @@ def main():
         safe_dist_cm=50.0,
         emergency_stop_cm=10.0,
         enable_camera=True,
-        enable_imu=True,
+        enable_imu=False,
+
         enable_mqtt=True,
         mqtt_host="rfff7184.ala.us-east-1.emqxsl.com",
         mqtt_port=8883,
@@ -118,89 +221,77 @@ def main():
     )
     planner.start()
 
-    # 2) Motion
+    # ---------- 2) Motion ----------
     motion = MotionController(pose_file=POSE_FILE)
     motion.boot()
     set_volumes()
-    set_face("what_is_it")
 
     dog = getattr(motion, "dog", None)
 
-    def led_off():
-        try:
-            if dog and hasattr(dog, "rgb_strip"):
-                try:
-                    dog.rgb_strip.off()
-                except Exception:
-                    dog.rgb_strip.set_mode("solid", "black")
-        except Exception:
-            pass
+    # đứng dậy trước
+    try:
+        exec_move(motion, "STOP")
+    except Exception:
+        pass
 
-    def led_blue():
-        try:
-            if dog and hasattr(dog, "rgb_strip"):
-                dog.rgb_strip.set_mode("solid", "blue")
-        except Exception:
-            pass
+    # ---------- 3) frame provider: planner.latest_jpeg -> BGR ----------
+    last_frame_ts = 0.0
 
-    def led_red():
-        try:
-            if dog and hasattr(dog, "rgb_strip"):
-                dog.rgb_strip.set_mode("solid", "red")
-        except Exception:
-            pass
-
-    # 3) Frame provider
     def get_frame_bgr_from_planner():
+        nonlocal last_frame_ts
         jpg = getattr(planner, "latest_jpeg", None)
         if not jpg:
             return None
         try:
             arr = np.frombuffer(jpg, dtype=np.uint8)
-            return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if frame is None:
+                return None
+            last_frame_ts = time.time()
+            return frame
         except Exception:
             return None
 
     def get_lidar_cm_from_planner():
-        st = safe_get_state(planner)
+        try:
+            st = planner.get_status_dict()  # dict
+        except Exception:
+            try:
+                st = planner.get_state()
+            except Exception:
+                st = None
         return get_lidar_cm_from_state(st)
 
-    # 4) AvoidObstacle
+    # ---------- 4) AvoidObstacle ----------
     avoid_cfg = AvoidCfg(
         loop_hz=15.0,
-        roi_y_start_ratio=0.55,
-        roi_y_end_ratio=1.0,
+        roi_y_start_ratio=0.60,
+        roi_y_end_ratio=1.00,
         sector_n=9,
-
-        force_stop_cm=40.0,
         trigger_cm=120.0,
-        hard_stop_cm=28.0,
-
+        hard_stop_cm=35.0,
         server_url="https://embeddedprogramming-healtheworldserver.up.railway.app/avoid_obstacle_vision",
         send_w=256,
         send_h=144,
         jpeg_quality=55,
-        min_trigger_interval_sec=1.2,
-        plan_ttl_sec=6.0,
-
-        bands_n=6,
-        corridor_min_width_ratio=0.18,
+        min_trigger_interval_sec=1.0,
+        plan_ttl_sec=8.0,
     )
 
     avoid = AvoidObstacle(
-        get_distance_cm=get_lidar_cm_from_planner,
+        get_ultrasonic_cm=get_lidar_cm_from_planner,   # (distance getter)
         cfg=avoid_cfg,
         get_frame_bgr=get_frame_bgr_from_planner,
-        rotate180=True,
+        rotate180=True,  # mặc định rotate 180
     )
     avoid.start()
 
-    # 5) WebDashboard + manual
+    # ---------- 5) WebDashboard ----------
     manual = {"move": None, "ts": 0.0}
     manual_timeout_sec = 1.2
 
     def on_manual_cmd(move: str):
-        manual["move"] = norm_move(move or "STOP")
+        manual["move"] = norm_move(move)
         manual["ts"] = time.time()
 
     def manual_active():
@@ -226,145 +317,163 @@ def main():
     )
     threading.Thread(target=web.run, daemon=True).start()
 
-    # 6) IMU bump handling (dựa vào PerceptionState.imu_bump)
-    bump_score = 0.0
-    bump_threshold = 2.4
-    last_bump_t = time.time()
+    # ---------- 6) Decision state machine ----------
+    danger_mode = False
+    danger_enter_ts = 0.0
+    barked = False
+    back_until_ts = 0.0
+    turn180_until_ts = 0.0
 
-    def update_bump_score():
-        nonlocal bump_score, last_bump_t
-        st = safe_get_state(planner)
-        now = time.time()
-        dt = max(1e-3, now - last_bump_t)
-        last_bump_t = now
+    last_led_mode = None
 
-        # decay
-        bump_score *= (0.85 ** dt)
+    def set_led_for_move(mv: str):
+        nonlocal last_led_mode
+        mv = norm_move(mv)
+        if mv != last_led_mode:
+            set_led_mode(dog, mv)
+            last_led_mode = mv
 
-        if st is None:
-            return
+    set_face("what_is_it")
+    set_led_for_move("STOP")
 
-        try:
-            if bool(getattr(st, "imu_bump", False)):
-                bump_score += 1.2
-        except Exception:
-            pass
-
-    # 7) Motion helpers
-    last_cmd = "STOP"
-    last_cmd_ts = 0.0
-
-    def exec_move(cmd: str):
-        nonlocal last_cmd, last_cmd_ts
-        cmd = norm_move(cmd)
-        now = time.time()
-
-        if cmd == last_cmd and (now - last_cmd_ts) < 0.25:
-            return
-        last_cmd = cmd
-        last_cmd_ts = now
-
-        try:
-            motion.execute(cmd)
-        except Exception:
-            pass
-
-        if cmd == "FORWARD":
-            led_blue()
-        elif cmd == "BACK":
-            led_red()
-        else:
-            led_off()
-
-    def rotate_180_for_4s():
-        exec_move("TURN_LEFT")
-        t0 = time.time()
-        while time.time() - t0 < 4.0:
-            time.sleep(0.05)
-        exec_move("STOP")
-
-    def decide_auto() -> str:
-        st = avoid.get_state()
-        local = st.get("local", {}) if isinstance(st, dict) else {}
-        plan = st.get("plan", {}) if isinstance(st, dict) else {}
-
-        best = plan.get("best_sector", None)
-        if not isinstance(best, int):
-            best = local.get("best_sector", None)
-
-        if isinstance(best, int):
-            if best <= 3:
-                return "TURN_LEFT"
-            if best >= 5:
-                return "TURN_RIGHT"
-            return "FORWARD"
-        return "FORWARD"
-
-    last_bark_ts = 0.0
-    bark_cooldown = 2.0
-
-    print("[START] AUTO MOVE + LiDAR priority + IMU bump stop/rotate + GPT walkway/labels")
+    print("[START] Auto move + avoid obstacle (LiDAR priority)")
 
     try:
         while True:
             now = time.time()
 
-            update_bump_score()
+            # web toggles
+            try:
+                auto_on = bool(web.is_auto_on())
+            except Exception:
+                auto_on = True  # default auto ON if method not found
 
-            if manual_active():
-                exec_move(manual["move"])
+            # manual priority (optional)
+            m_cmd = manual["move"] if manual_active() else None
+            if m_cmd:
+                mv = exec_move(motion, m_cmd)
+                set_led_for_move(mv)
+                time.sleep(0.02)
+                continue
+
+            # if auto off -> stop + led off
+            if not auto_on:
+                mv = exec_move(motion, "STOP")
+                set_led_for_move(mv)
                 time.sleep(0.05)
                 continue
 
-            if not web.is_auto_on():
-                exec_move("STOP")
-                time.sleep(0.08)
+            # get sensors
+            try:
+                st = planner.get_state()
+            except Exception:
+                st = None
+
+            dist_cm = get_lidar_cm_from_state(st)
+            planner_decision = get_decision_from_state(st)
+
+            # ===== (1) LiDAR hard priority: <40cm =====
+            if dist_cm is not None and dist_cm < 40.0:
+                if not danger_mode:
+                    danger_mode = True
+                    danger_enter_ts = now
+                    barked = False
+
+                # STOP ngay
+                mv = exec_move(motion, "STOP")
+                set_led_for_move(mv)
+
+                # bark 2 tiếng (chỉ 1 lần khi mới vào danger)
+                if not barked:
+                    barked = True
+                    bark_twice(dog)
+
+                # ép gọi GPT (avoid trigger)
+                try:
+                    avoid.force_trigger()
+                except Exception:
+                    pass
+
+                # lùi ra 0.8s để thoát sát
+                back_until_ts = max(back_until_ts, now + 0.8)
+
+            # ===== (2) BACK window =====
+            if now < back_until_ts:
+                mv = exec_move(motion, "BACK")
+                set_led_for_move(mv)
+                time.sleep(0.02)
                 continue
 
-            dist_cm = get_lidar_cm_from_planner()
-
-            # IMU bump repeated
-            if bump_score >= bump_threshold:
-                exec_move("STOP")
-                rotate_180_for_4s()
-                avoid.request_plan_now(reason="imu_bump_rotate", force=True)
-                bump_score = 0.0
-                time.sleep(0.12)
+            # ===== (3) TURN 180 window =====
+            if now < turn180_until_ts:
+                mv = exec_move(motion, "LEFT")  # quay trái
+                set_led_for_move(mv)
+                time.sleep(0.02)
+                continue
+            elif turn180_until_ts > 0 and now >= turn180_until_ts:
+                turn180_until_ts = 0.0
+                danger_mode = False
+                mv = exec_move(motion, "STOP")
+                set_led_for_move(mv)
+                time.sleep(0.05)
                 continue
 
-            # LiDAR < 40 => STOP + bark + force GPT
-            if dist_cm is not None and dist_cm < avoid_cfg.force_stop_cm:
-                exec_move("STOP")
-                if now - last_bark_ts >= bark_cooldown:
-                    last_bark_ts = now
-                    threading.Thread(target=bark_twice, daemon=True).start()
-                avoid.request_plan_now(reason="lidar_force_stop", force=True)
-                time.sleep(0.12)
+            # ===== (4) Use GPT plan from AvoidObstacle if available =====
+            plan = None
+            try:
+                plan = avoid.get_best_action()
+            except Exception:
+                plan = None
+
+            if danger_mode:
+                # nếu danger mà chưa có plan rõ ràng -> đứng yên, quá 2s thì quay 180
+                if (not plan) or (float(plan.get("confidence", 0.0) or 0.0) < 0.35):
+                    mv = exec_move(motion, "STOP")
+                    set_led_for_move(mv)
+                    if now - danger_enter_ts > 2.0:
+                        turn180_until_ts = max(turn180_until_ts, now + 4.0)
+                    time.sleep(0.03)
+                    continue
+
+                # nếu plan báo no_path/narrow -> quay 180 luôn
+                if bool(plan.get("no_path", False)) or bool(plan.get("narrow", False)):
+                    turn180_until_ts = max(turn180_until_ts, now + 4.0)
+                    mv = exec_move(motion, "STOP")
+                    set_led_for_move(mv)
+                    time.sleep(0.03)
+                    continue
+
+                # có action rõ ràng
+                act = norm_move(plan.get("action", "STOP"))
+                mv = exec_move(motion, act)
+                set_led_for_move(mv)
+
+                # nếu đã đi được và LiDAR thoáng -> thoát danger
+                if act != "STOP" and (dist_cm is None or dist_cm >= 60.0):
+                    danger_mode = False
+
+                time.sleep(0.02)
                 continue
 
-            # narrow/no path => rotate then replan
-            if avoid.should_rotate_replan():
-                exec_move("STOP")
-                rotate_180_for_4s()
-                avoid.request_plan_now(reason="no_path_rotate", force=True)
-                time.sleep(0.12)
-                continue
+            # ===== (5) Normal mode: prefer GPT if confident, else planner =====
+            if plan and float(plan.get("confidence", 0.0) or 0.0) >= 0.45:
+                act = norm_move(plan.get("action", "STOP"))
+                mv = exec_move(motion, act)
+            else:
+                mv = exec_move(motion, planner_decision)
 
-            cmd = decide_auto()
+            set_led_for_move(mv)
 
-            # extra safety: if close then don't forward hard
-            if dist_cm is not None and dist_cm < 60.0 and cmd == "FORWARD":
-                cmd = "TURN_LEFT"
-
-            exec_move(cmd)
-            time.sleep(0.06)
+            # tiết kiệm pin: nếu STOP thì đừng loop quá nhanh
+            time.sleep(0.02 if mv != "STOP" else 0.06)
 
     except KeyboardInterrupt:
         print("\n[EXIT] Ctrl+C")
 
     finally:
         try:
-            exec_move("STOP")
+            exec_move(motion, "STOP")
+            set_led_for_move("STOP")
         except Exception:
             pass
         try:
