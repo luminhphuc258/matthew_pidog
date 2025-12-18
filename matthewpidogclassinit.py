@@ -20,6 +20,7 @@ class MatthewPidogBootClass:
     - load LEG_INIT_ANGLES from pose file (P0..P7)
     - init Pidog
     - force head servo after init (bypass pidog)
+    - support_stand(): 5-phase slow synchronized servo recovery/stand support
     """
 
     def __init__(
@@ -51,6 +52,10 @@ class MatthewPidogBootClass:
         self.enable_force_head = enable_force_head
 
         self.dog: Pidog | None = None
+
+        # clamp range chuẩn robot_hat
+        self._angle_min = -90
+        self._angle_max = 90
 
     # ===================== AUDIO UNLOCK (SPK_EN) =====================
 
@@ -191,6 +196,98 @@ class MatthewPidogBootClass:
         except Exception as e:
             print(f"[FORCE ERROR] không set được {port}: {e}")
             return False
+
+    # ===================== SUPPORT STAND (NEW) =====================
+
+    def clamp(self, v: int | float) -> int:
+        try:
+            v = int(v)
+        except Exception:
+            v = 0
+        return max(self._angle_min, min(self._angle_max, v))
+
+    def smooth_pair(
+        self,
+        pA: str, a_start: int, a_end: int,
+        pB: str, b_start: int, b_end: int,
+        step: int = 1,
+        delay: float = 0.03,
+    ):
+        """
+        Di chuyển 2 servo đồng bộ, mượt:
+        - set về start trước (nhẹ)
+        - mỗi tick cập nhật cả A & B rồi sleep(delay)
+        """
+        sA = Servo(pA)
+        sB = Servo(pB)
+
+        a_start, a_end = self.clamp(a_start), self.clamp(a_end)
+        b_start, b_end = self.clamp(b_start), self.clamp(b_end)
+
+        a = a_start
+        b = b_start
+
+        # set initial
+        try:
+            sA.angle(a)
+            sB.angle(b)
+        except Exception:
+            pass
+
+        max_steps = max(abs(a_end - a_start), abs(b_end - b_start))
+        if max_steps == 0:
+            return
+
+        step = max(1, int(abs(step)))
+
+        for _ in range(max_steps):
+            if a != a_end:
+                a += step if a_end > a else -step
+                if (a_end > a_start and a > a_end) or (a_end < a_start and a < a_end):
+                    a = a_end
+
+            if b != b_end:
+                b += step if b_end > b else -step
+                if (b_end > b_start and b > b_end) or (b_end < b_start and b < b_end):
+                    b = b_end
+
+            try:
+                sA.angle(self.clamp(a))
+                sB.angle(self.clamp(b))
+            except Exception:
+                pass
+
+            sleep(delay)
+
+    def support_stand(self, step: int = 1, delay: float = 0.03, pause_sec: float = 1.0):
+        """
+        5 phases đúng yêu cầu bạn:
+        Phase 1: P1 +90 -> +5,  P3 -76 -> +5
+        Phase 2: P6 +32 -> +63, P4 +4  -> -39
+        Phase 3: P0 -8  -> -55, P2 +15 -> +74
+        Phase 4: P4 -39 -> -2,  P6 +63 -> +33
+        Phase 5: P0 -55 -> +12, P2 +74 -> -2
+        """
+        print("[support_stand] Phase 1: P1 +90 -> +5, P3 -76 -> +5")
+        self.smooth_pair("P1", +90, +5, "P3", -76, +5, step=step, delay=delay)
+        sleep(pause_sec)
+
+        print("[support_stand] Phase 2: P6 +32 -> +63, P4 +4 -> -39")
+        self.smooth_pair("P6", +32, +63, "P4", +4, -39, step=step, delay=delay)
+        sleep(pause_sec)
+
+        print("[support_stand] Phase 3: P0 -8 -> -55, P2 +15 -> +74")
+        self.smooth_pair("P0", -8, -55, "P2", +15, +74, step=step, delay=delay)
+        sleep(pause_sec)
+
+        print("[support_stand] Phase 4: P4 -39 -> -2, P6 +63 -> +33")
+        self.smooth_pair("P4", -39, -2, "P6", +63, +33, step=step, delay=delay)
+        sleep(pause_sec)
+
+        print("[support_stand] Phase 5: P0 -55 -> +12, P2 +74 -> -2")
+        self.smooth_pair("P0", -55, +12, "P2", +74, -2, step=step, delay=delay)
+
+        print("[support_stand] DONE")
 
     # ===================== INIT PIDOG =====================
 
