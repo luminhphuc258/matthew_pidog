@@ -4,64 +4,73 @@
 import time
 from pathlib import Path
 
-from motion_controller import MotionController
+from matthewpidogclassinit import MatthewPidogBootClass
 from move_rear_legs import MoveRearLegs
 
 POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
 
 
-def set_led(dog, mode: str):
-    """
-    mode: "pink" | "off"
-    """
-    if dog is None:
-        return
+def set_led(dog, color: str, bps: float = 0.8):
     try:
-        strip = getattr(dog, "rgb_strip", None)
-        if strip is None:
-            return
-        if mode == "pink":
-            strip.set_mode("breath", "pink", bps=0.7)
-        else:
+        if dog and hasattr(dog, "rgb_strip"):
+            dog.rgb_strip.set_mode("breath", color, bps=bps)
+    except Exception:
+        pass
+
+
+def led_off(dog):
+    try:
+        if dog and hasattr(dog, "rgb_strip"):
             try:
-                strip.set_mode("off")
+                dog.rgb_strip.set_mode("off")
             except Exception:
-                strip.set_mode("solid", "black")
+                dog.rgb_strip.set_mode("solid", "black")
     except Exception:
         pass
 
 
 def main():
-    motion = MotionController(pose_file=POSE_FILE)
-    motion.boot()
+    # 1) Boot PiDog
+    boot = MatthewPidogBootClass()
+    dog = boot.create()
+    time.sleep(1.0)
 
-    dog = getattr(motion, "dog", None)
-
+    # 2) SIT 3s + LED pink
     print("[TEST] Sit 3s + LED pink...")
-    set_led(dog, "pink")
-    motion.sit(speed=20)
+    try:
+        dog.do_action("sit", speed=20)
+        dog.wait_all_done()
+    except Exception:
+        pass
+
+    set_led(dog, "pink", bps=0.8)
     time.sleep(3.0)
 
-    print("[TEST] Move rear legs -> apply pose config...")
+    # 3) Move rear legs (P4/P6) + apply pose config
+    print("[TEST] Move rear legs (P4/P6) -> apply pose config...")
     rear = MoveRearLegs(
         pose_file=POSE_FILE,
-        # dùng y hệt defaults MotionController của bạn (đang đúng)
-        p5_start=18, p7_start=-13,
-        p5_target=4, p7_target=-1,
-        p4_lock=80, p6_lock=-70,
+
+        # ===== chỉnh theo robot bạn nếu cần =====
+        p4_start=80,
+        p6_start=-70,
+        p4_target=65,
+        p6_target=-55,
+
         delay=0.05,
     )
-    rear.run()
+    rear.run(apply_pose=True)
 
-    print("[TEST] Stand + LED off...")
-    set_led(dog, "off")
-    motion.stand(speed=30, force=True)
+    # 4) Stand + LED off
+    print("[TEST] Stand...")
+    try:
+        dog.do_action("stand", speed=20)
+        dog.wait_all_done()
+    except Exception:
+        pass
 
+    led_off(dog)
     print("[DONE]")
-
-    # giữ 1 chút để bạn nhìn
-    time.sleep(2.0)
-    motion.close()
 
 
 if __name__ == "__main__":
