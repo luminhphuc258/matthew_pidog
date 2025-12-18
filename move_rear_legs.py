@@ -5,55 +5,41 @@ import json
 import time
 from pathlib import Path
 from typing import Dict
-
 from robot_hat import Servo
 
 
 class MoveRearLegs:
     """
-    Chỉ xử lý 2 chân sau (P5, P7) + lock P4/P6.
-    - Di chuyển NÂNG từ từ (step-by-step) giống MotionController.
-    - ĐỔI CHIỀU QUAY vật lý bằng cách đảo dấu góc khi gửi ra servo.
+    Nâng 2 chân sau bằng 2 motor P4 và P6 (từ từ, đều, không giật).
+    - Start -> Target theo từng 1 degree
+    - Alternating (P4 rồi P6) để robot ổn định.
+    - Cuối cùng apply pose config (tất cả servo) nếu bạn muốn.
     """
 
     def __init__(
         self,
         pose_file: Path,
 
-        # ===== REAR LEGS (P5, P7) =====
-        p5_start: int = 18,
-        p7_start: int = -13,
-        p5_target: int = 4,
-        p7_target: int = -1,
-
-        # ===== LOAD LEGS (LOCK) =====
-        p4_lock: int = 80,
-        p6_lock: int = -70,
+        # ===== REAR LIFT (P4, P6) =====
+        p4_start: int = 80,
+        p6_start: int = -70,
+        p4_target: int = 65,   # bạn chỉnh theo thực tế (nâng lên)
+        p6_target: int = -55,  # bạn chỉnh theo thực tế (nâng lên)
 
         delay: float = 0.05,
         angle_min: int = -90,
         angle_max: int = 90,
-
-        # ✅ NEW: invert output direction (đổi chiều quay)
-        invert_p5: bool = True,
-        invert_p7: bool = True,
     ):
         self.pose_file = Path(pose_file)
 
-        self.P5_START = int(p5_start)
-        self.P7_START = int(p7_start)
-        self.P5_TARGET = int(p5_target)
-        self.P7_TARGET = int(p7_target)
-
-        self.P4_LOCK = int(p4_lock)
-        self.P6_LOCK = int(p6_lock)
+        self.P4_START = int(p4_start)
+        self.P6_START = int(p6_start)
+        self.P4_TARGET = int(p4_target)
+        self.P6_TARGET = int(p6_target)
 
         self.DELAY = float(delay)
         self.angle_min = int(angle_min)
         self.angle_max = int(angle_max)
-
-        self.invert_p5 = bool(invert_p5)
-        self.invert_p7 = bool(invert_p7)
 
         self.servo_ports = [f"P{i}" for i in range(12)]
 
@@ -71,15 +57,6 @@ class MoveRearLegs:
         except Exception:
             pass
 
-    def _apply_p5(self, s5: Servo, angle: int):
-        # ✅ đảo chiều quay nhưng vẫn step từ từ
-        a = -angle if self.invert_p5 else angle
-        self._apply(s5, a)
-
-    def _apply_p7(self, s7: Servo, angle: int):
-        a = -angle if self.invert_p7 else angle
-        self._apply(s7, a)
-
     # ---------------- pose ----------------
     def load_pose_config(self) -> Dict[str, int]:
         cfg = {p: 0 for p in self.servo_ports}
@@ -95,12 +72,7 @@ class MoveRearLegs:
             pass
         return cfg
 
-    def apply_pose_from_cfg(
-        self,
-        cfg: Dict[str, int],
-        per_servo_delay: float = 0.03,
-        settle_sec: float = 0.8,
-    ):
+    def apply_pose_from_cfg(self, cfg: Dict[str, int], per_servo_delay: float = 0.03, settle_sec: float = 0.8):
         servos = {}
         for p in self.servo_ports:
             try:
@@ -112,57 +84,45 @@ class MoveRearLegs:
             s = servos.get(p)
             if not s:
                 continue
-            # pose config apply bình thường (không invert toàn bộ pose)
             self._apply(s, cfg.get(p, 0))
             time.sleep(per_servo_delay)
 
-        if settle_sec > 0:
+        if settle_sec and settle_sec > 0:
             time.sleep(settle_sec)
 
-    # ---------------- core rear legs ----------------
-    def move_only_rear_legs(self):
+    # ---------------- core: lift rear legs using P4/P6 ----------------
+    def lift_rear_legs_smooth(self):
         s4 = Servo("P4")
-        s5 = Servo("P5")
         s6 = Servo("P6")
-        s7 = Servo("P7")
 
-        # STEP 1: lock
-        self._apply(s4, self.P4_LOCK)
-        self._apply(s6, self.P6_LOCK)
-        time.sleep(0.5)
+        # 1) set start (nhẹ nhàng)
+        curr4 = self.P4_START
+        curr6 = self.P6_START
+        self._apply(s4, curr4)
+        self._apply(s6, curr6)
+        time.sleep(0.6)
 
-        # STEP 2: set start (vẫn start như cũ, KHÔNG nhảy)
-        curr_p5 = self.P5_START
-        curr_p7 = self.P7_START
-
-        self._apply_p5(s5, curr_p5)
-        self._apply_p7(s7, curr_p7)
-        self._apply(s4, self.P4_LOCK)
-        self._apply(s6, self.P6_LOCK)
-        time.sleep(1.0)
-
-        # STEP 3: move P5/P7 alternating từ từ về target (giống cũ)
-        while curr_p5 != self.P5_TARGET or curr_p7 != self.P7_TARGET:
-            self._apply(s4, self.P4_LOCK)
-            self._apply(s6, self.P6_LOCK)
-
-            if curr_p5 != self.P5_TARGET:
-                curr_p5 += 1 if self.P5_TARGET > curr_p5 else -1
-                self._apply_p5(s5, curr_p5)
+        # 2) alternating step-by-step
+        while curr4 != self.P4_TARGET or curr6 != self.P6_TARGET:
+            if curr4 != self.P4_TARGET:
+                curr4 += 1 if self.P4_TARGET > curr4 else -1
+                self._apply(s4, curr4)
                 time.sleep(self.DELAY)
 
-            if curr_p7 != self.P7_TARGET:
-                curr_p7 += 1 if self.P7_TARGET > curr_p7 else -1
-                self._apply_p7(s7, curr_p7)
+            if curr6 != self.P6_TARGET:
+                curr6 += 1 if self.P6_TARGET > curr6 else -1
+                self._apply(s6, curr6)
                 time.sleep(self.DELAY)
 
         time.sleep(0.25)
 
-    def run(self):
+    def run(self, apply_pose: bool = True):
         """
-        SIT -> rear legs lift (smooth, reverse direction) -> apply pose config.
+        - Nâng 2 chân sau (P4/P6) từ từ
+        - Option: apply pose config sau đó
         """
-        self.move_only_rear_legs()
-        cfg = self.load_pose_config()
-        self.apply_pose_from_cfg(cfg)
+        self.lift_rear_legs_smooth()
+        if apply_pose:
+            cfg = self.load_pose_config()
+            self.apply_pose_from_cfg(cfg)
         return True
