@@ -9,7 +9,6 @@ from typing import Optional, Callable, Any, Dict
 
 from flask import Flask, Response, request, jsonify
 
-# MQTT
 try:
     import paho.mqtt.client as mqtt
 except Exception:
@@ -60,12 +59,9 @@ class WebDashboard:
     """
     - /            HTML dashboard
     - /mjpeg       live video
-    - /status      mqtt sensor + toggles + (avoid_obstacle state) + hand
+    - /status      mqtt + toggles + avoid_obstacle + hand state
     - /cmd         manual command
-    - /toggle_listen      listen-only
-    - /toggle_auto        auto-move only
-    - /toggle_listen_run  listen + auto-move (test)
-    - /toggle_hand        NEW: hand command
+    - /toggle_hand toggle HandCommand enabled
     - /health
     """
 
@@ -93,7 +89,7 @@ class WebDashboard:
         mqtt_insecure: bool = True,
         mqtt_debug: bool = False,
 
-        # ✅ NEW
+        # hand command
         hand_command: Optional[Any] = None,
     ):
         self.host, self.port = host, port
@@ -120,13 +116,10 @@ class WebDashboard:
         self._lock = threading.Lock()
         self._sensor = MqttSensorState()
 
-        # toggles
+        # other toggles (giữ lại nếu bạn dùng)
         self._listen_on = False
         self._auto_on = False
         self._listen_run_on = False
-
-        # ✅ NEW
-        self._hand_on = False
 
         self.app = Flask(__name__)
         self._setup_routes()
@@ -135,9 +128,14 @@ class WebDashboard:
         if self.mqtt_enable:
             self._start_mqtt()
 
-    def is_hand_on(self) -> bool:
-        with self._lock:
-            return bool(self._hand_on)
+    # ===== helper: get hand enabled real-time =====
+    def _hand_enabled(self) -> bool:
+        if self.hand_command is None:
+            return False
+        try:
+            return bool(self.hand_command.get_last().get("enabled", False))
+        except Exception:
+            return False
 
     # ===== MQTT =====
     def _start_mqtt(self):
@@ -253,6 +251,8 @@ class WebDashboard:
                 except Exception:
                     hand_state = {"error": "hand_command.get_last failed"}
 
+            hand_on = self._hand_enabled()
+
             with self._lock:
                 return jsonify({
                     "ok": True,
@@ -275,26 +275,25 @@ class WebDashboard:
                         "listening": self._listen_on,
                         "auto_move": self._auto_on,
                         "listen_run": self._listen_run_on,
-                        "hand_cmd": self._hand_on,  # ✅ NEW
+                        "hand_cmd": hand_on,  # ✅ sync theo HandCommand thật
                     },
                     "avoid_obstacle": avoid_state,
-                    "hand": hand_state,           # ✅ NEW
+                    "hand": hand_state,
                     "video": {"rotate180": self.rotate180},
                 })
 
         @self.app.post("/toggle_hand")
         def toggle_hand():
-            with self._lock:
-                self._hand_on = not self._hand_on
-                on = self._hand_on
+            if self.hand_command is None:
+                return jsonify({"ok": False, "err": "hand_command is None"})
 
-            if self.hand_command is not None:
-                try:
-                    self.hand_command.set_enabled(on)
-                except Exception:
-                    pass
-
-            return jsonify({"ok": True, "toggles": {"hand_cmd": on}})
+            cur = self._hand_enabled()
+            newv = not cur
+            try:
+                self.hand_command.set_enabled(newv)
+            except Exception:
+                pass
+            return jsonify({"ok": True, "toggles": {"hand_cmd": newv}})
 
         @self.app.get("/cmd")
         def cmd():
@@ -339,12 +338,8 @@ class WebDashboard:
                                     except Exception:
                                         pass
 
-                                # ✅ NEW: draw hand overlay only when toggle on
-                                hand_on = False
-                                with self._lock:
-                                    hand_on = self._hand_on
-
-                                if hand_on and self.hand_command is not None:
+                                # ✅ draw hand overlay when HandCommand.enabled is True
+                                if self._hand_enabled() and self.hand_command is not None:
                                     try:
                                         frame_bgr = self.hand_command.draw_on_frame(frame_bgr)
                                     except Exception:
@@ -392,9 +387,6 @@ class WebDashboard:
     .err { color:#ff6b6b; }
     .btn-on { background:#1f7a3a; color:#fff; }
     .btn-off { background:#444; color:#fff; }
-    .btn-warn { background:#8a1f1f; color:#fff; }
-    .btn-test-on { background:#2d4f9e; color:#fff; }
-    .btn-test-off { background:#1f2f55; color:#fff; }
   </style>
 </head>
 <body>
@@ -437,9 +429,9 @@ class WebDashboard:
   </div>
 
 <script>
-function setBtn(el, on, labelOn, labelOff, clsOn, clsOff){
-  el.className = on ? clsOn : clsOff;
-  el.textContent = on ? labelOn : labelOff;
+function setBtn(el, on){
+  el.className = on ? 'btn-on' : 'btn-off';
+  el.textContent = on ? 'Hand Command: ON' : 'Hand Command: OFF';
 }
 
 async function refresh(){
@@ -458,10 +450,11 @@ async function refresh(){
     const handOn = j?.toggles?.hand_cmd === true;
     const gest = j?.hand?.gesture ?? 'NA';
     const fps = j?.hand?.fps ?? null;
-    document.getElementById('hand').textContent = gest + (fps ? (' ('+fps.toFixed(1)+'fps)') : '');
+    const fc  = j?.hand?.finger_count ?? 0;
+    document.getElementById('hand').textContent =
+      gest + " | fingers:" + fc + (fps ? (' ('+fps.toFixed(1)+'fps)') : '');
 
-    setBtn(document.getElementById('btnHand'), handOn,
-      'Hand Command: ON', 'Hand Command: OFF', 'btn-on', 'btn-off');
+    setBtn(document.getElementById('btnHand'), handOn);
 
     errEl.textContent = (j?.mqtt?.err ? ('MQTT ERROR: ' + j.mqtt.err) : '');
   }catch(e){
