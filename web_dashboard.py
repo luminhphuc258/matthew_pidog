@@ -22,13 +22,12 @@ class MqttSensorState:
     last_ts: float = 0.0
     dt_ms: Optional[int] = None
 
-    # unified
-    dist_cm: Optional[float] = None   # will map from uart_dist_cm
+    dist_cm: Optional[float] = None
     temp_c: Optional[float] = None
     humid: Optional[float] = None
-    strength: Optional[float] = None  # uart_strength
+    strength: Optional[float] = None
 
-    src_ts_ms: Optional[int] = None   # ts_ms from ESP32
+    src_ts_ms: Optional[int] = None
     err: Optional[str] = None
 
 
@@ -61,11 +60,12 @@ class WebDashboard:
     """
     - /            HTML dashboard
     - /mjpeg       live video
-    - /status      mqtt sensor + toggles + (avoid_obstacle state)
+    - /status      mqtt sensor + toggles + (avoid_obstacle state) + hand
     - /cmd         manual command
     - /toggle_listen      listen-only
     - /toggle_auto        auto-move only
     - /toggle_listen_run  listen + auto-move (test)
+    - /toggle_hand        NEW: hand command
     - /health
     """
 
@@ -92,6 +92,9 @@ class WebDashboard:
         mqtt_tls: bool = False,
         mqtt_insecure: bool = True,
         mqtt_debug: bool = False,
+
+        # ✅ NEW
+        hand_command: Optional[Any] = None,
     ):
         self.host, self.port = host, port
 
@@ -99,6 +102,7 @@ class WebDashboard:
         self.get_frame_bgr = get_frame_bgr
         self.avoid_obstacle = avoid_obstacle
         self.on_manual_cmd = on_manual_cmd
+        self.hand_command = hand_command
 
         self.rotate180 = bool(rotate180)
 
@@ -121,6 +125,9 @@ class WebDashboard:
         self._auto_on = False
         self._listen_run_on = False
 
+        # ✅ NEW
+        self._hand_on = False
+
         self.app = Flask(__name__)
         self._setup_routes()
 
@@ -128,17 +135,9 @@ class WebDashboard:
         if self.mqtt_enable:
             self._start_mqtt()
 
-    def is_listen_on(self) -> bool:
+    def is_hand_on(self) -> bool:
         with self._lock:
-            return bool(self._listen_on)
-
-    def is_auto_on(self) -> bool:
-        with self._lock:
-            return bool(self._auto_on)
-
-    def is_listen_run_on(self) -> bool:
-        with self._lock:
-            return bool(self._listen_run_on)
+            return bool(self._hand_on)
 
     # ===== MQTT =====
     def _start_mqtt(self):
@@ -197,19 +196,10 @@ class WebDashboard:
                 self._sensor.last_ts = now
 
                 if data is not None:
-                    # NEW keys from ESP32: uart_dist_cm, uart_strength, ts_ms
-                    dist = _pick(data, [
-                        "uart_dist_cm", "lidar_cm", "dist_cm", "distance_cm", "distance", "dist", "range_cm"
-                    ])
-                    strength = _pick(data, [
-                        "uart_strength", "strength"
-                    ])
-                    temp = _pick(data, [
-                        "temp_c", "uart_temp_c", "temperature_c", "temperature", "temp", "t"
-                    ])
-                    hum = _pick(data, [
-                        "humid", "uart_humid", "humidity", "hum", "h"
-                    ])
+                    dist = _pick(data, ["uart_dist_cm", "lidar_cm", "dist_cm", "distance_cm", "distance", "dist", "range_cm"])
+                    strength = _pick(data, ["uart_strength", "strength"])
+                    temp = _pick(data, ["temp_c", "uart_temp_c", "temperature_c", "temperature", "temp", "t"])
+                    hum = _pick(data, ["humid", "uart_humid", "humidity", "hum", "h"])
                     ts_ms = _pick(data, ["ts_ms", "timestamp_ms", "ms"])
 
                     self._sensor.dist_cm = _to_float(dist)
@@ -256,6 +246,13 @@ class WebDashboard:
                 except Exception:
                     avoid_state = {"error": "avoid_obstacle.get_state failed"}
 
+            hand_state = None
+            if self.hand_command is not None:
+                try:
+                    hand_state = self.hand_command.get_last()
+                except Exception:
+                    hand_state = {"error": "hand_command.get_last failed"}
+
             with self._lock:
                 return jsonify({
                     "ok": True,
@@ -269,62 +266,35 @@ class WebDashboard:
                         "topic": self.mqtt_topic,
                     },
 
-                    # keep old names for your python code
-                    "dist_cm": self._sensor.dist_cm,          # LiDAR distance
-                    "temp_c": self._sensor.temp_c,
-                    "humid": self._sensor.humid,
-
-                    # NEW fields
                     "lidar_cm": self._sensor.dist_cm,
                     "lidar_strength": self._sensor.strength,
+                    "temp_c": self._sensor.temp_c,
+                    "humid": self._sensor.humid,
 
                     "toggles": {
                         "listening": self._listen_on,
                         "auto_move": self._auto_on,
                         "listen_run": self._listen_run_on,
+                        "hand_cmd": self._hand_on,  # ✅ NEW
                     },
                     "avoid_obstacle": avoid_state,
+                    "hand": hand_state,           # ✅ NEW
                     "video": {"rotate180": self.rotate180},
                 })
 
-        @self.app.post("/toggle_listen")
-        def toggle_listen():
+        @self.app.post("/toggle_hand")
+        def toggle_hand():
             with self._lock:
-                self._listen_on = not self._listen_on
-                if self._listen_on:
-                    self._auto_on = False
-                    self._listen_run_on = False
-                return jsonify({"ok": True, "toggles": {
-                    "listening": self._listen_on,
-                    "auto_move": self._auto_on,
-                    "listen_run": self._listen_run_on,
-                }})
+                self._hand_on = not self._hand_on
+                on = self._hand_on
 
-        @self.app.post("/toggle_auto")
-        def toggle_auto():
-            with self._lock:
-                self._auto_on = not self._auto_on
-                if self._auto_on:
-                    self._listen_on = False
-                    self._listen_run_on = False
-                return jsonify({"ok": True, "toggles": {
-                    "listening": self._listen_on,
-                    "auto_move": self._auto_on,
-                    "listen_run": self._listen_run_on,
-                }})
+            if self.hand_command is not None:
+                try:
+                    self.hand_command.set_enabled(on)
+                except Exception:
+                    pass
 
-        @self.app.post("/toggle_listen_run")
-        def toggle_listen_run():
-            with self._lock:
-                self._listen_run_on = not self._listen_run_on
-                if self._listen_run_on:
-                    self._listen_on = False
-                    self._auto_on = True
-                return jsonify({"ok": True, "toggles": {
-                    "listening": self._listen_on,
-                    "auto_move": self._auto_on,
-                    "listen_run": self._listen_run_on,
-                }})
+            return jsonify({"ok": True, "toggles": {"hand_cmd": on}})
 
         @self.app.get("/cmd")
         def cmd():
@@ -341,8 +311,8 @@ class WebDashboard:
             def gen():
                 black = None
                 try:
-                    import cv2
                     import numpy as np
+                    import cv2
                     img = np.zeros((480, 640, 3), dtype=np.uint8)
                     ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
                     if ok:
@@ -366,6 +336,17 @@ class WebDashboard:
                                 if self.avoid_obstacle is not None:
                                     try:
                                         frame_bgr = self.avoid_obstacle.draw_overlay(frame_bgr)
+                                    except Exception:
+                                        pass
+
+                                # ✅ NEW: draw hand overlay only when toggle on
+                                hand_on = False
+                                with self._lock:
+                                    hand_on = self._hand_on
+
+                                if hand_on and self.hand_command is not None:
+                                    try:
+                                        frame_bgr = self.hand_command.draw_on_frame(frame_bgr)
                                     except Exception:
                                         pass
 
@@ -430,13 +411,13 @@ class WebDashboard:
 
     <div style="width:580px;">
       <div class="card">
-        <b>Quick Status (MQTT Direct)</b>
+        <b>Quick Status</b>
         <div class="kv">
           <div class="pill">LiDAR(cm): <span id="lidar">...</span></div>
           <div class="pill">Strength: <span id="str">...</span></div>
           <div class="pill">Temp(°C): <span id="t">...</span></div>
           <div class="pill">Hum(%): <span id="h">...</span></div>
-          <div class="pill">MQTT: <span id="mq">...</span></div>
+          <div class="pill">HAND: <span id="hand">...</span></div>
         </div>
         <div class="err" id="err"></div>
       </div>
@@ -444,24 +425,7 @@ class WebDashboard:
       <div class="card">
         <div><b>Modes</b></div>
         <div class="kv">
-          <button id="btnListen" class="btn-off" onclick="toggleListen()">Active Listening: OFF</button>
-          <button id="btnAuto" class="btn-off" onclick="toggleAuto()">Auto Move: OFF</button>
-          <button id="btnListenRun" class="btn-test-off" onclick="toggleListenRun()">Listen & Run (TEST): OFF</button>
-        </div>
-      </div>
-
-      <div class="card">
-        <div><b>Manual Control</b></div>
-        <div>
-          <button onclick="cmd('FORWARD')">FORWARD</button>
-        </div>
-        <div>
-          <button onclick="cmd('TURN_LEFT')">LEFT</button>
-          <button class="btn-warn" onclick="cmd('STOP')">STOP</button>
-          <button onclick="cmd('TURN_RIGHT')">RIGHT</button>
-        </div>
-        <div>
-          <button onclick="cmd('BACK')">BACK</button>
+          <button id="btnHand" class="btn-off" onclick="toggleHand()">Hand Command: OFF</button>
         </div>
       </div>
 
@@ -486,27 +450,18 @@ async function refresh(){
 
     document.getElementById('status').textContent = JSON.stringify(j, null, 2);
 
-    const mqttOk = j?.mqtt?.ok === true;
-    const mq = mqttOk ? ('OK dt=' + (j.mqtt.dt_ms ?? 'NA') + 'ms') : ('ERR');
-    document.getElementById('mq').textContent = mq;
-
     document.getElementById('lidar').textContent = (j.lidar_cm ?? 'NA');
     document.getElementById('str').textContent   = (j.lidar_strength ?? 'NA');
     document.getElementById('t').textContent     = (j.temp_c ?? 'NA');
     document.getElementById('h').textContent     = (j.humid ?? 'NA');
 
-    const listenOn = j?.toggles?.listening === true;
-    const autoOn = j?.toggles?.auto_move === true;
-    const lrOn = j?.toggles?.listen_run === true;
+    const handOn = j?.toggles?.hand_cmd === true;
+    const gest = j?.hand?.gesture ?? 'NA';
+    const fps = j?.hand?.fps ?? null;
+    document.getElementById('hand').textContent = gest + (fps ? (' ('+fps.toFixed(1)+'fps)') : '');
 
-    setBtn(document.getElementById('btnListen'), listenOn,
-      'Active Listening: ON', 'Active Listening: OFF', 'btn-on', 'btn-off');
-
-    setBtn(document.getElementById('btnAuto'), autoOn,
-      'Auto Move: ON', 'Auto Move: OFF', 'btn-on', 'btn-off');
-
-    setBtn(document.getElementById('btnListenRun'), lrOn,
-      'Listen & Run (TEST): ON', 'Listen & Run (TEST): OFF', 'btn-test-on', 'btn-test-off');
+    setBtn(document.getElementById('btnHand'), handOn,
+      'Hand Command: ON', 'Hand Command: OFF', 'btn-on', 'btn-off');
 
     errEl.textContent = (j?.mqtt?.err ? ('MQTT ERROR: ' + j.mqtt.err) : '');
   }catch(e){
@@ -515,17 +470,8 @@ async function refresh(){
   setTimeout(refresh, 250);
 }
 
-async function cmd(m){
-  await fetch('/cmd?move=' + m, {cache:'no-store'});
-}
-async function toggleListen(){
-  await fetch('/toggle_listen', {method:'POST'});
-}
-async function toggleAuto(){
-  await fetch('/toggle_auto', {method:'POST'});
-}
-async function toggleListenRun(){
-  await fetch('/toggle_listen_run', {method:'POST'});
+async function toggleHand(){
+  await fetch('/toggle_hand', {method:'POST'});
 }
 
 refresh();

@@ -1,79 +1,112 @@
-# test_handcommand.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import time
+import socket
 from pathlib import Path
 
-from handcommand import HandCommand, HandCmdCfg
+import cv2
 
-# Nếu bạn muốn test support_stand thật: import boot helper của bạn
-# from matthew_pidog_boot import MatthewPidogBootClass
+from handcommand import HandCommand, HandCfg
+from web_dashboard import WebDashboard
 
-def set_face_udp(emo: str):
-    # demo: chỉ in
-    print("[FACE]", emo)
+# ===== face UDP (giống cách bạn set face3d) =====
+FACE_HOST = "127.0.0.1"
+FACE_PORT = 39393
+_face_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-def on_cmd_print(cmd: str):
-    # demo: chỉ in
-    print("[CMD ]", cmd)
+def set_face(emo: str):
+    try:
+        _face_sock.sendto(emo.encode("utf-8"), (FACE_HOST, FACE_PORT))
+    except Exception:
+        pass
 
-def bark_print():
-    print("[BARK] woof woof")
+
+# ===== camera (shared) =====
+class Camera:
+    def __init__(self, dev="/dev/video0", w=640, h=480, fps=30):
+        self.cap = cv2.VideoCapture(dev)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+        self.cap.set(cv2.CAP_PROP_FPS, fps)
+        self.last = None
+        self.ts = 0.0
+
+    def read(self):
+        ok, frame = self.cap.read()
+        if not ok:
+            return None
+        self.last = frame
+        self.ts = time.time()
+        return frame
+
+    def get_frame(self):
+        # WebDashboard gọi hàm này liên tục
+        # -> nếu chưa có frame mới thì đọc thêm
+        fr = self.read()
+        return fr if fr is not None else self.last
+
+    def close(self):
+        try:
+            self.cap.release()
+        except Exception:
+            pass
+
 
 def main():
-    cfg = HandCmdCfg(
-        cam_dev="/dev/video0",
-        cam_w=640,
-        cam_h=480,
-        cooldown_sec=0.9,
-        draw_overlay=True,
+    cam = Camera(dev="/dev/video0", w=640, h=480, fps=30)
 
-        # ✅ file memory
-        state_file="gesture_state.json",
-        log_file="gesture_log.jsonl",
+    # ===== callback khi HandCommand detect gesture =====
+    def on_action(action: str, face: str, bark: bool):
+        print(f"[CMD ] {action}")
+        print(f"[FACE] {face}  bark={bark}")
+        set_face(face)
 
-        # ✅ xóa bộ nhớ cũ khi start
-        clear_old_memory_on_start=True,
-    )
+        # NOTE:
+        # ở test này mình chỉ print + set face.
+        # sau này bạn thay bằng MotionController: move(action)
+        # bark=True thì bạn phát âm thanh sủa
 
-    # boot = MatthewPidogBootClass(pose_file="pidog_pose_config.txt")
-    # (nếu muốn: boot.create() để init dog, nhưng test này không cần)
-
+    # ===== HandCommand =====
     hc = HandCommand(
-        cfg=cfg,
-        on_cmd=on_cmd_print,
-        set_face=set_face_udp,
-        on_bark=bark_print,
-        boot_helper=None,  # hoặc boot nếu bạn muốn gọi support_stand thật
+        cfg=HandCfg(
+            cam_dev="/dev/video0",
+            w=640, h=480, fps=30,
+            process_every=2,          # ✅ nhẹ hơn, đỡ lag
+            action_cooldown_sec=0.7
+        ),
+        on_action=on_action,
+        boot_helper=None,            # nếu muốn support_stand thật: truyền MatthewPidogBootClass()
+        get_frame_bgr=cam.get_frame, # ✅ dùng chung camera với web
+        open_own_camera=False,       # ✅ không tự mở camera nữa
+        clear_memory_on_start=True
     )
 
-    print("\n=== HandCommand TEST ===")
-    print("Keys:")
-    print("  e  : toggle enable/disable")
-    print("  q  : quit")
-    print("Start with ENABLED...\n")
+    hc.start()
+    hc.set_enabled(True)  # start ON luôn (bạn có thể OFF nếu muốn)
 
-    hc.start(enabled=True)
+    # ===== WebDashboard =====
+    dash = WebDashboard(
+        host="0.0.0.0",
+        port=8000,
+        get_frame_bgr=cam.get_frame,
+        avoid_obstacle=None,
+        on_manual_cmd=lambda m: print("[MANUAL CMD]", m),
+        rotate180=True,
+        mqtt_enable=False,
+        hand_command=hc,   # ✅ NEW
+    )
 
-    # simple keyboard loop (không cần cv2.imshow)
+    print("\n=== HandCommand + WebDashboard ===")
+    print("Open browser: http://<pi_ip>:8000")
+    print("Toggle Hand Command to see landmarks/gesture overlay.\n")
+
     try:
-        while True:
-            s = input("(e=toggle, q=quit) > ").strip().lower()
-            if s == "q":
-                break
-            if s == "e":
-                new_state = not hc.is_enabled()
-                hc.set_enabled(new_state)
-                print("[TOGGLE] enabled =", new_state)
-            time.sleep(0.05)
-    except KeyboardInterrupt:
-        pass
+        dash.run()
     finally:
         hc.stop()
-        print("Bye. State/log saved next to this file:")
-        print(" -", Path(cfg.state_file).resolve())
-        print(" -", Path(cfg.log_file).resolve())
+        cam.close()
+
 
 if __name__ == "__main__":
     main()

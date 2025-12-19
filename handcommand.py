@@ -1,384 +1,290 @@
-# handcommand.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+from __future__ import annotations
+
 import os
-import time
 import json
+import time
 import math
 import threading
-import socket
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Callable, Dict, Any, Tuple, List
-
-import numpy as np
-
-try:
-    import cv2
-except Exception:
-    cv2 = None
-
-# Optional: mediapipe
-try:
-    import mediapipe as mp
-except Exception:
-    mp = None
+from typing import Optional, Callable, Any, Dict, Tuple
 
 
 # =========================
-# Utils
+# Helpers
 # =========================
-def _clamp(v, lo, hi):
-    return max(lo, min(hi, v))
 
-
-def _now():
+def _now() -> float:
     return time.time()
 
 
-def _dist(a, b) -> float:
-    return float(math.hypot(a[0] - b[0], a[1] - b[1]))
+def _clamp(x: float, a: float, b: float) -> float:
+    return max(a, min(b, x))
 
 
-def _safe_json_load(path: Path, default):
+def _safe_read_json(path: Path) -> Dict[str, Any]:
     try:
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+        if not path.exists():
+            return {}
+        return json.loads(path.read_text(encoding="utf-8", errors="ignore") or "{}")
     except Exception:
-        pass
-    return default
+        return {}
 
 
-def _safe_json_dump(path: Path, obj):
+def _safe_write_json(path: Path, obj: Dict[str, Any]) -> None:
     try:
         path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
-        return True
     except Exception:
-        return False
+        pass
 
 
-def _append_jsonl(path: Path, obj):
+def _rm_if_exists(path: Path) -> None:
     try:
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-        return True
+        if path.exists():
+            path.unlink()
     except Exception:
-        return False
+        pass
 
 
 # =========================
-# Config
+# Config / Result
 # =========================
+
 @dataclass
-class HandCmdCfg:
+class HandCfg:
     cam_dev: str = "/dev/video0"
-    cam_w: int = 640
-    cam_h: int = 480
-    cam_fps: int = 30
+    w: int = 640
+    h: int = 480
+    fps: int = 30
 
-    # detection
-    min_det_conf: float = 0.6
-    min_track_conf: float = 0.6
+    # detect
+    det_conf: float = 0.55
+    track_conf: float = 0.50
+    max_hands: int = 1
 
-    # avoid spam
-    cooldown_sec: float = 0.9
-    same_gesture_hold_sec: float = 0.25
-    max_fps: float = 20.0
+    # performance: skip frames (1=every frame, 2=every 2 frames...)
+    process_every: int = 2
 
-    # file memory
-    state_file: str = "gesture_state.json"
-    log_file: str = "gesture_log.jsonl"
+    # cooldown: chống spam command
+    action_cooldown_sec: float = 0.7
 
-    # ✅ NEW: clear old memory on start
-    clear_old_memory_on_start: bool = True
+    # thresholds (tùy chỉnh dần)
+    thumb_dir_deadzone: float = 0.10   # độ "nghiêng" tối thiểu để coi là thumbs left/right
+    hand_high_y: float = 0.33          # palm y < 0.33 => hand high (stand)
+    hand_low_y: float = 0.70           # palm y > 0.70 => hand low  (sit)
 
-    # face3d UDP
-    face_host: str = "127.0.0.1"
-    face_port: int = 39393
+    # clap
+    clap_window_sec: float = 0.35      # khoảng thời gian để coi 2 tay "vỗ"
+    clap_dist_norm: float = 0.14       # khoảng cách 2 cổ tay (chuẩn hóa theo khung) để coi là "chạm"
 
-    # debug overlay
-    draw_overlay: bool = True
+
+@dataclass
+class HandLast:
+    enabled: bool = False
+    gesture: Optional[str] = None
+    action: Optional[str] = None
+    face: Optional[str] = None
+    bark: bool = False
+    fps: float = 0.0
+    robot_state: str = "UNKNOWN"
+    ts: float = 0.0
+    err: Optional[str] = None
 
 
 # =========================
 # HandCommand
 # =========================
+
 class HandCommand:
     """
-    HandCommand: nhận diện gesture realtime từ live camera.
+    MediaPipe-based hand gesture recognizer.
 
-    Output: gọi callback on_cmd(move_str) + set_face(emo_str)
-
-    - Có state machine cơ bản + ghi file gesture_state.json và gesture_log.jsonl
-    - Có check robot_state trước khi chạy lệnh để tránh té:
-        * nếu robot đang SIT mà cần MOVE/STAND => gọi support_stand() trước
-    - Có thể bật/tắt bằng set_enabled(True/False)
-
-    Gesture (heuristic, mediapipe):
-      1) Beckon 4 fingers wave (come closer) => FORWARD + face suprise
-      2) Index up to camera => TROT_FORWARD + face suprise
-      3) Palm high => STAND + face suprise
-      4) Palm low => SIT + face sad
-      5) Fist => STOP + face sleep
-      6) Clap (2 hands) => BACK + BARK + face angry
-      7) Thumb right => TURN_RIGHT + face what_is_it
-      8) Thumb left => TURN_LEFT + face suprise
-
-    NOTE:
-      - Bạn map các string command này ở main bằng MotionController của bạn.
+    Public API:
+      - start() / stop()
+      - set_enabled(on: bool)
+      - get_last() -> dict
+      - draw_on_frame(frame_bgr) -> frame_bgr  (for WebDashboard)
     """
 
-    VALID_STATES = {"UNKNOWN", "SIT", "STAND", "MOVING", "STOPPED"}
+    # gesture names
+    G_NONE = "NONE"
+    G_BECKON = "BECKON"          # 4 fingers curling/waving
+    G_INDEX_UP = "INDEX_UP"      # 1 index finger up
+    G_PALM_HIGH = "PALM_HIGH"    # hand raised high -> stand
+    G_PALM_LOW = "PALM_LOW"      # hand down low -> sit
+    G_FIST = "FIST"              # stop
+    G_CLAP = "CLAP"              # two hands clap -> back + bark
+    G_THUMB_RIGHT = "THUMB_RIGHT"
+    G_THUMB_LEFT = "THUMB_LEFT"
+
+    # robot states saved in memory
+    S_STAND = "STAND"
+    S_SIT = "SIT"
+    S_LYING = "LYING"
+    S_MOVING = "MOVING"
+    S_STOP = "STOP"
+    S_UNKNOWN = "UNKNOWN"
 
     def __init__(
         self,
-        cfg: HandCmdCfg,
-        on_cmd: Optional[Callable[[str], None]] = None,
-        set_face: Optional[Callable[[str], None]] = None,
-
-        # optional: bark callback (hoặc bạn dùng ActiveListenerV2 tự bark)
-        on_bark: Optional[Callable[[], None]] = None,
-
-        # optional: support stand helper (MatthewPidogBootClass instance)
+        cfg: HandCfg,
+        on_action: Callable[[str, str, bool], None],
+        # optional boot helper for support_stand
         boot_helper: Optional[Any] = None,
+        # optional camera supplier (if you already have frame pipeline)
+        get_frame_bgr: Optional[Callable[[], Any]] = None,
+        # optional: if you want open its own camera
+        open_own_camera: bool = True,
+        # memory file
+        memory_file: str = "gesture_memory.json",
+        # if True: remove old memory file on init
+        clear_memory_on_start: bool = True,
     ):
-        if cv2 is None:
-            raise RuntimeError("OpenCV (cv2) is required for HandCommand.")
+        self.cfg = cfg
+        self.on_action = on_action
+        self.boot_helper = boot_helper
+        self.get_frame_bgr = get_frame_bgr
+        self.open_own_camera = bool(open_own_camera)
 
-        if mp is None:
+        self.base_dir = Path(__file__).resolve().parent
+        self.mem_path = self.base_dir / memory_file
+
+        if clear_memory_on_start:
+            _rm_if_exists(self.mem_path)
+
+        # runtime
+        self._enabled = False
+        self._running = False
+        self._thr: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+
+        self._last = HandLast(enabled=False, robot_state=self._read_robot_state(), ts=_now())
+        self._last_action_ts = 0.0
+
+        # last mediapipe landmarks (for draw_on_frame)
+        self._last_mp_landmarks = None
+        self._last_mp_handedness = None
+
+        # fps calc
+        self._fps_ts = _now()
+        self._fps_n = 0
+        self._fps_val = 0.0
+
+        # mediapipe
+        try:
+            import mediapipe as mp
+            self._mp = mp
+            self._mp_hands = mp.solutions.hands
+            self._mp_draw = mp.solutions.drawing_utils
+            self._hands = self._mp_hands.Hands(
+                static_image_mode=False,
+                max_num_hands=self.cfg.max_hands,
+                model_complexity=0,  # ✅ nhẹ nhất, chạy nhanh hơn
+                min_detection_confidence=self.cfg.det_conf,
+                min_tracking_confidence=self.cfg.track_conf,
+            )
+        except Exception as e:
             raise RuntimeError(
                 "mediapipe is required for HandCommand.\n"
-                "Install: pip install mediapipe"
+                "Install example: pip install mediapipe\n"
+                f"Error: {e}"
             )
 
-        self.cfg = cfg
-        self.on_cmd = on_cmd
-        self.set_face_cb = set_face
-        self.on_bark = on_bark
-        self.boot_helper = boot_helper
+        # opencv only for drawing + camera if needed
+        self._cv2 = None
+        try:
+            import cv2
+            self._cv2 = cv2
+        except Exception:
+            self._cv2 = None
 
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-        self._enabled_lock = threading.Lock()
-        self._enabled = False
-
-        # face udp
-        self._udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._udp_addr = (self.cfg.face_host, int(self.cfg.face_port))
-
-        # files
-        self._state_path = Path(self.cfg.state_file)
-        self._log_path = Path(self.cfg.log_file)
-
-        # ✅ NEW: clear old memory on start
-        if getattr(self.cfg, "clear_old_memory_on_start", True):
-            try:
-                if self._state_path.exists():
-                    self._state_path.unlink()
-            except Exception:
-                pass
-            try:
-                if self._log_path.exists():
-                    self._log_path.unlink()
-            except Exception:
-                pass
-
-        # state
-        self._state = self._load_state()
-        if self._state.get("robot_state") not in self.VALID_STATES:
-            self._state["robot_state"] = "UNKNOWN"
-
-        # recent gesture buffer
-        self._last_emit_ts = 0.0
-        self._last_gesture = ""
-        self._gesture_since = 0.0
-
-        # clap detection memory
-        self._last_clap_close_ts = 0.0
-
-        # mediapipe hands
-        self._mp_hands = mp.solutions.hands
-        self._hands = self._mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=2,
-            min_detection_confidence=float(self.cfg.min_det_conf),
-            min_tracking_confidence=float(self.cfg.min_track_conf),
-        )
-
+        # if open own camera
         self._cap = None
-        self._last_frame = None
-        self._last_frame_lock = threading.Lock()
 
-    # ---------------- public ----------------
-    def start(self, enabled: bool = True):
-        self.set_enabled(enabled)
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, name="HandCommand", daemon=True)
-        self._thread.start()
+        # clap state (if you later enable multi-hand)
+        self._last_clap_ts = 0.0
 
-    def stop(self):
-        self._stop.set()
-        try:
-            if self._thread:
-                self._thread.join(timeout=1.5)
-        except Exception:
-            pass
-        self._release_cam()
+    # -------------------------
+    # State / memory
+    # -------------------------
 
-    def join(self, timeout: float = 2.0):
-        if self._thread:
-            self._thread.join(timeout=timeout)
+    def _read_robot_state(self) -> str:
+        data = _safe_read_json(self.mem_path)
+        st = (data.get("robot_state") or "").upper().strip()
+        if st:
+            return st
+        return self.S_UNKNOWN
 
-    def set_enabled(self, on: bool):
-        with self._enabled_lock:
-            self._enabled = bool(on)
-
-    def is_enabled(self) -> bool:
-        with self._enabled_lock:
-            return bool(self._enabled)
-
-    def get_last_frame(self):
-        with self._last_frame_lock:
-            return None if self._last_frame is None else self._last_frame.copy()
-
-    # ---------------- face ----------------
-    def send_face_cmd(self, msg: str):
-        try:
-            self._udp.sendto(msg.encode("utf-8"), self._udp_addr)
-        except Exception:
-            pass
-
-    def set_face(self, emo: str):
-        if self.set_face_cb:
-            try:
-                self.set_face_cb(emo)
-                return
-            except Exception:
-                pass
-        # fallback to udp
-        self.send_face_cmd(f"EMO {emo}")
-
-    # ---------------- file memory ----------------
-    def _load_state(self) -> Dict[str, Any]:
-        default = {
-            "robot_state": "UNKNOWN",
-            "last_action": "",
-            "last_face": "",
-            "last_gesture": "",
-            "ts": 0.0,
-        }
-        return _safe_json_load(self._state_path, default)
-
-    def _save_state(self):
-        self._state["ts"] = _now()
-        _safe_json_dump(self._state_path, self._state)
-
-    def _log_event(self, gesture: str, action: str, face: str, extra: Optional[Dict[str, Any]] = None):
-        ev = {
+    def _write_memory(self, gesture: str, action: str, face: str, bark: bool, robot_state: str):
+        obj = {
             "ts": _now(),
             "gesture": gesture,
             "action": action,
             "face": face,
-            "robot_state_before": self._state.get("robot_state", "UNKNOWN"),
+            "bark": bool(bark),
+            "robot_state": robot_state,
         }
-        if extra:
-            ev.update(extra)
-        _append_jsonl(self._log_path, ev)
+        _safe_write_json(self.mem_path, obj)
 
-    # ---------------- robot state helper ----------------
-    def _need_support_stand(self, desired_action: str) -> bool:
-        """
-        Nếu robot đang SIT mà muốn MOVE/STAND => cần support_stand trước.
-        """
-        st = (self._state.get("robot_state") or "UNKNOWN").upper()
-        if st == "SIT":
-            if desired_action in ("STAND", "FORWARD", "TROT_FORWARD", "BACK", "TURN_LEFT", "TURN_RIGHT"):
-                return True
-        return False
+    def _update_last(self, **kw):
+        with self._lock:
+            for k, v in kw.items():
+                setattr(self._last, k, v)
 
-    def _do_support_stand_if_needed(self, desired_action: str):
-        if not self._need_support_stand(desired_action):
+    def get_last(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "enabled": self._last.enabled,
+                "gesture": self._last.gesture,
+                "action": self._last.action,
+                "face": self._last.face,
+                "bark": self._last.bark,
+                "fps": self._last.fps,
+                "robot_state": self._last.robot_state,
+                "ts": self._last.ts,
+                "err": self._last.err,
+            }
+
+    def set_enabled(self, on: bool):
+        on = bool(on)
+        with self._lock:
+            self._enabled = on
+            self._last.enabled = on
+            self._last.ts = _now()
+        # nếu bật lên: clear last gesture cho sạch
+        if on:
+            self._update_last(gesture=None, action=None, face=None, bark=False, err=None)
+
+    # -------------------------
+    # Run loop
+    # -------------------------
+
+    def start(self):
+        if self._running:
             return
-        if self.boot_helper and hasattr(self.boot_helper, "support_stand"):
-            print("[HandCommand] support_stand() because robot_state=SIT")
-            try:
-                self.boot_helper.support_stand(step=1, delay=0.03, pause_sec=0.6)
-            except Exception as e:
-                print("[HandCommand] support_stand error:", e)
+        self._running = True
 
-    # ---------------- command dispatcher ----------------
-    def _emit(self, gesture: str, action: str, face: str, bark: bool = False):
-        now = _now()
-        if now - self._last_emit_ts < float(self.cfg.cooldown_sec):
-            return
+        if self.open_own_camera and self.get_frame_bgr is None:
+            if self._cv2 is None:
+                self._running = False
+                raise RuntimeError("opencv-python is required to open camera in HandCommand")
+            self._cap = self._cv2.VideoCapture(self.cfg.cam_dev)
+            self._cap.set(self._cv2.CAP_PROP_FRAME_WIDTH, self.cfg.w)
+            self._cap.set(self._cv2.CAP_PROP_FRAME_HEIGHT, self.cfg.h)
+            self._cap.set(self._cv2.CAP_PROP_FPS, self.cfg.fps)
 
-        # hold gesture stable a little (anti jitter)
-        if self._last_gesture != gesture:
-            self._last_gesture = gesture
-            self._gesture_since = now
-            return
-        if (now - self._gesture_since) < float(self.cfg.same_gesture_hold_sec):
-            return
+        self._thr = threading.Thread(target=self._loop, daemon=True)
+        self._thr.start()
 
-        self._last_emit_ts = now
+    def stop(self):
+        self._running = False
+        if self._thr:
+            self._thr.join(timeout=1.0)
+        self._thr = None
 
-        # check state safety
-        self._do_support_stand_if_needed(action)
-
-        # face first
-        if face:
-            self.set_face(face)
-
-        # bark (if requested)
-        if bark and self.on_bark:
-            try:
-                self.on_bark()
-            except Exception:
-                pass
-
-        # send command
-        if action and self.on_cmd:
-            try:
-                self.on_cmd(action)
-            except Exception:
-                pass
-
-        # update state guess
-        if action == "SIT":
-            self._state["robot_state"] = "SIT"
-        elif action == "STAND":
-            self._state["robot_state"] = "STAND"
-        elif action == "STOP":
-            self._state["robot_state"] = "STOPPED"
-        else:
-            # forward/back/turn/trot
-            self._state["robot_state"] = "MOVING"
-
-        self._state["last_action"] = action
-        self._state["last_face"] = face
-        self._state["last_gesture"] = gesture
-        self._save_state()
-
-        self._log_event(gesture, action, face, extra={"bark": bool(bark)})
-
-        print(f"[HandCommand] GESTURE={gesture} => ACTION={action} FACE={face} bark={bark}")
-
-    # ---------------- camera ----------------
-    def _open_cam(self):
-        if self._cap is not None:
-            return
-        backend = cv2.CAP_V4L2 if hasattr(cv2, "CAP_V4L2") else 0
-        cap = cv2.VideoCapture(self.cfg.cam_dev, backend)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(self.cfg.cam_w))
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(self.cfg.cam_h))
-        cap.set(cv2.CAP_PROP_FPS, int(self.cfg.cam_fps))
-        self._cap = cap
-
-    def _release_cam(self):
         try:
             if self._cap is not None:
                 self._cap.release()
@@ -386,252 +292,322 @@ class HandCommand:
             pass
         self._cap = None
 
-    # ---------------- mediapipe helpers ----------------
-    def _lm_xy(self, lm, w, h) -> Tuple[float, float]:
-        return (float(lm.x) * w, float(lm.y) * h)
+    # -------------------------
+    # Drawing (WebDashboard)
+    # -------------------------
 
-    def _hand_features(self, lms, w, h) -> Dict[str, Any]:
+    def draw_on_frame(self, frame_bgr):
         """
-        Return features from 21 landmarks:
-          - finger up states
-          - palm center
-          - bbox
+        Draw mediapipe hand landmarks + gesture text onto BGR frame for WebDashboard.
         """
-        # indices
-        WRIST = 0
-        THUMB_TIP = 4
-        INDEX_TIP = 8
-        MIDDLE_TIP = 12
-        RING_TIP = 16
-        PINKY_TIP = 20
+        if self._cv2 is None:
+            return frame_bgr
 
-        INDEX_PIP = 6
-        MIDDLE_PIP = 10
-        RING_PIP = 14
-        PINKY_PIP = 18
-
-        pts = [self._lm_xy(lm, w, h) for lm in lms]
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        bbox = (min(xs), min(ys), max(xs), max(ys))
-        palm = pts[WRIST]
-
-        # simple "finger up": tip.y < pip.y  (camera coord: y down)
-        def up(tip_i, pip_i):
-            return pts[tip_i][1] < pts[pip_i][1]
-
-        idx_up = up(INDEX_TIP, INDEX_PIP)
-        mid_up = up(MIDDLE_TIP, MIDDLE_PIP)
-        ring_up = up(RING_TIP, RING_PIP)
-        pink_up = up(PINKY_TIP, PINKY_PIP)
-
-        # thumb: use x-direction relative to index MCP to estimate extended
-        # MCP index = 5
-        thumb_tip = pts[THUMB_TIP]
-        index_mcp = pts[5]
-        thumb_ext = abs(thumb_tip[0] - index_mcp[0]) > (0.12 * (bbox[2] - bbox[0] + 1e-6))
-
-        # fist: all fingers down (thumb may be near)
-        fist = (not idx_up) and (not mid_up) and (not ring_up) and (not pink_up)
-
-        # open palm: 4 fingers up
-        open4 = idx_up and mid_up and ring_up and pink_up
-
-        # thumb direction (left/right) based on thumb tip relative to wrist
-        wrist = pts[WRIST]
-        thumb_dir = "CENTER"
-        dx = thumb_tip[0] - wrist[0]
-        if abs(dx) > 0.10 * (bbox[2] - bbox[0] + 1e-6):
-            thumb_dir = "RIGHT" if dx > 0 else "LEFT"
-
-        return {
-            "pts": pts,
-            "bbox": bbox,
-            "palm": palm,
-            "idx_up": idx_up,
-            "mid_up": mid_up,
-            "ring_up": ring_up,
-            "pink_up": pink_up,
-            "thumb_ext": thumb_ext,
-            "thumb_dir": thumb_dir,
-            "fist": fist,
-            "open4": open4,
-        }
-
-    def _detect_clap(self, hands_feats: List[Dict[str, Any]]) -> bool:
-        """
-        Clap = 2 hands present and distance between palms is very small,
-        and just closed quickly recently.
-        """
-        if len(hands_feats) < 2:
-            return False
-
-        p1 = hands_feats[0]["palm"]
-        p2 = hands_feats[1]["palm"]
-        d = _dist(p1, p2)
-
-        # normalize threshold by frame width (~640)
-        # Clap close threshold
-        close_thr = 90.0
-
-        now = _now()
-
-        if d < close_thr:
-            # if recently also far then close -> clap
-            if (now - self._last_clap_close_ts) > 0.25:
-                # mark first close
-                self._last_clap_close_ts = now
-                return False
-            # second detection within short window => clap confirmed
-            return True
-
-        # far: reset
-        if d > 170.0:
-            self._last_clap_close_ts = 0.0
-
-        return False
-
-    def _detect_beckon(self, feat: Dict[str, Any], prev_feat: Optional[Dict[str, Any]], w: int, h: int) -> bool:
-        """
-        "ngoắc lại gần bằng 4 ngón tay vẫy liên tục":
-          - 4 fingers up (open4)
-          - fingertip y changes back/forth between frames (wave)
-        """
-        if not feat["open4"]:
-            return False
-        if prev_feat is None:
-            return False
-
-        # track average fingertip y
-        tips_idx = [8, 12, 16, 20]
-        cur = np.mean([feat["pts"][i][1] for i in tips_idx])
-        prv = np.mean([prev_feat["pts"][i][1] for i in tips_idx])
-
-        dy = cur - prv
-        # wave threshold
-        return abs(dy) > 10.0
-
-    def _palm_height(self, feat: Dict[str, Any], h: int) -> str:
-        """
-        return: HIGH / LOW / MID based on wrist/palm y
-        """
-        y = feat["palm"][1]
-        if y < 0.30 * h:
-            return "HIGH"
-        if y > 0.70 * h:
-            return "LOW"
-        return "MID"
-
-    # ---------------- main loop ----------------
-    def _loop(self):
-        self._open_cam()
-        if self._cap is None or not self._cap.isOpened():
-            print("[HandCommand] ERROR: camera not opened:", self.cfg.cam_dev)
-            return
-
-        prev_feat_one = None
-
-        last_tick = 0.0
-        min_dt = 1.0 / max(5.0, float(self.cfg.max_fps))
-
-        while not self._stop.is_set():
-            # limit fps
-            tnow = _now()
-            if (tnow - last_tick) < min_dt:
-                time.sleep(0.002)
-                continue
-            last_tick = tnow
-
-            ok, frame = self._cap.read()
-            if not ok or frame is None:
-                time.sleep(0.02)
-                continue
-
-            # store last frame for dashboard use
-            with self._last_frame_lock:
-                self._last_frame = frame.copy()
-
-            if not self.is_enabled():
-                prev_feat_one = None
-                continue
-
-            h, w = frame.shape[:2]
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-            res = self._hands.process(rgb)
-            hands_feats = []
-
-            if res.multi_hand_landmarks:
-                for hand_lms in res.multi_hand_landmarks:
-                    feat = self._hand_features(hand_lms.landmark, w, h)
-                    hands_feats.append(feat)
-
-            # Optional overlay
-            if self.cfg.draw_overlay and res.multi_hand_landmarks:
-                mp.solutions.drawing_utils.draw_landmarks(
-                    frame, res.multi_hand_landmarks[0], self._mp_hands.HAND_CONNECTIONS
+        cv2 = self._cv2
+        try:
+            # draw landmarks
+            lm = self._last_mp_landmarks
+            if lm is not None:
+                self._mp_draw.draw_landmarks(
+                    frame_bgr,
+                    lm,
+                    self._mp_hands.HAND_CONNECTIONS
                 )
 
-            # Clap (2 hands) highest priority
-            if self._detect_clap(hands_feats):
-                self._emit("CLAP", "BACK", "angry", bark=True)
-                prev_feat_one = hands_feats[0] if hands_feats else None
-                continue
+            last = self.get_last()
+            enabled = last.get("enabled", False)
+            gest = last.get("gesture") or "NA"
+            fps = last.get("fps", None)
 
-            if not hands_feats:
-                prev_feat_one = None
-                continue
+            txt = ("HAND: ON  " if enabled else "HAND: OFF ") + f" {gest}"
+            if isinstance(fps, (int, float)):
+                txt += f"  ({fps:.1f}fps)"
 
-            # use first hand as primary
-            feat0 = hands_feats[0]
-
-            # 1) FIST => STOP (highest for single hand)
-            if feat0["fist"]:
-                self._emit("FIST", "STOP", "sleep")
-                prev_feat_one = feat0
-                continue
-
-            # 2) Palm high/low => STAND/SIT
-            ph = self._palm_height(feat0, h)
-            if ph == "HIGH":
-                self._emit("PALM_HIGH", "STAND", "suprise")
-                prev_feat_one = feat0
-                continue
-            if ph == "LOW":
-                self._emit("PALM_LOW", "SIT", "sad")
-                prev_feat_one = feat0
-                continue
-
-            # 3) Index up only => TROT forward
-            if feat0["idx_up"] and (not feat0["mid_up"]) and (not feat0["ring_up"]) and (not feat0["pink_up"]):
-                self._emit("INDEX_UP", "TROT_FORWARD", "suprise")
-                prev_feat_one = feat0
-                continue
-
-            # 4) Thumb left/right
-            # require thumb extended, and other fingers down-ish to reduce false triggers
-            if feat0["thumb_ext"] and (not feat0["idx_up"]) and (not feat0["mid_up"]) and (not feat0["ring_up"]) and (not feat0["pink_up"]):
-                if feat0["thumb_dir"] == "RIGHT":
-                    self._emit("THUMB_RIGHT", "TURN_RIGHT", "what_is_it")
-                    prev_feat_one = feat0
-                    continue
-                if feat0["thumb_dir"] == "LEFT":
-                    self._emit("THUMB_LEFT", "TURN_LEFT", "suprise")
-                    prev_feat_one = feat0
-                    continue
-
-            # 5) Beckon (open4 + wave) => FORWARD
-            if self._detect_beckon(feat0, prev_feat_one, w, h):
-                self._emit("BECKON", "FORWARD", "suprise")
-                prev_feat_one = feat0
-                continue
-
-            # default
-            prev_feat_one = feat0
-
-        # cleanup
-        self._release_cam()
-        try:
-            self._hands.close()
+            # background box
+            cv2.rectangle(frame_bgr, (10, 10), (520, 60), (0, 0, 0), -1)
+            cv2.putText(frame_bgr, txt, (20, 45),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
         except Exception:
             pass
+        return frame_bgr
+
+    # -------------------------
+    # Internal loop
+    # -------------------------
+
+    def _grab_frame(self):
+        if self.get_frame_bgr is not None:
+            try:
+                return self.get_frame_bgr()
+            except Exception:
+                return None
+
+        if self._cap is None:
+            return None
+
+        ok, frame = self._cap.read()
+        if not ok:
+            return None
+        return frame
+
+    def _loop(self):
+        frame_i = 0
+        while self._running:
+            t0 = _now()
+            frame = self._grab_frame()
+            if frame is None:
+                self._update_last(err="no_frame", ts=_now())
+                time.sleep(0.03)
+                continue
+
+            frame_i += 1
+            if self.cfg.process_every > 1 and (frame_i % self.cfg.process_every != 0):
+                # update fps counter even if skipping (for UI feel)
+                self._tick_fps()
+                time.sleep(0.001)
+                continue
+
+            try:
+                gesture = self._infer_gesture(frame)
+                self._tick_fps()
+
+                enabled = False
+                with self._lock:
+                    enabled = bool(self._enabled)
+
+                if enabled and gesture and gesture != self.G_NONE:
+                    self._maybe_fire_action(gesture)
+
+                self._update_last(
+                    enabled=enabled,
+                    gesture=(gesture if gesture != self.G_NONE else None),
+                    fps=self._fps_val,
+                    ts=_now(),
+                    err=None
+                )
+            except Exception as e:
+                self._update_last(err=f"infer_error: {e}", ts=_now())
+
+            dt = _now() - t0
+            # giữ loop nhẹ nhàng
+            if dt < 0.01:
+                time.sleep(0.002)
+
+    def _tick_fps(self):
+        self._fps_n += 1
+        dt = _now() - self._fps_ts
+        if dt >= 1.0:
+            self._fps_val = float(self._fps_n) / dt
+            self._fps_n = 0
+            self._fps_ts = _now()
+
+    # -------------------------
+    # Gesture inference
+    # -------------------------
+
+    def _infer_gesture(self, frame_bgr) -> str:
+        """
+        Return one of gesture constants.
+        """
+        cv2 = self._cv2
+        if cv2 is None:
+            return self.G_NONE
+
+        # convert BGR -> RGB for mediapipe
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+        res = self._hands.process(rgb)
+        if not res.multi_hand_landmarks:
+            self._last_mp_landmarks = None
+            self._last_mp_handedness = None
+            return self.G_NONE
+
+        lm = res.multi_hand_landmarks[0]
+        self._last_mp_landmarks = lm
+        try:
+            self._last_mp_handedness = res.multi_handedness[0]
+        except Exception:
+            self._last_mp_handedness = None
+
+        # normalized points
+        pts = [(p.x, p.y, p.z) for p in lm.landmark]
+
+        # key indexes (mediapipe)
+        WRIST = 0
+        TH_CMC = 1
+        TH_MCP = 2
+        TH_IP  = 3
+        TH_TIP = 4
+        IN_MCP = 5
+        IN_PIP = 6
+        IN_DIP = 7
+        IN_TIP = 8
+        MD_MCP = 9
+        MD_PIP = 10
+        MD_DIP = 11
+        MD_TIP = 12
+        RG_MCP = 13
+        RG_PIP = 14
+        RG_DIP = 15
+        RG_TIP = 16
+        PK_MCP = 17
+        PK_PIP = 18
+        PK_DIP = 19
+        PK_TIP = 20
+
+        def dist2(i, j) -> float:
+            ax, ay, _ = pts[i]
+            bx, by, _ = pts[j]
+            dx = ax - bx
+            dy = ay - by
+            return dx*dx + dy*dy
+
+        def is_finger_extended(tip, pip, mcp) -> bool:
+            # y nhỏ hơn => cao hơn trong ảnh (tay hướng lên)
+            ty = pts[tip][1]
+            py = pts[pip][1]
+            my = pts[mcp][1]
+            return (ty < py) and (py < my)
+
+        def finger_curl_score(tip, pip, mcp, wrist=WRIST) -> float:
+            # lớn => đang co về cổ tay
+            # dùng khoảng cách tip->wrist so với mcp->wrist
+            tw = math.sqrt(dist2(tip, wrist))
+            mw = math.sqrt(dist2(mcp, wrist))
+            if mw <= 1e-6:
+                return 0.0
+            return _clamp((mw - tw) / mw, 0.0, 1.0)
+
+        # palm center
+        palm_x = (pts[WRIST][0] + pts[IN_MCP][0] + pts[MD_MCP][0] + pts[RG_MCP][0] + pts[PK_MCP][0]) / 5.0
+        palm_y = (pts[WRIST][1] + pts[IN_MCP][1] + pts[MD_MCP][1] + pts[RG_MCP][1] + pts[PK_MCP][1]) / 5.0
+
+        # --------- Palm high / low (priority: stand/sit) ---------
+        if palm_y < self.cfg.hand_high_y:
+            return self.G_PALM_HIGH
+        if palm_y > self.cfg.hand_low_y:
+            return self.G_PALM_LOW
+
+        # --------- Finger extended flags ---------
+        idx_ext = is_finger_extended(IN_TIP, IN_PIP, IN_MCP)
+        mid_ext = is_finger_extended(MD_TIP, MD_PIP, MD_MCP)
+        rng_ext = is_finger_extended(RG_TIP, RG_PIP, RG_MCP)
+        pnk_ext = is_finger_extended(PK_TIP, PK_PIP, PK_MCP)
+
+        ext_count = sum([idx_ext, mid_ext, rng_ext, pnk_ext])
+
+        # --------- Fist ---------
+        # nếu 4 ngón đều co mạnh -> fist
+        c_idx = finger_curl_score(IN_TIP, IN_PIP, IN_MCP)
+        c_mid = finger_curl_score(MD_TIP, MD_PIP, MD_MCP)
+        c_rng = finger_curl_score(RG_TIP, RG_PIP, RG_MCP)
+        c_pnk = finger_curl_score(PK_TIP, PK_PIP, PK_MCP)
+        avg_curl = (c_idx + c_mid + c_rng + c_pnk) / 4.0
+
+        if avg_curl > 0.68 and ext_count == 0:
+            return self.G_FIST
+
+        # --------- Index up ---------
+        # chỉ index duỗi, các ngón khác co
+        if idx_ext and (not mid_ext) and (not rng_ext) and (not pnk_ext):
+            # thêm điều kiện các ngón kia co vừa đủ
+            if (c_mid + c_rng + c_pnk) / 3.0 > 0.35:
+                return self.G_INDEX_UP
+
+        # --------- Beckon (4-finger curling) ---------
+        # index+mid+ring+pinky curl khá cao, thumb không quan trọng
+        if avg_curl > 0.45 and ext_count <= 1:
+            # muốn beckon thì curl nhưng không phải fist quá chặt
+            if 0.45 <= avg_curl <= 0.75:
+                return self.G_BECKON
+
+        # --------- Thumb left/right ---------
+        # đo hướng vector thumb_mcp -> thumb_tip theo trục x
+        th_dx = pts[TH_TIP][0] - pts[TH_MCP][0]
+        th_dy = pts[TH_TIP][1] - pts[TH_MCP][1]
+        # thumbs "ngang" hơn "dọc"
+        if abs(th_dx) > abs(th_dy) and abs(th_dx) > self.cfg.thumb_dir_deadzone:
+            if th_dx > 0:
+                return self.G_THUMB_RIGHT
+            else:
+                return self.G_THUMB_LEFT
+
+        return self.G_NONE
+
+    # -------------------------
+    # Action mapping + safety state
+    # -------------------------
+
+    def _maybe_fire_action(self, gesture: str):
+        now = _now()
+        if (now - self._last_action_ts) < self.cfg.action_cooldown_sec:
+            return
+
+        # read last robot state
+        robot_state = self._read_robot_state()
+
+        action, face, bark, next_state = self._map_gesture_to_action(gesture, robot_state)
+        if action is None:
+            return
+
+        # safety: nếu đang SIT mà cần di chuyển/stand -> support stand trước
+        # (bạn có thể mở rộng thêm state khác)
+        needs_standing_first = action in ("FORWARD", "TROT_FORWARD", "BACK", "TURN_LEFT", "TURN_RIGHT", "STAND")
+        if needs_standing_first and robot_state == self.S_SIT:
+            if self.boot_helper is not None and hasattr(self.boot_helper, "support_stand"):
+                try:
+                    print("[HandCommand] safety: robot SIT -> support_stand() before action")
+                    self.boot_helper.support_stand()
+                    robot_state = self.S_STAND
+                except Exception as e:
+                    print("[HandCommand] support_stand error:", e, flush=True)
+
+        # fire action
+        try:
+            self.on_action(action, face, bark)
+        except Exception as e:
+            self._update_last(err=f"on_action error: {e}", ts=_now())
+            return
+
+        self._last_action_ts = now
+
+        # update memory + last
+        self._write_memory(gesture, action, face, bark, next_state)
+        self._update_last(action=action, face=face, bark=bark, robot_state=next_state, ts=_now())
+
+        print(f"[HandCommand] GESTURE={gesture} => ACTION={action} FACE={face} bark={bark}", flush=True)
+
+    def _map_gesture_to_action(self, gesture: str, robot_state: str) -> Tuple[Optional[str], Optional[str], bool, str]:
+        """
+        Returns: (action, face, bark, next_robot_state)
+        """
+        # mapping theo yêu cầu bạn
+        if gesture == self.G_BECKON:
+            return ("FORWARD", "suprise", False, self.S_MOVING)
+
+        if gesture == self.G_INDEX_UP:
+            return ("TROT_FORWARD", "suprise", False, self.S_MOVING)
+
+        if gesture == self.G_PALM_HIGH:
+            # đứng lên
+            return ("STAND", "what_is_it", False, self.S_STAND)
+
+        if gesture == self.G_PALM_LOW:
+            return ("SIT", "sad", False, self.S_SIT)
+
+        if gesture == self.G_FIST:
+            return ("STOP", "sleep", False, self.S_STOP)
+
+        if gesture == self.G_THUMB_RIGHT:
+            return ("TURN_RIGHT", "what_is_it", False, self.S_MOVING)
+
+        if gesture == self.G_THUMB_LEFT:
+            return ("TURN_LEFT", "suprise", False, self.S_MOVING)
+
+        # Clap: hiện tại file này chạy max_hands=1 cho nhanh,
+        # nên CLAP chưa kích hoạt trong _infer_gesture().
+        # Nếu bạn muốn clap thật (2 tay), mình sẽ nâng cấp phiên bản max_hands=2 + wrist distance.
+        if gesture == self.G_CLAP:
+            return ("BACK", "angry", True, self.S_MOVING)
+
+        return (None, None, False, robot_state)
