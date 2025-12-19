@@ -25,7 +25,7 @@ print(inspect.signature(music.music_play))
 
 print("\n[TEST] Try play with loops=1")
 try:
-    music.music_play(str(wav), loops=1)
+    music.music_play(str(wav), loops=3)
     time.sleep(2)
     print("✅ SUCCESS with loops=1")
     exit(0)
