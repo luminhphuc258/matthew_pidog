@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+# ==========================
+# FIX OPENCV / GSTREAMER
+# ==========================
 import os
+os.environ.setdefault("OPENCV_VIDEOIO_PRIORITY_GSTREAMER", "0")  # disable gstreamer backend priority
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")              # reduce OpenCV logs
+
 import time
 import json
 import math
@@ -22,7 +28,7 @@ except Exception:
 
 from robot_hat import Music
 
-# ==== NEW: boot via MotionController ====
+# ==== BOOT via MotionController ====
 from motion_controller import MotionController
 
 
@@ -40,11 +46,13 @@ class ListenerCfg:
     server_url: str = "https://embeddedprogramming-healtheworldserver.up.railway.app/pi_upload_audio_v2"
     timeout_sec: float = 30.0
 
-    # camera
+    # camera (Brio)
     cam_dev: str = "/dev/video0"
     cam_w: int = 640
     cam_h: int = 480
     jpeg_quality: int = 80
+    cam_warmup_frames: int = 6
+    cam_backend: str = "v4l2"  # force v4l2
 
     # memory
     memory_file: str = "robot_memory.jsonl"
@@ -103,7 +111,9 @@ class ActiveListenerV2:
                 if not full_wav:
                     continue
 
-                image_bytes = self._capture_jpeg_frame()  # optional
+                # capture camera frame (Brio safe)
+                image_bytes = self._capture_jpeg_frame()
+
                 resp = self._send_to_server(full_wav, image_bytes=image_bytes)
                 if not resp:
                     continue
@@ -166,8 +176,7 @@ class ActiveListenerV2:
                 if nchan != 1 or sampw != 2:
                     return None
                 raw = wf.readframes(wf.getnframes())
-            x = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
-            return x
+            return np.frombuffer(raw, dtype=np.int16).astype(np.float32)
         except Exception:
             return None
 
@@ -231,29 +240,55 @@ class ActiveListenerV2:
         finally:
             self._playing = False
 
-    # -------------------- camera --------------------
+    # -------------------- camera (Brio safe) --------------------
     def _capture_jpeg_frame(self) -> Optional[bytes]:
         if cv2 is None:
             return None
+
+        cap = None
         try:
-            cap = cv2.VideoCapture(self.cfg.cam_dev)
+            backend = cv2.CAP_V4L2 if self.cfg.cam_backend.lower() == "v4l2" else 0
+            cap = cv2.VideoCapture(self.cfg.cam_dev, backend)
             if not cap.isOpened():
+                print("[CAM] cannot open:", self.cfg.cam_dev)
                 return None
+
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg.cam_w)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg.cam_h)
 
-            ok, frame = cap.read()
-            cap.release()
-            if not ok or frame is None:
+            # Brio often supports MJPG; try to set it (ignore if fails)
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+                cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+            except Exception:
+                pass
+
+            frame = None
+            for _ in range(max(2, int(self.cfg.cam_warmup_frames))):
+                ok, fr = cap.read()
+                if ok and fr is not None:
+                    frame = fr
+
+            if frame is None:
+                print("[CAM] read failed")
                 return None
 
             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), int(self.cfg.jpeg_quality)]
             ok2, buf = cv2.imencode(".jpg", frame, encode_param)
             if not ok2:
+                print("[CAM] encode failed")
                 return None
             return buf.tobytes()
-        except Exception:
+
+        except Exception as e:
+            print("[CAM] error:", e)
             return None
+        finally:
+            try:
+                if cap is not None:
+                    cap.release()
+            except Exception:
+                pass
 
     # -------------------- memory --------------------
     def _load_recent_memory(self) -> List[Dict[str, Any]]:
@@ -296,15 +331,13 @@ class ActiveListenerV2:
         if image_bytes:
             files["image"] = ("frame.jpg", image_bytes, "image/jpeg")
 
-        data = {
-            "meta": json.dumps(meta, ensure_ascii=False),
-        }
+        data = {"meta": json.dumps(meta, ensure_ascii=False)}
 
         try:
             print("[HTTP] POST", self.cfg.server_url, "image=" + ("yes" if image_bytes else "no"))
             r = requests.post(self.cfg.server_url, files=files, data=data, timeout=self.cfg.timeout_sec)
             if r.status_code != 200:
-                print("[HTTP] bad status:", r.status_code, r.text[:200])
+                print("[HTTP] bad status:", r.status_code, r.text[:300])
                 return None
             return r.json()
         except Exception as e:
@@ -364,14 +397,11 @@ class ActiveListenerV2:
             if self._download(audio_url, local):
                 self._play_audio_file(local)
         finally:
-            try:
-                shutil.rmtree(tmpdir, ignore_errors=True)
-            except Exception:
-                pass
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ==========================================================
-# TEST / MAIN: BOOT using MotionController (unlock speaker)
+# MAIN: BOOT using MotionController (unlock speaker)
 # ==========================================================
 def main():
     POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
@@ -382,11 +412,15 @@ def main():
     time.sleep(0.8)
 
     cfg = ListenerCfg(
-        mic_device="default",  # sửa theo mic của bạn nếu cần: plughw:3,0 ...
+        mic_device="default",
         server_url="https://embeddedprogramming-healtheworldserver.up.railway.app/pi_upload_audio_v2",
         bark_wav="tiengsua.wav",
         bark_times=2,
-        cam_dev="/dev/video0",
+        cam_dev="/dev/video0",   # Brio thường là /dev/video0 hoặc /dev/video2 tuỳ máy
+        cam_w=640,
+        cam_h=480,
+        cam_backend="v4l2",
+        cam_warmup_frames=6,
         memory_file="robot_memory.jsonl",
     )
 
@@ -398,6 +432,7 @@ def main():
         pass
     finally:
         al.stop()
+        # MotionController có/không có close tuỳ project bạn
         try:
             mc.close()
         except Exception:
