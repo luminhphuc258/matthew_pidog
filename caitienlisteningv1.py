@@ -443,15 +443,14 @@ class ActiveListenerV2:
 
     def _handle_server_reply(self, resp: Dict[str, Any]):
         """
-        Expected server response fields:
+        Expected server response:
         {
             status, transcript, label, reply_text, audio_url, used_vision?
         }
 
-        Behavior:
-        - label == "clap"  -> bark locally, no TTS playback
-        - otherwise        -> download audio_url (mp3) and play via robot_hat.Music
-        - always save memory entry to jsonl
+        - label == "clap"  -> bark locally, skip TTS
+        - otherwise        -> download audio_url -> play by robot_hat.Music
+        - always append memory jsonl
         """
         transcript = (resp.get("transcript") or "").strip()
         label = (resp.get("label") or "unknown").strip()
@@ -464,7 +463,7 @@ class ActiveListenerV2:
             print("[BOT  ]", reply_text)
         print("[AUDIO]", audio_url)
 
-        # save memory (store everything, including clap)
+        # save memory
         self._append_memory({
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "transcript": transcript,
@@ -473,24 +472,41 @@ class ActiveListenerV2:
             "audio_url": audio_url,
         })
 
-        # ✅ NEW: clap => bark locally, skip audio_url / TTS
+        # ✅ clap => bark locally, no TTS
         if label.lower() == "clap":
             print(f"[CLAP->BARK] bark x{self.cfg.bark_times}")
             self._bark()
             return
 
-        # no audio -> nothing to play
         if not audio_url:
             return
 
-        # download + play mp3
+        # download to temp and play
         tmpdir = tempfile.mkdtemp(prefix="al2_play_")
         local = os.path.join(tmpdir, "reply.mp3")
         try:
-            if self._download(audio_url, local):
-                self._play_audio_file(local)
-            else:
+            ok = self._download(audio_url, local)
+            if not ok:
                 print("[PLAY] download failed:", audio_url)
+                return
+
+            self._playing = True
+            try:
+                # try common signatures of robot_hat.Music.music_play
+                try:
+                    # some versions use loops
+                    self.music.music_play(local, loops=1)
+                except TypeError:
+                    try:
+                        # some versions use loop
+                        self.music.music_play(local, loop=1)
+                    except TypeError:
+                        # fallback: no loop arg
+                        self.music.music_play(local)
+            except Exception as e:
+                print("[PLAY] error:", e)
+            finally:
+                self._playing = False
         finally:
             try:
                 shutil.rmtree(tmpdir, ignore_errors=True)
