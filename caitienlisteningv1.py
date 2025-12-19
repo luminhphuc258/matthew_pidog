@@ -5,8 +5,8 @@
 # FIX OPENCV / GSTREAMER
 # ==========================
 import os
-os.environ.setdefault("OPENCV_VIDEOIO_PRIORITY_GSTREAMER", "0")  # disable gstreamer backend priority
-os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")              # reduce OpenCV logs
+os.environ.setdefault("OPENCV_VIDEOIO_PRIORITY_GSTREAMER", "0")
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
 
 import time
 import json
@@ -27,8 +27,6 @@ except Exception:
     cv2 = None
 
 from robot_hat import Music
-
-# ==== BOOT via MotionController ====
 from motion_controller import MotionController
 
 
@@ -64,14 +62,6 @@ class ListenerCfg:
 
 
 class ActiveListenerV2:
-    """
-    Active listening v2:
-    - record chunk ngắn -> classify env vs speech (heuristic)
-    - env => bark (Music.music_play wav, loop=bark_times)
-    - speech => record full -> send server (audio + optional image + memory)
-    - long-term memory saved to jsonl and sent to server each request
-    """
-
     def __init__(self, cfg: ListenerCfg):
         self.cfg = cfg
         self._playing = False
@@ -84,6 +74,36 @@ class ActiveListenerV2:
     def stop(self):
         self._stop = True
 
+    # -------------------- SAFE MUSIC PLAY --------------------
+    def _music_play(self, filepath: str, times: int = 1):
+        """
+        robot_hat.Music.music_play() trên máy bạn dùng param `loops` (not loop).
+        Một số version khác có thể là `loop`.
+        Hàm này tự fallback cho cả 2.
+        """
+        self._playing = True
+        try:
+            # try loops=
+            try:
+                self.music.music_play(filepath, loops=int(times))
+                return
+            except TypeError:
+                pass
+            # fallback loop=
+            try:
+                self.music.music_play(filepath, loop=int(times))
+                return
+            except TypeError:
+                pass
+            # fallback no param
+            for _ in range(max(1, int(times))):
+                self.music.music_play(filepath)
+        except Exception as e:
+            print("[PLAY] error:", e)
+        finally:
+            self._playing = False
+
+    # -------------------- MAIN LOOP --------------------
     def run_forever(self):
         print("[ActiveListenerV2] start listening...")
         while not self._stop:
@@ -111,9 +131,7 @@ class ActiveListenerV2:
                 if not full_wav:
                     continue
 
-                # capture camera frame (Brio safe)
-                image_bytes = self._capture_jpeg_frame()
-
+                image_bytes = self._capture_jpeg_frame()  # optional
                 resp = self._send_to_server(full_wav, image_bytes=image_bytes)
                 if not resp:
                     continue
@@ -131,9 +149,8 @@ class ActiveListenerV2:
                 except Exception:
                     pass
 
-    # -------------------- audio record --------------------
+    # -------------------- AUDIO RECORD --------------------
     def _record_wav(self, seconds: float) -> Optional[str]:
-        """Record WAV (S16_LE mono 16k) using arecord."""
         if seconds <= 0:
             return None
 
@@ -180,7 +197,7 @@ class ActiveListenerV2:
         except Exception:
             return None
 
-    # -------------------- classification --------------------
+    # -------------------- CLASSIFY --------------------
     def _classify_chunk(self, wav_path: str) -> Tuple[float, float, Dict[str, float]]:
         x = self._read_wav_pcm16(wav_path)
         if x is None or len(x) < 256:
@@ -227,20 +244,14 @@ class ActiveListenerV2:
         }
         return rms, score, dbg
 
-    # -------------------- bark --------------------
+    # -------------------- BARK --------------------
     def _bark(self):
         if not self._bark_path.exists():
             print(f"[WARN] bark file not found: {self._bark_path}")
             return
-        self._playing = True
-        try:
-            self.music.music_play(str(self._bark_path), loop=int(self.cfg.bark_times))
-        except Exception as e:
-            print("[BARK] error:", e)
-        finally:
-            self._playing = False
+        self._music_play(str(self._bark_path), times=int(self.cfg.bark_times))
 
-    # -------------------- camera (Brio safe) --------------------
+    # -------------------- CAMERA --------------------
     def _capture_jpeg_frame(self) -> Optional[bytes]:
         if cv2 is None:
             return None
@@ -256,7 +267,7 @@ class ActiveListenerV2:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg.cam_w)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg.cam_h)
 
-            # Brio often supports MJPG; try to set it (ignore if fails)
+            # Try MJPG for Brio
             try:
                 fourcc = cv2.VideoWriter_fourcc(*"MJPG")
                 cap.set(cv2.CAP_PROP_FOURCC, fourcc)
@@ -290,7 +301,7 @@ class ActiveListenerV2:
             except Exception:
                 pass
 
-    # -------------------- memory --------------------
+    # -------------------- MEMORY --------------------
     def _load_recent_memory(self) -> List[Dict[str, Any]]:
         if not self._mem_path.exists():
             return []
@@ -307,7 +318,7 @@ class ActiveListenerV2:
                         pass
         except Exception:
             return []
-        return items[-self.cfg.memory_max_items_send :]
+        return items[-self.cfg.memory_max_items_send:]
 
     def _append_memory(self, entry: Dict[str, Any]):
         try:
@@ -316,18 +327,12 @@ class ActiveListenerV2:
         except Exception as e:
             print("[MEM] write error:", e)
 
-    # -------------------- server --------------------
+    # -------------------- SERVER --------------------
     def _send_to_server(self, wav_path: str, image_bytes: Optional[bytes]) -> Optional[Dict[str, Any]]:
         mem = self._load_recent_memory()
-        meta = {
-            "ts": time.time(),
-            "client": "pidog",
-            "memory": mem,
-        }
+        meta = {"ts": time.time(), "client": "pidog", "memory": mem}
 
-        files = {
-            "audio": ("audio.wav", open(wav_path, "rb"), "audio/wav"),
-        }
+        files = {"audio": ("audio.wav", open(wav_path, "rb"), "audio/wav")}
         if image_bytes:
             files["image"] = ("frame.jpg", image_bytes, "image/jpeg")
 
@@ -360,15 +365,6 @@ class ActiveListenerV2:
         except Exception:
             return False
 
-    def _play_audio_file(self, filepath: str):
-        self._playing = True
-        try:
-            self.music.music_play(filepath, loop=1)
-        except Exception as e:
-            print("[PLAY] error:", e)
-        finally:
-            self._playing = False
-
     def _handle_server_reply(self, resp: Dict[str, Any]):
         transcript = (resp.get("transcript") or "").strip()
         label = resp.get("label") or "unknown"
@@ -395,14 +391,14 @@ class ActiveListenerV2:
         local = os.path.join(tmpdir, "reply.mp3")
         try:
             if self._download(audio_url, local):
-                self._play_audio_file(local)
+                self._music_play(local, times=1)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ==========================================================
-# MAIN: BOOT using MotionController (unlock speaker)
-# ==========================================================
+# ==========================
+# MAIN (BOOT by MotionController)
+# ==========================
 def main():
     POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
     mc = MotionController(pose_file=POSE_FILE)
@@ -416,7 +412,7 @@ def main():
         server_url="https://embeddedprogramming-healtheworldserver.up.railway.app/pi_upload_audio_v2",
         bark_wav="tiengsua.wav",
         bark_times=2,
-        cam_dev="/dev/video0",   # Brio thường là /dev/video0 hoặc /dev/video2 tuỳ máy
+        cam_dev="/dev/video0",
         cam_w=640,
         cam_h=480,
         cam_backend="v4l2",
@@ -432,7 +428,6 @@ def main():
         pass
     finally:
         al.stop()
-        # MotionController có/không có close tuỳ project bạn
         try:
             mc.close()
         except Exception:
