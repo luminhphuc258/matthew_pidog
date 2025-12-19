@@ -37,17 +37,17 @@ class ListenerCfg:
     record_sec: float = 6.0
 
     # ===== auto noise gate =====
-    noise_calib_sec: float = 2.0      # thời gian học nền lúc start
-    gate_db_above_noise: float = 10.0 # chỉ trigger khi lớn hơn nền ~10dB
-    min_rms_floor: float = 700.0      # chặn những máy rất yên tĩnh bị gate quá thấp
+    noise_calib_sec: float = 2.0
+    gate_db_above_noise: float = 10.0
+    min_rms_floor: float = 700.0
 
     # speech score
-    speech_score_threshold: float = 0.62  # tăng lên để bớt nhạy
+    speech_score_threshold: float = 0.62
 
     # clap detector
-    clap_peak_ratio: float = 5.0      # peak/rms lớn => xung mạnh
-    clap_high_ratio: float = 0.12     # nhiều high freq
-    clap_zcr: float = 0.10            # zcr cao
+    clap_peak_ratio: float = 5.0
+    clap_high_ratio: float = 0.12
+    clap_zcr: float = 0.10
 
     # server
     server_url: str = "https://embeddedprogramming-healtheworldserver.up.railway.app/pi_upload_audio_v2"
@@ -69,6 +69,12 @@ class ListenerCfg:
     bark_wav: str = "tiengsua.wav"
     bark_times: int = 2
 
+    # ✅ NEW: cooldown sau khi phát loa để khỏi tự kích hoạt lại
+    playback_cooldown_sec: float = 0.7
+
+    # ✅ NEW: volume (0-100)
+    volume: int = 80
+
 
 class ActiveListenerV2:
     def __init__(self, cfg: ListenerCfg):
@@ -77,41 +83,91 @@ class ActiveListenerV2:
         self._stop = False
 
         self.music = Music()
+        try:
+            self.music.music_set_volume(int(self.cfg.volume))
+        except Exception:
+            pass
+
         self._mem_path = Path(self.cfg.memory_file)
         self._bark_path = Path(self.cfg.bark_wav)
 
-        # learned noise level
-        self._noise_rms = None  # float
+        self._noise_rms: Optional[float] = None
+        self._cooldown_until = 0.0
 
-    # ---------- SAFE MUSIC PLAY ----------
-    def _music_play(self, filepath: str, times: int = 1):
+        # (optional) unlock speaker pin if needed
+        try:
+            os.system("pinctrl set 12 op dh")
+            time.sleep(0.1)
+        except Exception:
+            pass
+
+    def stop(self):
+        self._stop = True
+
+    # ---------- duration helper ----------
+    def _get_audio_duration_sec(self, filepath: str) -> Optional[float]:
+        p = str(filepath)
+        # wav -> wave module
+        if p.lower().endswith(".wav"):
+            try:
+                import wave
+                with wave.open(p, "rb") as wf:
+                    frames = wf.getnframes()
+                    rate = wf.getframerate()
+                    if rate > 0:
+                        return float(frames) / float(rate)
+            except Exception:
+                pass
+
+        # mp3/m4a -> ffprobe if exists
+        try:
+            r = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", p],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False
+            )
+            s = (r.stdout or "").strip()
+            if s:
+                return float(s)
+        except Exception:
+            pass
+
+        return None
+
+    # ---------- SAFE MUSIC PLAY (BLOCKING) ----------
+    def _music_play_blocking(self, filepath: str, times: int = 1):
+        """
+        Quan trọng:
+        - Dùng loops=... đúng với robot_hat trên máy bạn
+        - BLOCK bằng sleep theo duration để không bị cắt 1s
+        - Trong lúc play: _playing=True => mic không record
+        """
         self._playing = True
         try:
-            try:
-                self.music.music_play(filepath, loops=int(times))
-                return
-            except TypeError:
-                pass
-            try:
-                self.music.music_play(filepath, loop=int(times))
-                return
-            except TypeError:
-                pass
-            for _ in range(max(1, int(times))):
-                self.music.music_play(filepath)
+            dur = self._get_audio_duration_sec(filepath)
+            loops = max(1, int(times))
+
+            # play
+            self.music.music_play(str(filepath), loops=loops)
+
+            # block until done (best effort)
+            if dur is not None:
+                time.sleep(dur * loops + 0.15)
+            else:
+                # fallback nếu không đo được dur
+                time.sleep(2.5 * loops)
+
         except Exception as e:
             print("[PLAY] error:", e)
         finally:
             self._playing = False
+            self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
 
     def _bark(self):
         if not self._bark_path.exists():
             print(f"[WARN] bark file not found: {self._bark_path}")
             return
-        self._music_play(str(self._bark_path), times=int(self.cfg.bark_times))
-
-    def stop(self):
-        self._stop = True
+        self._music_play_blocking(str(self._bark_path), times=int(self.cfg.bark_times))
 
     # ---------- MAIN ----------
     def run_forever(self):
@@ -119,7 +175,8 @@ class ActiveListenerV2:
         self._calibrate_noise_floor()
 
         while not self._stop:
-            if self._playing:
+            # ✅ Nếu đang phát loa / đang cooldown thì bỏ qua thu âm
+            if self._playing or (time.time() < self._cooldown_until):
                 time.sleep(0.05)
                 continue
 
@@ -132,11 +189,10 @@ class ActiveListenerV2:
                 feats = self._extract_features(wav_path)
                 rms = feats["rms"]
 
-                # dynamic gate based on noise floor
                 if not self._passes_gate(rms):
                     continue
 
-                # clap check first (because clap is short impulse)
+                # clap first
                 if self._is_clap(feats):
                     print(f"[CLAP] rms={rms:.0f} peak/rms={feats['peak_ratio']:.1f} hi={feats['high_ratio']:.3f} zcr={feats['zcr']:.3f} -> BARK")
                     self._bark()
@@ -160,7 +216,7 @@ class ActiveListenerV2:
                     except Exception:
                         pass
                 else:
-                    # other env noise (fan/tv/steps...) => bark
+                    # env noise => bark
                     print(f"[ENV] rms={rms:.0f} score={feats['speech_score']:.2f} dbg={self._dbg_dict(feats)} -> BARK")
                     self._bark()
 
@@ -172,10 +228,6 @@ class ActiveListenerV2:
 
     # ---------- NOISE FLOOR ----------
     def _calibrate_noise_floor(self):
-        """
-        Learn environment baseline RMS for a few seconds.
-        Uses median to ignore occasional spikes.
-        """
         secs = max(1.0, float(self.cfg.noise_calib_sec))
         n_chunks = int(math.ceil(secs / max(0.2, self.cfg.detect_chunk_sec)))
         samples = []
@@ -210,9 +262,6 @@ class ActiveListenerV2:
     def _passes_gate(self, rms: float) -> bool:
         if self._noise_rms is None:
             return rms >= float(self.cfg.min_rms_floor)
-
-        # convert to dB ratio: gate_db_above_noise
-        # rms >= noise * 10^(db/20)
         thr = self._noise_rms * (10.0 ** (float(self.cfg.gate_db_above_noise) / 20.0))
         return rms >= thr
 
@@ -296,7 +345,6 @@ class ActiveListenerV2:
         high_ratio = e_high / (total + 1e-9)
         low_ratio = e_low / (total + 1e-9)
 
-        # speech score (slightly reweighted)
         score = 0.0
         score += (1.0 - min(1.0, flatness * 3.0)) * 0.40
         score += min(1.0, speech_ratio * 3.2) * 0.50
@@ -326,7 +374,6 @@ class ActiveListenerV2:
 
     # ---------- CLAP DETECT ----------
     def _is_clap(self, feats: Dict[str, float]) -> bool:
-        # clap: short impulse => peak/rms high, high_ratio relatively high, zcr high-ish
         return (
             feats["peak_ratio"] >= float(self.cfg.clap_peak_ratio)
             and feats["high_ratio"] >= float(self.cfg.clap_high_ratio)
@@ -441,17 +488,8 @@ class ActiveListenerV2:
         except Exception:
             return False
 
+    # ✅ UPDATED: play reply audio BLOCKING + mic off while playing
     def _handle_server_reply(self, resp: Dict[str, Any]):
-        """
-        Expected server response:
-        {
-            status, transcript, label, reply_text, audio_url, used_vision?
-        }
-
-        - label == "clap"  -> bark locally, skip TTS
-        - otherwise        -> download audio_url -> play by robot_hat.Music
-        - always append memory jsonl
-        """
         transcript = (resp.get("transcript") or "").strip()
         label = (resp.get("label") or "unknown").strip()
         reply_text = (resp.get("reply_text") or "").strip()
@@ -463,7 +501,6 @@ class ActiveListenerV2:
             print("[BOT  ]", reply_text)
         print("[AUDIO]", audio_url)
 
-        # save memory
         self._append_memory({
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "transcript": transcript,
@@ -472,7 +509,7 @@ class ActiveListenerV2:
             "audio_url": audio_url,
         })
 
-        # ✅ clap => bark locally, no TTS
+        # nếu server trả label clap thì bark local
         if label.lower() == "clap":
             print(f"[CLAP->BARK] bark x{self.cfg.bark_times}")
             self._bark()
@@ -481,38 +518,21 @@ class ActiveListenerV2:
         if not audio_url:
             return
 
-        # download to temp and play
         tmpdir = tempfile.mkdtemp(prefix="al2_play_")
         local = os.path.join(tmpdir, "reply.mp3")
         try:
-            ok = self._download(audio_url, local)
-            if not ok:
+            if not self._download(audio_url, local):
                 print("[PLAY] download failed:", audio_url)
                 return
 
-            self._playing = True
-            try:
-                # try common signatures of robot_hat.Music.music_play
-                try:
-                    # some versions use loops
-                    self.music.music_play(local, loops=1)
-                except TypeError:
-                    try:
-                        # some versions use loop
-                        self.music.music_play(local, loop=1)
-                    except TypeError:
-                        # fallback: no loop arg
-                        self.music.music_play(local)
-            except Exception as e:
-                print("[PLAY] error:", e)
-            finally:
-                self._playing = False
+            # ✅ phát BLOCKING để không cắt + mic off
+            self._music_play_blocking(local, times=1)
+
         finally:
             try:
                 shutil.rmtree(tmpdir, ignore_errors=True)
             except Exception:
                 pass
-
 
 
 def main():
@@ -530,9 +550,10 @@ def main():
         bark_times=2,
         cam_dev="/dev/video0",
         cam_backend="v4l2",
-        # bạn có thể tăng gate_db_above_noise lên 12-15 nếu phòng ồn
         gate_db_above_noise=10.0,
         speech_score_threshold=0.62,
+        playback_cooldown_sec=0.7,
+        volume=80,
     )
 
     al = ActiveListenerV2(cfg)
