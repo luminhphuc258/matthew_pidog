@@ -442,16 +442,29 @@ class ActiveListenerV2:
             return False
 
     def _handle_server_reply(self, resp: Dict[str, Any]):
+        """
+        Expected server response fields:
+        {
+            status, transcript, label, reply_text, audio_url, used_vision?
+        }
+
+        Behavior:
+        - label == "clap"  -> bark locally, no TTS playback
+        - otherwise        -> download audio_url (mp3) and play via robot_hat.Music
+        - always save memory entry to jsonl
+        """
         transcript = (resp.get("transcript") or "").strip()
-        label = resp.get("label") or "unknown"
+        label = (resp.get("label") or "unknown").strip()
         reply_text = (resp.get("reply_text") or "").strip()
         audio_url = resp.get("audio_url")
 
         print("[SERVER] label=", label)
         print("[USER ]", transcript)
-        print("[BOT  ]", reply_text)
+        if reply_text:
+            print("[BOT  ]", reply_text)
         print("[AUDIO]", audio_url)
 
+        # save memory (store everything, including clap)
         self._append_memory({
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "transcript": transcript,
@@ -460,16 +473,30 @@ class ActiveListenerV2:
             "audio_url": audio_url,
         })
 
+        # ✅ NEW: clap => bark locally, skip audio_url / TTS
+        if label.lower() == "clap":
+            print(f"[CLAP->BARK] bark x{self.cfg.bark_times}")
+            self._bark()
+            return
+
+        # no audio -> nothing to play
         if not audio_url:
             return
 
+        # download + play mp3
         tmpdir = tempfile.mkdtemp(prefix="al2_play_")
         local = os.path.join(tmpdir, "reply.mp3")
         try:
             if self._download(audio_url, local):
-                self._music_play(local, times=1)
+                self._play_audio_file(local)
+            else:
+                print("[PLAY] download failed:", audio_url)
         finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
+            try:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+
 
 
 def main():
