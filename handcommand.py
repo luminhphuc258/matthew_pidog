@@ -71,29 +71,33 @@ class HandCfg:
     action_cooldown_sec: float = 0.45
 
     # ===== Direction by finger vectors (MCP->TIP) =====
-    dir_min_len: float = 0.10       # ignore short vectors (curled finger noise)
-    dir_axis_ratio: float = 1.25    # vertical if |dy| > r*|dx| ; horizontal if |dx| > r*|dy|
-    dir_votes_need: int = 2         # ✅ cần >=2 ngón vote cùng hướng mới ăn
+    dir_min_len: float = 0.10
+    dir_axis_ratio: float = 1.25
+    dir_votes_need: int = 2            # >=2 ngón vote cùng hướng
     prefer_vertical: bool = True
 
-    # debounce + anti-wave
-    dir_hold_frames: int = 4        # ✅ giữ cùng hướng N frames mới confirm
+    # debounce
+    dir_hold_frames: int = 4
     dir_require_still: bool = True
-    dir_still_max_speed: float = 0.06   # ✅ tay đang quăng mạnh thì bỏ direction
+    dir_still_max_speed: float = 0.06
 
     # ===== STOP (fist) =====
     fist_curl_min: float = 0.74
-    fist_need_extended_max: int = 1     # ✅ cho phép lòi 1 ngón vẫn STOP
-    fist_single_finger_max_ratio: float = 1.20  # nếu ngón đó duỗi quá thật => không coi STOP
+    fist_need_extended_max: int = 1
+    fist_single_finger_max_ratio: float = 1.20
 
-    # ===== WAVE =====
-    wave_min_open_fingers: int = 3      # ✅ >=3 ngón vẫn tính wave
-    wave_window_sec: float = 0.90
-    wave_min_amplitude_y: float = 0.06
-    wave_min_amplitude_x: float = 0.08
-    wave_min_swings: int = 2
-    wave_lock_sec: float = 1.10         # ✅ lock lâu hơn để direction không chen vào
-    wave_preempt_speed: float = 0.10    # ✅ tay di chuyển nhanh => chặn direction (ưu tiên wave)
+    # ===== WAVE (OPEN/CLOSE sequence) =====
+    wave_open_min_fingers: int = 3      # OPEN: 3..5
+    wave_close_max_fingers: int = 1     # CLOSE: 0..1
+
+    wave_window_sec: float = 3.5        # ✅ 3–4s cửa sổ
+    wave_need_toggles: int = 3          # ✅ số lần đổi OPEN<->CLOSE tối thiểu
+    wave_need_cycles: int = 2           # ✅ ít nhất 2 chu kỳ (OPEN->CLOSE->OPEN) ~ "vẫy"
+    wave_lock_sec: float = 1.0          # lock sau khi detect wave
+
+    # gating: khi đang "có vẻ wave" thì chặn direction để khỏi cướp
+    wave_preempt: bool = True
+    wave_preempt_min_events: int = 1    # chỉ cần đã thấy 1 event OPEN/CLOSE gần đây thì chặn direction
 
     # drawing
     draw_tip_radius: int = 7
@@ -125,11 +129,10 @@ class HandCommand:
     6 gestures:
       - LEFT, RIGHT, UP, DOWN, STOP, WAVE
 
-    Key behavior:
-      - WAVE priority + preempt gate: đang vẫy thì chặn direction
-      - WAVE only needs >=3 fingers visible
-      - Direction requires >=2 finger votes + hold frames + still-hand
-      - STOP tolerant: allow 1 finger leak if fist curl is strong
+    Changes in this version:
+      - Invert directions to match your real hand: RIGHT<->LEFT, UP<->DOWN
+      - WAVE detection: based on OPEN/CLOSE sequence within 3–4 seconds
+        OPEN = 3..5 fingers, CLOSE = 0..1 finger
     """
 
     # gestures
@@ -148,6 +151,12 @@ class HandCommand:
     S_MOVING = "MOVING"
     S_STOP = "STOP"
     S_UNKNOWN = "UNKNOWN"
+
+    # wave states
+    W_UNKNOWN = "UNK"
+    W_OPEN = "OPEN"
+    W_CLOSE = "CLOSE"
+    W_MID = "MID"   # 2 fingers etc.
 
     def __init__(
         self,
@@ -188,17 +197,17 @@ class HandCommand:
         self._fps_n = 0
         self._fps_val = 0.0
 
-        # wave history + lock
-        self._hist_x: List[Tuple[float, float]] = []
-        self._hist_y: List[Tuple[float, float]] = []
-        self._wave_lock_until: float = 0.0
-
         # direction debounce
         self._dir_last: Optional[str] = None
         self._dir_hold: int = 0
 
-        # wrist speed
+        # wrist speed (still-hand)
         self._last_wrist_xy: Optional[Tuple[float, float]] = None
+
+        # wave events: list of (ts, state OPEN/CLOSE)
+        self._wave_events: List[Tuple[float, str]] = []
+        self._wave_last_state: str = self.W_UNKNOWN
+        self._wave_lock_until: float = 0.0
 
         # mediapipe
         try:
@@ -279,12 +288,13 @@ class HandCommand:
             self._last.ts = _now()
 
         # reset states
-        self._hist_x.clear()
-        self._hist_y.clear()
-        self._wave_lock_until = 0.0
         self._dir_last = None
         self._dir_hold = 0
         self._last_wrist_xy = None
+
+        self._wave_events.clear()
+        self._wave_last_state = self.W_UNKNOWN
+        self._wave_lock_until = 0.0
 
         if on:
             self._update_last(gesture=None, action=None, face=None, bark=False, err=None)
@@ -365,7 +375,6 @@ class HandCommand:
                     "pinky": [PK_MCP, PK_PIP, PK_DIP, PK_TIP],
                 }
 
-                # ✅ vẽ “ngón nào đang extended” màu xanh
                 for name, chain in fingers.items():
                     on = bool(fext.get(name, False))
                     col = (0, 255, 0) if on else (80, 80, 80)
@@ -394,10 +403,8 @@ class HandCommand:
                 return self.get_frame_bgr()
             except Exception:
                 return None
-
         if self._cap is None:
             return None
-
         ok, frame = self._cap.read()
         if not ok:
             return None
@@ -483,41 +490,7 @@ class HandCommand:
         d_ti = math.sqrt(self._dist2_xy(pts, TH_TIP, IN_MCP))
         return (d_tw > 0.16) and (d_ti > 0.09)
 
-    def _wave_check(self, hist: List[Tuple[float, float]], v: float, amp_thresh: float) -> bool:
-        now = _now()
-        hist.append((now, v))
-        cut = now - self.cfg.wave_window_sec
-        while hist and hist[0][0] < cut:
-            hist.pop(0)
-
-        if len(hist) < 6:
-            return False
-
-        vs = [x for _, x in hist]
-        amp = max(vs) - min(vs)
-        if amp < amp_thresh:
-            return False
-
-        m = sum(vs) / len(vs)
-        signs = []
-        for x in vs:
-            d = x - m
-            if abs(d) < 0.012:
-                continue
-            signs.append(1 if d > 0 else -1)
-
-        if len(signs) < 4:
-            return False
-
-        changes = 0
-        for a, b in zip(signs[:-1], signs[1:]):
-            if a != b:
-                changes += 1
-
-        return changes >= self.cfg.wave_min_swings
-
     def _finger_dir_vote(self, pts) -> Optional[str]:
-        # vote by index/middle/ring/pinky (thumb is unstable)
         IN_MCP, IN_TIP = 5, 8
         MD_MCP, MD_TIP = 9, 12
         RG_MCP, RG_TIP = 13, 16
@@ -538,7 +511,6 @@ class HandCommand:
             adx = abs(dx)
             ady = abs(dy)
 
-            # y smaller => up
             if ady > self.cfg.dir_axis_ratio * adx:
                 if dy < 0:
                     votes["UP"] += 1
@@ -559,7 +531,6 @@ class HandCommand:
         if best_n < self.cfg.dir_votes_need:
             return None
 
-        # preference
         updown = max(votes["UP"], votes["DOWN"])
         leftright = max(votes["LEFT"], votes["RIGHT"])
 
@@ -577,6 +548,72 @@ class HandCommand:
         return best_dir
 
     # -------------------------
+    # Wave by OPEN/CLOSE sequence
+    # -------------------------
+
+    def _wave_state_from_fingers(self, finger_count: int) -> str:
+        if finger_count >= self.cfg.wave_open_min_fingers:
+            return self.W_OPEN
+        if finger_count <= self.cfg.wave_close_max_fingers:
+            return self.W_CLOSE
+        return self.W_MID
+
+    def _wave_push_event_if_needed(self, st: str):
+        """
+        Record transitions between OPEN and CLOSE only.
+        MID does not create events.
+        """
+        now = _now()
+        # cleanup old
+        cut = now - self.cfg.wave_window_sec
+        while self._wave_events and self._wave_events[0][0] < cut:
+            self._wave_events.pop(0)
+
+        if st not in (self.W_OPEN, self.W_CLOSE):
+            return
+
+        if self._wave_last_state == st:
+            return
+
+        # record event
+        self._wave_last_state = st
+        self._wave_events.append((now, st))
+
+        # cleanup again
+        while self._wave_events and self._wave_events[0][0] < cut:
+            self._wave_events.pop(0)
+
+    def _wave_detect(self) -> bool:
+        """
+        Detect wave when we have enough OPEN<->CLOSE toggles in window.
+        Also require enough "cycles": OPEN->CLOSE->OPEN counted.
+        """
+        now = _now()
+        cut = now - self.cfg.wave_window_sec
+        events = [(t, s) for (t, s) in self._wave_events if t >= cut]
+
+        if len(events) < 2:
+            return False
+
+        # count toggles
+        toggles = 0
+        for (_, a), (_, b) in zip(events[:-1], events[1:]):
+            if a != b:
+                toggles += 1
+
+        if toggles < self.cfg.wave_need_toggles:
+            return False
+
+        # count cycles: OPEN->CLOSE->OPEN
+        states = [s for _, s in events]
+        cycles = 0
+        for i in range(len(states) - 2):
+            if states[i] == self.W_OPEN and states[i + 1] == self.W_CLOSE and states[i + 2] == self.W_OPEN:
+                cycles += 1
+
+        return cycles >= self.cfg.wave_need_cycles
+
+    # -------------------------
     # Gesture inference
     # -------------------------
 
@@ -591,11 +628,12 @@ class HandCommand:
         if not res.multi_hand_landmarks:
             self._last_mp_landmarks = None
             self._last_pts = None
-            self._hist_x.clear()
-            self._hist_y.clear()
             self._dir_last = None
             self._dir_hold = 0
             self._last_wrist_xy = None
+
+            self._wave_events.clear()
+            self._wave_last_state = self.W_UNKNOWN
             return self.G_NONE, {}
 
         lm = res.multi_hand_landmarks[0]
@@ -603,7 +641,6 @@ class HandCommand:
         pts = [(p.x, p.y, p.z) for p in lm.landmark]
         self._last_pts = pts
 
-        # indices
         WRIST = 0
         IN_MCP, IN_TIP = 5, 8
         MD_MCP, MD_TIP = 9, 12
@@ -632,7 +669,7 @@ class HandCommand:
         }
         finger_count = sum(1 for v in finger_extended.values() if v)
 
-        # curl score for fist
+        # curl for fist
         c_idx = self._curl_score(pts, IN_TIP, IN_MCP, WRIST)
         c_mid = self._curl_score(pts, MD_TIP, MD_MCP, WRIST)
         c_rng = self._curl_score(pts, RG_TIP, RG_MCP, WRIST)
@@ -642,7 +679,7 @@ class HandCommand:
         info = {"finger_extended": finger_extended, "finger_count": finger_count}
         now = _now()
 
-        # ===== wrist speed =====
+        # ===== wrist speed (still-hand) =====
         wx, wy, _ = pts[WRIST]
         speed = 0.0
         if self._last_wrist_xy is not None:
@@ -654,29 +691,23 @@ class HandCommand:
         if now < self._wave_lock_until:
             return self.G_WAVE, info
 
-        # ---- 2) WAVE detect (>=3 fingers + oscillation) ----
-        wave_motion = (speed >= self.cfg.wave_preempt_speed)
-        wave_hit = False
+        # ---- 2) WAVE by OPEN/CLOSE sequence ----
+        st = self._wave_state_from_fingers(finger_count)
+        self._wave_push_event_if_needed(st)
 
-        if finger_count >= self.cfg.wave_min_open_fingers:
-            if self._wave_check(self._hist_y, wy, self.cfg.wave_min_amplitude_y) or \
-               self._wave_check(self._hist_x, wx, self.cfg.wave_min_amplitude_x):
-                wave_hit = True
-        else:
-            self._hist_x.clear()
-            self._hist_y.clear()
-
-        if wave_hit:
+        if self._wave_detect():
             self._wave_lock_until = now + self.cfg.wave_lock_sec
             self._dir_last = None
             self._dir_hold = 0
             return self.G_WAVE, info
 
-        # đang quăng tay mạnh + đủ ngón mở => CHẶN direction (đợi đủ swings để thành WAVE)
-        if wave_motion and finger_count >= self.cfg.wave_min_open_fingers:
-            self._dir_last = None
-            self._dir_hold = 0
-            return self.G_NONE, info
+        # gating: nếu đang có event OPEN/CLOSE gần đây, chặn direction để khỏi bị “cướp”
+        if self.cfg.wave_preempt:
+            # chỉ cần đã có ít nhất N event trong window
+            cut = now - self.cfg.wave_window_sec
+            recent_events = [1 for (t, _) in self._wave_events if t >= cut]
+            if len(recent_events) >= self.cfg.wave_preempt_min_events and st in (self.W_OPEN, self.W_CLOSE):
+                return self.G_NONE, info
 
         # ---- 3) STOP (fist tolerant) ----
         if avg_curl >= self.cfg.fist_curl_min and finger_count <= self.cfg.fist_need_extended_max:
@@ -702,7 +733,7 @@ class HandCommand:
             self._dir_hold = 0
             return self.G_NONE, info
 
-        d = self._finger_dir_vote(pts)  # UP/DOWN/LEFT/RIGHT or None
+        d = self._finger_dir_vote(pts)
         if d is None:
             self._dir_last = None
             self._dir_hold = 0
@@ -721,14 +752,16 @@ class HandCommand:
         self._dir_last = None
         self._dir_hold = 0
 
+        # ✅ INVERT directions as you requested:
+        # "UP -> DOWN", "DOWN -> UP", "LEFT -> RIGHT", "RIGHT -> LEFT"
         if d == "UP":
-            return self.G_UP, info
-        if d == "DOWN":
             return self.G_DOWN, info
+        if d == "DOWN":
+            return self.G_UP, info
         if d == "LEFT":
-            return self.G_LEFT, info
-        if d == "RIGHT":
             return self.G_RIGHT, info
+        if d == "RIGHT":
+            return self.G_LEFT, info
 
         return self.G_NONE, info
 
@@ -763,14 +796,13 @@ class HandCommand:
             return
 
         self._last_action_ts = now
-
         self._write_memory(gesture, action, face, bark, next_state)
         self._update_last(action=action, face=face, bark=bark, robot_state=next_state, ts=_now())
 
         print(f"[HandCommand] {gesture} => {action}", flush=True)
 
     def _map_gesture_to_action(self, gesture: str, robot_state: str) -> Tuple[Optional[str], Optional[str], bool, str]:
-        # ✅ bạn đổi mapping tùy ý
+        # bạn có thể đổi mapping tùy ý
         if gesture == self.G_UP:
             return ("FORWARD", "suprise", False, self.S_MOVING)
         if gesture == self.G_DOWN:
