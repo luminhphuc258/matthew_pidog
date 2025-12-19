@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# ==========================
-# FIX OPENCV / GSTREAMER
-# ==========================
 import os
 os.environ.setdefault("OPENCV_VIDEOIO_PRIORITY_GSTREAMER", "0")
 os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
@@ -35,22 +32,34 @@ class ListenerCfg:
     # audio
     mic_device: str = "default"
     sample_rate: int = 16000
-    detect_chunk_sec: float = 0.9
-    record_sec: float = 4.0
-    min_rms: float = 900.0
-    speech_score_threshold: float = 0.55
+
+    detect_chunk_sec: float = 0.6     # ngắn hơn để bắt clap tốt
+    record_sec: float = 6.0
+
+    # ===== auto noise gate =====
+    noise_calib_sec: float = 2.0      # thời gian học nền lúc start
+    gate_db_above_noise: float = 10.0 # chỉ trigger khi lớn hơn nền ~10dB
+    min_rms_floor: float = 700.0      # chặn những máy rất yên tĩnh bị gate quá thấp
+
+    # speech score
+    speech_score_threshold: float = 0.62  # tăng lên để bớt nhạy
+
+    # clap detector
+    clap_peak_ratio: float = 5.0      # peak/rms lớn => xung mạnh
+    clap_high_ratio: float = 0.12     # nhiều high freq
+    clap_zcr: float = 0.10            # zcr cao
 
     # server
     server_url: str = "https://embeddedprogramming-healtheworldserver.up.railway.app/pi_upload_audio_v2"
     timeout_sec: float = 30.0
 
-    # camera (Brio)
+    # camera
     cam_dev: str = "/dev/video0"
     cam_w: int = 640
     cam_h: int = 480
     jpeg_quality: int = 80
     cam_warmup_frames: int = 6
-    cam_backend: str = "v4l2"  # force v4l2
+    cam_backend: str = "v4l2"
 
     # memory
     memory_file: str = "robot_memory.jsonl"
@@ -71,31 +80,23 @@ class ActiveListenerV2:
         self._mem_path = Path(self.cfg.memory_file)
         self._bark_path = Path(self.cfg.bark_wav)
 
-    def stop(self):
-        self._stop = True
+        # learned noise level
+        self._noise_rms = None  # float
 
-    # -------------------- SAFE MUSIC PLAY --------------------
+    # ---------- SAFE MUSIC PLAY ----------
     def _music_play(self, filepath: str, times: int = 1):
-        """
-        robot_hat.Music.music_play() trên máy bạn dùng param `loops` (not loop).
-        Một số version khác có thể là `loop`.
-        Hàm này tự fallback cho cả 2.
-        """
         self._playing = True
         try:
-            # try loops=
             try:
                 self.music.music_play(filepath, loops=int(times))
                 return
             except TypeError:
                 pass
-            # fallback loop=
             try:
                 self.music.music_play(filepath, loop=int(times))
                 return
             except TypeError:
                 pass
-            # fallback no param
             for _ in range(max(1, int(times))):
                 self.music.music_play(filepath)
         except Exception as e:
@@ -103,9 +104,20 @@ class ActiveListenerV2:
         finally:
             self._playing = False
 
-    # -------------------- MAIN LOOP --------------------
+    def _bark(self):
+        if not self._bark_path.exists():
+            print(f"[WARN] bark file not found: {self._bark_path}")
+            return
+        self._music_play(str(self._bark_path), times=int(self.cfg.bark_times))
+
+    def stop(self):
+        self._stop = True
+
+    # ---------- MAIN ----------
     def run_forever(self):
         print("[ActiveListenerV2] start listening...")
+        self._calibrate_noise_floor()
+
         while not self._stop:
             if self._playing:
                 time.sleep(0.05)
@@ -113,35 +125,44 @@ class ActiveListenerV2:
 
             wav_path = self._record_wav(seconds=self.cfg.detect_chunk_sec)
             if not wav_path:
-                time.sleep(0.1)
+                time.sleep(0.08)
                 continue
 
             try:
-                rms, score, dbg = self._classify_chunk(wav_path)
-                if rms < self.cfg.min_rms:
+                feats = self._extract_features(wav_path)
+                rms = feats["rms"]
+
+                # dynamic gate based on noise floor
+                if not self._passes_gate(rms):
                     continue
 
-                if score < self.cfg.speech_score_threshold:
-                    print(f"[ENV] rms={rms:.0f} score={score:.2f} dbg={dbg} -> BARK x{self.cfg.bark_times}")
+                # clap check first (because clap is short impulse)
+                if self._is_clap(feats):
+                    print(f"[CLAP] rms={rms:.0f} peak/rms={feats['peak_ratio']:.1f} hi={feats['high_ratio']:.3f} zcr={feats['zcr']:.3f} -> BARK")
                     self._bark()
                     continue
 
-                print(f"[SPEECH] rms={rms:.0f} score={score:.2f} dbg={dbg} -> record full")
-                full_wav = self._record_wav(seconds=self.cfg.record_sec)
-                if not full_wav:
-                    continue
+                # speech check
+                if feats["speech_score"] >= self.cfg.speech_score_threshold:
+                    print(f"[SPEECH] rms={rms:.0f} score={feats['speech_score']:.2f} dbg={self._dbg_dict(feats)} -> record full")
 
-                image_bytes = self._capture_jpeg_frame()  # optional
-                resp = self._send_to_server(full_wav, image_bytes=image_bytes)
-                if not resp:
-                    continue
+                    full_wav = self._record_wav(seconds=self.cfg.record_sec)
+                    if not full_wav:
+                        continue
 
-                self._handle_server_reply(resp)
+                    image_bytes = self._capture_jpeg_frame()
+                    resp = self._send_to_server(full_wav, image_bytes=image_bytes)
+                    if resp:
+                        self._handle_server_reply(resp)
 
-                try:
-                    os.remove(full_wav)
-                except Exception:
-                    pass
+                    try:
+                        os.remove(full_wav)
+                    except Exception:
+                        pass
+                else:
+                    # other env noise (fan/tv/steps...) => bark
+                    print(f"[ENV] rms={rms:.0f} score={feats['speech_score']:.2f} dbg={self._dbg_dict(feats)} -> BARK")
+                    self._bark()
 
             finally:
                 try:
@@ -149,7 +170,53 @@ class ActiveListenerV2:
                 except Exception:
                     pass
 
-    # -------------------- AUDIO RECORD --------------------
+    # ---------- NOISE FLOOR ----------
+    def _calibrate_noise_floor(self):
+        """
+        Learn environment baseline RMS for a few seconds.
+        Uses median to ignore occasional spikes.
+        """
+        secs = max(1.0, float(self.cfg.noise_calib_sec))
+        n_chunks = int(math.ceil(secs / max(0.2, self.cfg.detect_chunk_sec)))
+        samples = []
+
+        print(f"[CALIB] measuring noise floor for ~{secs:.1f}s ... keep quiet if possible")
+        for _ in range(max(2, n_chunks)):
+            if self._stop:
+                break
+            p = self._record_wav(seconds=self.cfg.detect_chunk_sec)
+            if not p:
+                continue
+            try:
+                x = self._read_wav_pcm16(p)
+                if x is None or len(x) < 256:
+                    continue
+                rms = float(np.sqrt(np.mean(x * x) + 1e-9))
+                samples.append(rms)
+            finally:
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+        if not samples:
+            self._noise_rms = float(self.cfg.min_rms_floor)
+        else:
+            med = float(np.median(np.array(samples)))
+            self._noise_rms = max(float(self.cfg.min_rms_floor), med)
+
+        print(f"[CALIB] noise_rms≈{self._noise_rms:.0f}  gate=+{self.cfg.gate_db_above_noise:.1f}dB")
+
+    def _passes_gate(self, rms: float) -> bool:
+        if self._noise_rms is None:
+            return rms >= float(self.cfg.min_rms_floor)
+
+        # convert to dB ratio: gate_db_above_noise
+        # rms >= noise * 10^(db/20)
+        thr = self._noise_rms * (10.0 ** (float(self.cfg.gate_db_above_noise) / 20.0))
+        return rms >= thr
+
+    # ---------- AUDIO RECORD ----------
     def _record_wav(self, seconds: float) -> Optional[str]:
         if seconds <= 0:
             return None
@@ -188,24 +255,24 @@ class ActiveListenerV2:
         import wave
         try:
             with wave.open(wav_path, "rb") as wf:
-                nchan = wf.getnchannels()
-                sampw = wf.getsampwidth()
-                if nchan != 1 or sampw != 2:
+                if wf.getnchannels() != 1 or wf.getsampwidth() != 2:
                     return None
                 raw = wf.readframes(wf.getnframes())
             return np.frombuffer(raw, dtype=np.int16).astype(np.float32)
         except Exception:
             return None
 
-    # -------------------- CLASSIFY --------------------
-    def _classify_chunk(self, wav_path: str) -> Tuple[float, float, Dict[str, float]]:
+    # ---------- FEATURE EXTRACT ----------
+    def _extract_features(self, wav_path: str) -> Dict[str, float]:
         x = self._read_wav_pcm16(wav_path)
         if x is None or len(x) < 256:
-            return 0.0, 0.0, {}
+            return {"rms": 0.0, "speech_score": 0.0, "flatness": 1.0, "speech_ratio": 0.0, "high_ratio": 0.0, "low_ratio": 0.0, "zcr": 0.0, "peak_ratio": 0.0}
 
         rms = float(np.sqrt(np.mean(x * x) + 1e-9))
-        y = x / (np.max(np.abs(x)) + 1e-9)
+        peak = float(np.max(np.abs(x)) + 1e-9)
+        peak_ratio = float(peak / (rms + 1e-9))
 
+        y = x / (np.max(np.abs(x)) + 1e-9)
         zc = float(np.mean(y[1:] * y[:-1] < 0.0))
 
         sr = self.cfg.sample_rate
@@ -223,35 +290,50 @@ class ActiveListenerV2:
         e_speech = band_energy(300, 3400)
         e_high = band_energy(5000, 7500)
         e_low = band_energy(50, 250)
-
         total = float(np.sum(ps))
+
         speech_ratio = e_speech / (total + 1e-9)
         high_ratio = e_high / (total + 1e-9)
         low_ratio = e_low / (total + 1e-9)
 
+        # speech score (slightly reweighted)
         score = 0.0
-        score += (1.0 - min(1.0, flatness * 3.0)) * 0.45
-        score += min(1.0, speech_ratio * 3.0) * 0.45
+        score += (1.0 - min(1.0, flatness * 3.0)) * 0.40
+        score += min(1.0, speech_ratio * 3.2) * 0.50
         score += (1.0 - min(1.0, high_ratio * 6.0)) * 0.10
         score = float(max(0.0, min(1.0, score)))
 
-        dbg = {
+        return {
+            "rms": rms,
+            "speech_score": score,
             "flatness": float(flatness),
             "speech_ratio": float(speech_ratio),
             "high_ratio": float(high_ratio),
             "low_ratio": float(low_ratio),
             "zcr": float(zc),
+            "peak_ratio": peak_ratio,
         }
-        return rms, score, dbg
 
-    # -------------------- BARK --------------------
-    def _bark(self):
-        if not self._bark_path.exists():
-            print(f"[WARN] bark file not found: {self._bark_path}")
-            return
-        self._music_play(str(self._bark_path), times=int(self.cfg.bark_times))
+    def _dbg_dict(self, feats: Dict[str, float]) -> Dict[str, float]:
+        return {
+            "flat": round(feats["flatness"], 4),
+            "sp": round(feats["speech_ratio"], 4),
+            "hi": round(feats["high_ratio"], 4),
+            "zcr": round(feats["zcr"], 4),
+            "pk": round(feats["peak_ratio"], 2),
+            "noise": round(float(self._noise_rms or 0.0), 1),
+        }
 
-    # -------------------- CAMERA --------------------
+    # ---------- CLAP DETECT ----------
+    def _is_clap(self, feats: Dict[str, float]) -> bool:
+        # clap: short impulse => peak/rms high, high_ratio relatively high, zcr high-ish
+        return (
+            feats["peak_ratio"] >= float(self.cfg.clap_peak_ratio)
+            and feats["high_ratio"] >= float(self.cfg.clap_high_ratio)
+            and feats["zcr"] >= float(self.cfg.clap_zcr)
+        )
+
+    # ---------- CAMERA ----------
     def _capture_jpeg_frame(self) -> Optional[bytes]:
         if cv2 is None:
             return None
@@ -261,13 +343,11 @@ class ActiveListenerV2:
             backend = cv2.CAP_V4L2 if self.cfg.cam_backend.lower() == "v4l2" else 0
             cap = cv2.VideoCapture(self.cfg.cam_dev, backend)
             if not cap.isOpened():
-                print("[CAM] cannot open:", self.cfg.cam_dev)
                 return None
 
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg.cam_w)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg.cam_h)
 
-            # Try MJPG for Brio
             try:
                 fourcc = cv2.VideoWriter_fourcc(*"MJPG")
                 cap.set(cv2.CAP_PROP_FOURCC, fourcc)
@@ -281,18 +361,14 @@ class ActiveListenerV2:
                     frame = fr
 
             if frame is None:
-                print("[CAM] read failed")
                 return None
 
-            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), int(self.cfg.jpeg_quality)]
-            ok2, buf = cv2.imencode(".jpg", frame, encode_param)
+            ok2, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.cfg.jpeg_quality)])
             if not ok2:
-                print("[CAM] encode failed")
                 return None
             return buf.tobytes()
 
-        except Exception as e:
-            print("[CAM] error:", e)
+        except Exception:
             return None
         finally:
             try:
@@ -301,7 +377,7 @@ class ActiveListenerV2:
             except Exception:
                 pass
 
-    # -------------------- MEMORY --------------------
+    # ---------- MEMORY ----------
     def _load_recent_memory(self) -> List[Dict[str, Any]]:
         if not self._mem_path.exists():
             return []
@@ -327,7 +403,7 @@ class ActiveListenerV2:
         except Exception as e:
             print("[MEM] write error:", e)
 
-    # -------------------- SERVER --------------------
+    # ---------- SERVER ----------
     def _send_to_server(self, wav_path: str, image_bytes: Optional[bytes]) -> Optional[Dict[str, Any]]:
         mem = self._load_recent_memory()
         meta = {"ts": time.time(), "client": "pidog", "memory": mem}
@@ -396,9 +472,6 @@ class ActiveListenerV2:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ==========================
-# MAIN (BOOT by MotionController)
-# ==========================
 def main():
     POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
     mc = MotionController(pose_file=POSE_FILE)
@@ -413,11 +486,10 @@ def main():
         bark_wav="tiengsua.wav",
         bark_times=2,
         cam_dev="/dev/video0",
-        cam_w=640,
-        cam_h=480,
         cam_backend="v4l2",
-        cam_warmup_frames=6,
-        memory_file="robot_memory.jsonl",
+        # bạn có thể tăng gate_db_above_noise lên 12-15 nếu phòng ồn
+        gate_db_above_noise=10.0,
+        speech_score_threshold=0.62,
     )
 
     al = ActiveListenerV2(cfg)
