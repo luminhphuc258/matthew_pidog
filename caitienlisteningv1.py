@@ -178,12 +178,12 @@ class ListenerCfg:
     record_sec: float = 6.0
 
     # noise gate
-    noise_calib_sec: float = 2.0
-    gate_db_above_noise: float = 10.0
-    min_rms_floor: float = 700.0
+    noise_calib_sec: float = 1.2
+    gate_db_above_noise: float = 6.0
+    min_rms_floor: float = 500.0
 
     # speech score
-    speech_score_threshold: float = 0.62
+    speech_score_threshold: float = 0.52
 
     # clap detector
     clap_peak_ratio: float = 5.0
@@ -211,10 +211,10 @@ class ListenerCfg:
     bark_times: int = 2
 
     # playback cooldown to avoid self-trigger
-    playback_cooldown_sec: float = 0.8
+    playback_cooldown_sec: float = 1.5
 
     # speaker volume 0-100
-    volume: int = 80
+    volume: int = 90
 
     # face behavior
     face_idle: str = "what_is_it"
