@@ -3,25 +3,63 @@
 
 import json
 import os
+import time
 import signal
 import subprocess
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-PORT = 9900
+PORT = int(os.environ.get("VIDEO_PORT", "9900"))
 
-# đổi đúng tên service mặt robot của bạn (ví dụ face3d.service)
-FACE_SERVICE = os.environ.get("FACE_SERVICE", "face3d.service")
+# Mặc định đúng theo service bạn đang có
+FACE_SERVICE = os.environ.get("FACE_SERVICE", "robot-face.service")
 
-CHROMIUM = os.environ.get("CHROMIUM_BIN", "chromium-browser")
+# Nên set ENV CHROMIUM_BIN=/usr/bin/chromium trong .service
+CHROMIUM = os.environ.get("CHROMIUM_BIN", "/usr/bin/chromium")
 
 chromium_proc = None
 
+
+def _run_systemctl(action: str, service: str):
+    """
+    Try user service first (systemctl --user), then system service.
+    """
+    # try --user
+    try:
+        subprocess.run(
+            ["systemctl", "--user", action, service],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # không return luôn vì có trường hợp --user không có session -> fail silent
+    except Exception:
+        pass
+
+    # fallback system service
+    try:
+        subprocess.run(
+            ["sudo", "systemctl", action, service],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        # fallback không sudo (nếu service cho phép)
+        subprocess.run(
+            ["systemctl", action, service],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
 def face_stop():
-    # nếu mặt chạy bằng systemd user thì dùng --user
-    subprocess.run(["systemctl", "stop", FACE_SERVICE], check=False)
+    _run_systemctl("stop", FACE_SERVICE)
+
 
 def face_start():
-    subprocess.run(["systemctl", "start", FACE_SERVICE], check=False)
+    _run_systemctl("start", FACE_SERVICE)
+
 
 def video_stop():
     global chromium_proc
@@ -36,8 +74,14 @@ def video_stop():
                 pass
     chromium_proc = None
 
-def video_play(url: str):
+
+def video_play(url: str) -> bool:
+    """
+    Start chromium in kiosk mode for given url.
+    Return True if process started and still alive after a short delay.
+    """
     global chromium_proc
+    url = (url or "").strip()
     if not url:
         return False
 
@@ -45,20 +89,57 @@ def video_play(url: str):
     face_stop()
     video_stop()
 
+    # isolate profile to avoid "restore tabs / crash bubbles"
+    user_data_dir = "/tmp/chromium-kiosk-profile"
+    os.makedirs(user_data_dir, exist_ok=True)
+
     cmd = [
         CHROMIUM,
-        "--autoplay-policy=no-user-gesture-required",
         "--kiosk",
-        "--noerrdialogs",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--autoplay-policy=no-user-gesture-required",
         "--disable-infobars",
-        "--app=" + url
+        "--disable-session-crashed-bubble",
+        "--disable-features=TranslateUI",
+        "--disable-component-update",
+        "--noerrdialogs",
+        f"--user-data-dir={user_data_dir}",
+        "--new-window",
+        url,
     ]
-    chromium_proc = subprocess.Popen(cmd)
+
+    try:
+        chromium_proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        print("[VIDEO] failed to spawn chromium:", e)
+        chromium_proc = None
+        # mở lại mặt nếu play fail
+        face_start()
+        return False
+
+    # give it a moment; if it exits immediately => fail
+    time.sleep(0.25)
+    if chromium_proc.poll() is not None:
+        print("[VIDEO] chromium exited immediately. check DISPLAY/XAUTHORITY or url")
+        chromium_proc = None
+        face_start()
+        return False
+
     return True
 
+
 class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        # giảm spam log của BaseHTTPRequestHandler
+        return
+
     def _json(self, code, payload):
-        b = json.dumps(payload).encode("utf-8")
+        b = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(b)))
@@ -88,15 +169,37 @@ class Handler(BaseHTTPRequestHandler):
             face_start()
             return self._json(200, {"ok": True, "action": "face"})
 
+        if self.path == "/status":
+            alive = bool(chromium_proc and chromium_proc.poll() is None)
+            return self._json(200, {
+                "ok": True,
+                "playing": alive,
+                "face_service": FACE_SERVICE,
+                "chromium": CHROMIUM,
+                "display": os.environ.get("DISPLAY", ""),
+            })
+
         return self._json(404, {"ok": False, "error": "not found"})
+
 
 def main():
     server = HTTPServer(("127.0.0.1", PORT), Handler)
+
+    def _handle_term(sig, frame):
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+
+    signal.signal(signal.SIGTERM, _handle_term)
+    signal.signal(signal.SIGINT, _handle_term)
+
     print(f"robot_video_player listening on 127.0.0.1:{PORT}")
     try:
         server.serve_forever()
     finally:
         video_stop()
+
 
 if __name__ == "__main__":
     main()
