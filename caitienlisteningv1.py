@@ -11,6 +11,8 @@ import math
 import shutil
 import tempfile
 import subprocess
+import threading
+import socket
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -27,22 +29,49 @@ from robot_hat import Music
 from motion_controller import MotionController
 
 
+# =========================
+# Face UDP helper (your pygame face service)
+# =========================
+FACE_UDP_HOST = "127.0.0.1"
+FACE_UDP_PORT = 39393
+VALID_EMOS = {"love_eyes", "music", "what_is_it", "suprise", "sleep", "sad", "angry"}  # match your face code
+
+
+def _udp_send(msg: str):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.sendto(msg.encode("utf-8", "ignore"), (FACE_UDP_HOST, FACE_UDP_PORT))
+        s.close()
+    except Exception:
+        pass
+
+
+def set_face(emo: str):
+    if emo in VALID_EMOS:
+        _udp_send(f"EMO {emo}")
+
+
+def set_mouth(level01: float):
+    level01 = max(0.0, min(1.0, float(level01)))
+    _udp_send(f"MOUTH {level01:.3f}")
+
+
 @dataclass
 class ListenerCfg:
-    # audio
+    # audio input
     mic_device: str = "default"
     sample_rate: int = 16000
 
     detect_chunk_sec: float = 0.6
     record_sec: float = 6.0
 
-    # ===== auto noise gate (LOWER like old) =====
-    noise_calib_sec: float = 1.2          # giống log bạn đang thấy
-    gate_db_above_noise: float = 4.0      # ✅ thấp như cũ (dễ kích hoạt)
-    min_rms_floor: float = 200.0          # ✅ thấp hơn để khỏi “im lặng”
+    # ===== auto noise gate (LOW like your old) =====
+    noise_calib_sec: float = 1.2
+    gate_db_above_noise: float = 4.0
+    min_rms_floor: float = 200.0
 
-    # speech score (LOWER like old)
-    speech_score_threshold: float = 0.55  # ✅ dễ bắt giọng hơn
+    # speech score (LOW)
+    speech_score_threshold: float = 0.55
 
     # clap detector
     clap_peak_ratio: float = 5.0
@@ -69,18 +98,36 @@ class ListenerCfg:
     bark_wav: str = "tiengsua.wav"
     bark_times: int = 2
 
-    # cooldown sau khi phát loa để khỏi tự kích hoạt lại
+    # cooldown after playback to avoid self-trigger
     playback_cooldown_sec: float = 0.7
 
-    # volume (0-100)
+    # volume
     volume: int = 80
+
+    # ===== VIDEO PLAYER SERVICE (YouTube) =====
+    # If your systemd service name different -> change this
+    video_service_name: str = "robot-video-player.service"
+
+    # How to pass URL to service:
+    # Default: set env ROBOT_VIDEO_URL then restart service
+    video_env_key: str = "ROBOT_VIDEO_URL"
+
+    # Use user systemctl? If service is system-level, set False and use ["systemctl", ...] without "--user"
+    systemctl_user: bool = True
+
+    # Optional: when video starts, keep listening for clap to stop video (recommended)
+    allow_clap_stop_video: bool = True
 
 
 class ActiveListenerV2:
     def __init__(self, cfg: ListenerCfg):
         self.cfg = cfg
-        self._playing = False
         self._stop = False
+
+        # playback state
+        self._playing_audio = False
+        self._playing_video = False
+        self._cooldown_until = 0.0
 
         self.music = Music()
         try:
@@ -92,7 +139,6 @@ class ActiveListenerV2:
         self._bark_path = Path(self.cfg.bark_wav)
 
         self._noise_rms: Optional[float] = None
-        self._cooldown_until = 0.0
 
         # unlock speaker pin if needed
         try:
@@ -101,10 +147,70 @@ class ActiveListenerV2:
         except Exception:
             pass
 
+        # default face
+        set_face("what_is_it")
+        set_mouth(0.0)
+
     def stop(self):
         self._stop = True
 
-    # ---------- duration helper ----------
+    # ----------------------------
+    # System command helpers
+    # ----------------------------
+    def _run(self, cmd: List[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+    def _systemctl(self, args: List[str]) -> bool:
+        base = ["systemctl"]
+        if self.cfg.systemctl_user:
+            base += ["--user"]
+        p = self._run(base + args)
+        return p.returncode == 0
+
+    # ----------------------------
+    # Video controls
+    # ----------------------------
+    def _start_video_youtube(self, url: str):
+        url = (url or "").strip()
+        if not url:
+            return
+        # stop audio to avoid mixing
+        self._stop_audio_playback()
+
+        # set env for service and restart
+        ok1 = self._systemctl(["set-environment", f"{self.cfg.video_env_key}={url}"])
+        ok2 = self._systemctl(["restart", self.cfg.video_service_name])
+
+        self._playing_video = bool(ok1 and ok2)
+        print(f"[VIDEO] start url={url} ok={self._playing_video}")
+
+        # video is on screen; still set face state in background
+        set_face("music")
+        set_mouth(0.0)
+
+        # small cooldown to avoid instant re-trigger
+        self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
+
+    def _stop_video(self):
+        ok = self._systemctl(["stop", self.cfg.video_service_name])
+        self._playing_video = False
+        print(f"[VIDEO] stop ok={ok}")
+        # back to robot face
+        set_face("what_is_it")
+        set_mouth(0.0)
+        self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
+
+    # ----------------------------
+    # Audio playback (blocking) + lipsync
+    # ----------------------------
+    def _stop_audio_playback(self):
+        # robot_hat Music sometimes has music_stop(); try best-effort
+        try:
+            if hasattr(self.music, "music_stop"):
+                self.music.music_stop()
+        except Exception:
+            pass
+
     def _get_audio_duration_sec(self, filepath: str) -> Optional[float]:
         p = str(filepath)
         if p.lower().endswith(".wav"):
@@ -131,15 +237,63 @@ class ActiveListenerV2:
             pass
         return None
 
-    # ---------- SAFE MUSIC PLAY (BLOCKING) ----------
-    def _music_play_blocking(self, filepath: str, times: int = 1):
-        self._playing = True
+    def _lipsync_worker(self, audio_path: str, stop_evt: threading.Event):
+        """
+        Decode audio -> estimate envelope -> send MOUTH level.
+        Uses ffmpeg to output raw s16le mono 16k.
+        """
+        try:
+            cmd = [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-i", audio_path,
+                "-ac", "1", "-ar", "16000",
+                "-f", "s16le", "pipe:1"
+            ]
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            chunk_samples = int(16000 * 0.05)  # 50ms
+            chunk_bytes = chunk_samples * 2
+            while not stop_evt.is_set():
+                buf = p.stdout.read(chunk_bytes) if p.stdout else b""
+                if not buf:
+                    break
+                x = np.frombuffer(buf, dtype=np.int16).astype(np.float32)
+                rms = float(np.sqrt(np.mean(x * x) + 1e-9))
+                # map rms -> 0..1 (tune)
+                level = min(1.0, max(0.0, (rms / 4000.0)))
+                set_mouth(level)
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        finally:
+            set_mouth(0.0)
+
+    def _music_play_blocking_with_lipsync(self, filepath: str, times: int = 1):
+        """
+        Play audio blocking AND lipsync mouth.
+        During playback: mic skip.
+        """
+        self._playing_audio = True
+        stop_evt = threading.Event()
+        th = None
         try:
             dur = self._get_audio_duration_sec(filepath)
             loops = max(1, int(times))
 
+            # face talking
+            set_face("suprise")
+            set_mouth(0.0)
+
+            # start lipsync thread
+            th = threading.Thread(target=self._lipsync_worker, args=(filepath, stop_evt), daemon=True)
+            th.start()
+
+            # play
             self.music.music_play(str(filepath), loops=loops)
 
+            # block
             if dur is not None:
                 time.sleep(dur * loops + 0.15)
             else:
@@ -148,24 +302,57 @@ class ActiveListenerV2:
         except Exception as e:
             print("[PLAY] error:", e)
         finally:
-            self._playing = False
+            stop_evt.set()
+            try:
+                if th:
+                    th.join(timeout=0.3)
+            except Exception:
+                pass
+
+            self._playing_audio = False
+            set_mouth(0.0)
+            set_face("what_is_it")
             self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
 
     def _bark(self):
         if not self._bark_path.exists():
             print(f"[WARN] bark file not found: {self._bark_path}")
             return
-        self._music_play_blocking(str(self._bark_path), times=int(self.cfg.bark_times))
+        # bark face
+        set_face("sad")
+        set_mouth(0.0)
+        # bark audio (no lipsync needed)
+        self._playing_audio = True
+        try:
+            self.music.music_play(str(self._bark_path), loops=max(1, int(self.cfg.bark_times)))
+            dur = self._get_audio_duration_sec(str(self._bark_path))
+            if dur:
+                time.sleep(dur * max(1, int(self.cfg.bark_times)) + 0.15)
+            else:
+                time.sleep(2.2 * max(1, int(self.cfg.bark_times)))
+        finally:
+            self._playing_audio = False
+            set_face("what_is_it")
+            set_mouth(0.0)
+            self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
 
-    # ---------- MAIN ----------
+    # ----------------------------
+    # Main loop
+    # ----------------------------
     def run_forever(self):
         print("[ActiveListenerV2] start listening...")
         self._calibrate_noise_floor()
 
         while not self._stop:
-            if self._playing or (time.time() < self._cooldown_until):
+            # If audio playing => skip record
+            if self._playing_audio or (time.time() < self._cooldown_until):
                 time.sleep(0.05)
                 continue
+
+            # If video playing:
+            # - still allow clap to stop video (recommended)
+            # - but do NOT do speech->STT while video is running (it will pick up music)
+            video_mode = self._playing_video
 
             wav_path = self._record_wav(seconds=self.cfg.detect_chunk_sec)
             if not wav_path:
@@ -176,15 +363,25 @@ class ActiveListenerV2:
                 feats = self._extract_features(wav_path)
                 rms = feats["rms"]
 
-                # ✅ gate thấp như cũ
                 if not self._passes_gate(rms):
                     continue
 
+                # Clap handling
                 if self._is_clap(feats):
+                    if video_mode and self.cfg.allow_clap_stop_video:
+                        print("[CLAP] while video -> STOP VIDEO")
+                        self._stop_video()
+                        continue
+                    # normal clap -> bark
                     print(f"[CLAP] rms={rms:.0f} peak/rms={feats['peak_ratio']:.1f} hi={feats['high_ratio']:.3f} zcr={feats['zcr']:.3f} -> BARK")
                     self._bark()
                     continue
 
+                # In video mode: ignore speech/env (to avoid video audio triggering)
+                if video_mode:
+                    continue
+
+                # speech check
                 if feats["speech_score"] >= float(self.cfg.speech_score_threshold):
                     print(f"[SPEECH] rms={rms:.0f} score={feats['speech_score']:.2f} dbg={self._dbg_dict(feats)} -> record full")
 
@@ -202,6 +399,7 @@ class ActiveListenerV2:
                     except Exception:
                         pass
                 else:
+                    # env noise => bark
                     print(f"[ENV] rms={rms:.0f} score={feats['speech_score']:.2f} dbg={self._dbg_dict(feats)} -> BARK")
                     self._bark()
 
@@ -211,7 +409,9 @@ class ActiveListenerV2:
                 except Exception:
                     pass
 
-    # ---------- NOISE FLOOR ----------
+    # ----------------------------
+    # Noise floor / gate
+    # ----------------------------
     def _calibrate_noise_floor(self):
         secs = max(0.6, float(self.cfg.noise_calib_sec))
         n_chunks = int(math.ceil(secs / max(0.2, self.cfg.detect_chunk_sec)))
@@ -240,23 +440,21 @@ class ActiveListenerV2:
             self._noise_rms = float(self.cfg.min_rms_floor)
         else:
             med = float(np.median(np.array(samples)))
-            # ✅ noise_rms không bao giờ thấp hơn min_rms_floor (như cũ)
             self._noise_rms = max(float(self.cfg.min_rms_floor), med)
 
         print(f"[CALIB] noise_rms≈{self._noise_rms:.0f}  gate=+{self.cfg.gate_db_above_noise:.1f}dB")
 
     def _passes_gate(self, rms: float) -> bool:
-        # ✅ gate thấp + có floor
         floor = float(self.cfg.min_rms_floor)
         if self._noise_rms is None:
             return rms >= floor
-
         thr = self._noise_rms * (10.0 ** (float(self.cfg.gate_db_above_noise) / 20.0))
-        # ✅ luôn lấy threshold thấp nhất = floor (đỡ bị “câm”)
         thr = max(floor, thr)
         return rms >= thr
 
-    # ---------- AUDIO RECORD ----------
+    # ----------------------------
+    # Record wav
+    # ----------------------------
     def _record_wav(self, seconds: float) -> Optional[str]:
         if seconds <= 0:
             return None
@@ -302,7 +500,9 @@ class ActiveListenerV2:
         except Exception:
             return None
 
-    # ---------- FEATURE EXTRACT ----------
+    # ----------------------------
+    # Feature extract
+    # ----------------------------
     def _extract_features(self, wav_path: str) -> Dict[str, float]:
         x = self._read_wav_pcm16(wav_path)
         if x is None or len(x) < 256:
@@ -364,7 +564,6 @@ class ActiveListenerV2:
             "noise": round(float(self._noise_rms or 0.0), 1),
         }
 
-    # ---------- CLAP DETECT ----------
     def _is_clap(self, feats: Dict[str, float]) -> bool:
         return (
             feats["peak_ratio"] >= float(self.cfg.clap_peak_ratio)
@@ -372,7 +571,9 @@ class ActiveListenerV2:
             and feats["zcr"] >= float(self.cfg.clap_zcr)
         )
 
-    # ---------- CAMERA ----------
+    # ----------------------------
+    # Camera
+    # ----------------------------
     def _capture_jpeg_frame(self) -> Optional[bytes]:
         if cv2 is None:
             return None
@@ -416,7 +617,9 @@ class ActiveListenerV2:
             except Exception:
                 pass
 
-    # ---------- MEMORY ----------
+    # ----------------------------
+    # Memory
+    # ----------------------------
     def _load_recent_memory(self) -> List[Dict[str, Any]]:
         if not self._mem_path.exists():
             return []
@@ -442,7 +645,9 @@ class ActiveListenerV2:
         except Exception as e:
             print("[MEM] write error:", e)
 
-    # ---------- SERVER ----------
+    # ----------------------------
+    # Server
+    # ----------------------------
     def _send_to_server(self, wav_path: str, image_bytes: Optional[bytes]) -> Optional[Dict[str, Any]]:
         mem = self._load_recent_memory()
         meta = {"ts": time.time(), "client": "pidog", "memory": mem}
@@ -480,17 +685,22 @@ class ActiveListenerV2:
         except Exception:
             return False
 
+    # ----------------------------
+    # Handle server reply (KEY CHANGE)
+    # ----------------------------
     def _handle_server_reply(self, resp: Dict[str, Any]):
         transcript = (resp.get("transcript") or "").strip()
         label = (resp.get("label") or "unknown").strip()
         reply_text = (resp.get("reply_text") or "").strip()
         audio_url = resp.get("audio_url")
+        play = resp.get("play")  # <-- NEW
 
         print("[SERVER] label=", label)
         print("[USER ]", transcript)
         if reply_text:
             print("[BOT  ]", reply_text)
         print("[AUDIO]", audio_url)
+        print("[PLAY ]", play)
 
         self._append_memory({
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -498,28 +708,52 @@ class ActiveListenerV2:
             "label": label,
             "reply_text": reply_text,
             "audio_url": audio_url,
+            "play": play,
         })
 
-        if label.lower() == "clap":
-            print(f"[CLAP->BARK] bark x{self.cfg.bark_times}")
-            self._bark()
+        # Stop playback command
+        if label.lower() in {"stop_playback", "stop"}:
+            print("[STOP] server asked stop playback")
+            self._stop_audio_playback()
+            if self._playing_video:
+                self._stop_video()
             return
 
-        if not audio_url:
+        # If server returns play youtube => start video service
+        if isinstance(play, dict) and str(play.get("type", "")).lower() == "youtube":
+            url = (play.get("url") or "").strip()
+            if url:
+                # stop current video then start new
+                if self._playing_video:
+                    self._stop_video()
+                self._start_video_youtube(url)
+            else:
+                print("[WARN] play.type=youtube but missing url")
             return
 
-        tmpdir = tempfile.mkdtemp(prefix="al2_play_")
-        local = os.path.join(tmpdir, "reply.mp3")
-        try:
-            if not self._download(audio_url, local):
-                print("[PLAY] download failed:", audio_url)
-                return
-            self._music_play_blocking(local, times=1)
-        finally:
+        # If server returns play.stop => stop video
+        if isinstance(play, dict) and str(play.get("type", "")).lower() in {"stop", "stop_video"}:
+            if self._playing_video:
+                self._stop_video()
+            return
+
+        # Normal TTS/chat audio_url: stop video then play audio
+        if audio_url:
+            if self._playing_video:
+                self._stop_video()
+
+            tmpdir = tempfile.mkdtemp(prefix="al2_play_")
+            local = os.path.join(tmpdir, "reply.mp3")
             try:
-                shutil.rmtree(tmpdir, ignore_errors=True)
-            except Exception:
-                pass
+                if not self._download(audio_url, local):
+                    print("[PLAY] download failed:", audio_url)
+                    return
+                self._music_play_blocking_with_lipsync(local, times=1)
+            finally:
+                try:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+                except Exception:
+                    pass
 
 
 def main():
@@ -530,7 +764,7 @@ def main():
     mc.boot()
     time.sleep(0.8)
 
-    # ✅ ngưỡng kích hoạt “thấp như cũ”
+    # Low thresholds like your old
     cfg = ListenerCfg(
         mic_device="default",
         server_url="https://embeddedprogramming-healtheworldserver.up.railway.app/pi_upload_audio_v2",
@@ -546,6 +780,12 @@ def main():
 
         playback_cooldown_sec=0.7,
         volume=80,
+
+        # If your service name differs, change here:
+        video_service_name="robot-video-player.service",
+        video_env_key="ROBOT_VIDEO_URL",
+        systemctl_user=True,
+        allow_clap_stop_video=True,
     )
 
     al = ActiveListenerV2(cfg)
