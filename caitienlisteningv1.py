@@ -104,20 +104,6 @@ class ListenerCfg:
     # volume
     volume: int = 80
 
-    # ===== VIDEO PLAYER SERVICE (YouTube) =====
-    # If your systemd service name different -> change this
-    video_service_name: str = "robot-video-player.service"
-
-    # How to pass URL to service:
-    # Default: set env ROBOT_VIDEO_URL then restart service
-    video_env_key: str = "ROBOT_VIDEO_URL"
-
-    # Use user systemctl? If service is system-level, set False and use ["systemctl", ...] without "--user"
-    systemctl_user: bool = True
-
-    # Optional: when video starts, keep listening for clap to stop video (recommended)
-    allow_clap_stop_video: bool = True
-
 
 class ActiveListenerV2:
     def __init__(self, cfg: ListenerCfg):
@@ -126,7 +112,6 @@ class ActiveListenerV2:
 
         # playback state
         self._playing_audio = False
-        self._playing_video = False
         self._cooldown_until = 0.0
 
         self.music = Music()
@@ -140,7 +125,7 @@ class ActiveListenerV2:
 
         self._noise_rms: Optional[float] = None
 
-        # unlock speaker pin if needed
+        # unlock speaker pin if needed (Robot HAT)
         try:
             os.system("pinctrl set 12 op dh")
             time.sleep(0.1)
@@ -155,56 +140,9 @@ class ActiveListenerV2:
         self._stop = True
 
     # ----------------------------
-    # System command helpers
-    # ----------------------------
-    def _run(self, cmd: List[str]) -> subprocess.CompletedProcess:
-        return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-
-    def _systemctl(self, args: List[str]) -> bool:
-        base = ["systemctl"]
-        if self.cfg.systemctl_user:
-            base += ["--user"]
-        p = self._run(base + args)
-        return p.returncode == 0
-
-    # ----------------------------
-    # Video controls
-    # ----------------------------
-    def _start_video_youtube(self, url: str):
-        url = (url or "").strip()
-        if not url:
-            return
-        # stop audio to avoid mixing
-        self._stop_audio_playback()
-
-        # set env for service and restart
-        ok1 = self._systemctl(["set-environment", f"{self.cfg.video_env_key}={url}"])
-        ok2 = self._systemctl(["restart", self.cfg.video_service_name])
-
-        self._playing_video = bool(ok1 and ok2)
-        print(f"[VIDEO] start url={url} ok={self._playing_video}")
-
-        # video is on screen; still set face state in background
-        set_face("music")
-        set_mouth(0.0)
-
-        # small cooldown to avoid instant re-trigger
-        self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
-
-    def _stop_video(self):
-        ok = self._systemctl(["stop", self.cfg.video_service_name])
-        self._playing_video = False
-        print(f"[VIDEO] stop ok={ok}")
-        # back to robot face
-        set_face("what_is_it")
-        set_mouth(0.0)
-        self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
-
-    # ----------------------------
     # Audio playback (blocking) + lipsync
     # ----------------------------
     def _stop_audio_playback(self):
-        # robot_hat Music sometimes has music_stop(); try best-effort
         try:
             if hasattr(self.music, "music_stop"):
                 self.music.music_stop()
@@ -258,8 +196,7 @@ class ActiveListenerV2:
                     break
                 x = np.frombuffer(buf, dtype=np.int16).astype(np.float32)
                 rms = float(np.sqrt(np.mean(x * x) + 1e-9))
-                # map rms -> 0..1 (tune)
-                level = min(1.0, max(0.0, (rms / 4000.0)))
+                level = min(1.0, max(0.0, (rms / 4000.0)))  # tune if needed
                 set_mouth(level)
             try:
                 p.terminate()
@@ -282,18 +219,14 @@ class ActiveListenerV2:
             dur = self._get_audio_duration_sec(filepath)
             loops = max(1, int(times))
 
-            # face talking
             set_face("suprise")
             set_mouth(0.0)
 
-            # start lipsync thread
             th = threading.Thread(target=self._lipsync_worker, args=(filepath, stop_evt), daemon=True)
             th.start()
 
-            # play
             self.music.music_play(str(filepath), loops=loops)
 
-            # block
             if dur is not None:
                 time.sleep(dur * loops + 0.15)
             else:
@@ -318,10 +251,9 @@ class ActiveListenerV2:
         if not self._bark_path.exists():
             print(f"[WARN] bark file not found: {self._bark_path}")
             return
-        # bark face
         set_face("sad")
         set_mouth(0.0)
-        # bark audio (no lipsync needed)
+
         self._playing_audio = True
         try:
             self.music.music_play(str(self._bark_path), loops=max(1, int(self.cfg.bark_times)))
@@ -344,15 +276,9 @@ class ActiveListenerV2:
         self._calibrate_noise_floor()
 
         while not self._stop:
-            # If audio playing => skip record
             if self._playing_audio or (time.time() < self._cooldown_until):
                 time.sleep(0.05)
                 continue
-
-            # If video playing:
-            # - still allow clap to stop video (recommended)
-            # - but do NOT do speech->STT while video is running (it will pick up music)
-            video_mode = self._playing_video
 
             wav_path = self._record_wav(seconds=self.cfg.detect_chunk_sec)
             if not wav_path:
@@ -366,19 +292,10 @@ class ActiveListenerV2:
                 if not self._passes_gate(rms):
                     continue
 
-                # Clap handling
+                # Clap -> bark
                 if self._is_clap(feats):
-                    if video_mode and self.cfg.allow_clap_stop_video:
-                        print("[CLAP] while video -> STOP VIDEO")
-                        self._stop_video()
-                        continue
-                    # normal clap -> bark
                     print(f"[CLAP] rms={rms:.0f} peak/rms={feats['peak_ratio']:.1f} hi={feats['high_ratio']:.3f} zcr={feats['zcr']:.3f} -> BARK")
                     self._bark()
-                    continue
-
-                # In video mode: ignore speech/env (to avoid video audio triggering)
-                if video_mode:
                     continue
 
                 # speech check
@@ -686,21 +603,19 @@ class ActiveListenerV2:
             return False
 
     # ----------------------------
-    # Handle server reply (KEY CHANGE)
+    # Handle server reply (AUDIO-ONLY)
     # ----------------------------
     def _handle_server_reply(self, resp: Dict[str, Any]):
-        transcript = (resp.get("transcript") or "").strip()
+        transcript = (resp.get("transcript") or resp.get("text") or "").strip()
         label = (resp.get("label") or "unknown").strip()
         reply_text = (resp.get("reply_text") or "").strip()
         audio_url = resp.get("audio_url")
-        play = resp.get("play")  # <-- NEW
 
         print("[SERVER] label=", label)
         print("[USER ]", transcript)
         if reply_text:
             print("[BOT  ]", reply_text)
         print("[AUDIO]", audio_url)
-        print("[PLAY ]", play)
 
         self._append_memory({
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -708,47 +623,31 @@ class ActiveListenerV2:
             "label": label,
             "reply_text": reply_text,
             "audio_url": audio_url,
-            "play": play,
         })
 
         # Stop playback command
         if label.lower() in {"stop_playback", "stop"}:
             print("[STOP] server asked stop playback")
             self._stop_audio_playback()
-            if self._playing_video:
-                self._stop_video()
+            set_face("what_is_it")
+            set_mouth(0.0)
+            self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
             return
 
-        # If server returns play youtube => start video service
-        if isinstance(play, dict) and str(play.get("type", "")).lower() == "youtube":
-            url = (play.get("url") or "").strip()
-            if url:
-                # stop current video then start new
-                if self._playing_video:
-                    self._stop_video()
-                self._start_video_youtube(url)
-            else:
-                print("[WARN] play.type=youtube but missing url")
-            return
-
-        # If server returns play.stop => stop video
-        if isinstance(play, dict) and str(play.get("type", "")).lower() in {"stop", "stop_video"}:
-            if self._playing_video:
-                self._stop_video()
-            return
-
-        # Normal TTS/chat audio_url: stop video then play audio
+        # Normal audio_url: play it
         if audio_url:
-            if self._playing_video:
-                self._stop_video()
-
             tmpdir = tempfile.mkdtemp(prefix="al2_play_")
             local = os.path.join(tmpdir, "reply.mp3")
             try:
                 if not self._download(audio_url, local):
                     print("[PLAY] download failed:", audio_url)
                     return
+
+                # if label = nhac -> show music face while playing
+                if label.strip().lower() == "nhac":
+                    set_face("music")
                 self._music_play_blocking_with_lipsync(local, times=1)
+
             finally:
                 try:
                     shutil.rmtree(tmpdir, ignore_errors=True)
@@ -764,7 +663,6 @@ def main():
     mc.boot()
     time.sleep(0.8)
 
-    # Low thresholds like your old
     cfg = ListenerCfg(
         mic_device="default",
         server_url="https://embeddedprogramming-healtheworldserver.up.railway.app/pi_upload_audio_v2",
@@ -780,12 +678,6 @@ def main():
 
         playback_cooldown_sec=0.7,
         volume=80,
-
-        # If your service name differs, change here:
-        video_service_name="robot-video-player.service",
-        video_env_key="ROBOT_VIDEO_URL",
-        systemctl_user=True,
-        allow_clap_stop_video=True,
     )
 
     al = ActiveListenerV2(cfg)
