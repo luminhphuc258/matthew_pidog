@@ -1,6 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+main.py — Client PiDog (ActiveListenerV2) compatible with NEW NodeJS server response:
+- If server returns play.type == "youtube":
+    -> start systemd service robot-video-player (and pass youtube URL via env file)
+    -> mark video playing so mic recording pauses (avoid self-record)
+- If server returns audio_url (TTS/chat or iTunes mp3):
+    -> stop video (if playing)
+    -> set face "suprise" (and optional mouth animation handled by your face service)
+    -> play audio (blocking)
+- If bark (clap OR env noise):
+    -> stop video
+    -> set face "sad"
+    -> play local tiengsua.wav (blocking)
+
+IMPORTANT:
+- This code assumes you already have:
+    - face service listening UDP at 127.0.0.1:39393 (as you showed)
+    - robot-video-player.service that reads /home/matthewlupi/matthew_pidog/robot_video_player.env
+      with YOUTUBE_URL=... (and optionally VOLUME=...)
+- Change paths below if different.
+"""
+
 import os
 os.environ.setdefault("OPENCV_VIDEOIO_PRIORITY_GSTREAMER", "0")
 os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
@@ -11,7 +33,6 @@ import math
 import shutil
 import tempfile
 import subprocess
-import socket
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
@@ -28,84 +49,128 @@ from robot_hat import Music
 from motion_controller import MotionController
 
 
-# ============================================================
-# UDP FACE CLIENT (talk to your pygame face service)
-#   - service listens on 127.0.0.1:39393
-#   - commands supported:
-#       "EMO suprise"
-#       "EMO sad"
-#       "MOUTH 0.35"
-# ============================================================
-class FaceUdpClient:
-    def __init__(self, host: str = "127.0.0.1", port: int = 39393):
-        self.addr = (host, int(port))
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+# ==========================
+# Face (UDP) helpers
+# ==========================
+FACE_UDP_HOST = "127.0.0.1"
+FACE_UDP_PORT = 39393
 
-    def emo(self, name: str):
-        # your face service uses: suprise (typo) not surprise
-        cmd = f"EMO {name}".encode("utf-8", "ignore")
-        try:
-            self.sock.sendto(cmd, self.addr)
-        except Exception:
-            pass
-
-    def mouth(self, level01: float):
-        v = max(0.0, min(1.0, float(level01)))
-        cmd = f"MOUTH {v:.2f}".encode("utf-8", "ignore")
-        try:
-            self.sock.sendto(cmd, self.addr)
-        except Exception:
-            pass
+VALID_EMOS = {"love_eyes", "music", "what_is_it", "suprise", "sleep", "sad", "angry"}
 
 
-# ============================================================
-# Robot Video Player Controller
-#   Assumption: your robot-video-player service exposes local HTTP:
-#     POST http://127.0.0.1:9900/play  {"url": "..."}
-#     POST http://127.0.0.1:9900/stop  {}
-#     POST http://127.0.0.1:9900/face  {}   (switch back to face mode)
-#
-# If your endpoints are different, just change paths below.
-# ============================================================
-class VideoPlayerClient:
-    def __init__(self, base_url: str = "http://127.0.0.1:9900"):
-        self.base = base_url.rstrip("/")
-        self._mode = "face"   # best-effort state: face | video
-
-    def _post(self, path: str, payload: Optional[Dict[str, Any]] = None, timeout: float = 2.0) -> bool:
-        url = self.base + path
-        try:
-            r = requests.post(url, json=(payload or {}), timeout=timeout)
-            return r.status_code == 200
-        except Exception:
-            return False
-
-    def play_youtube(self, player_url: str) -> bool:
-        ok = self._post("/play", {"url": player_url})
-        if ok:
-            self._mode = "video"
-        return ok
-
-    def stop_video(self) -> bool:
-        ok = self._post("/stop", {})
-        if ok:
-            self._mode = "face"
-        return ok
-
-    def show_face(self) -> bool:
-        ok = self._post("/face", {})
-        if ok:
-            self._mode = "face"
-        return ok
-
-    @property
-    def mode(self) -> str:
-        return self._mode
+def _udp_send(host: str, port: int, msg: str):
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.sendto(msg.encode("utf-8"), (host, port))
+        s.close()
+    except Exception:
+        pass
 
 
+def face_set_emo(emo: str):
+    if emo not in VALID_EMOS:
+        emo = "what_is_it"
+    _udp_send(FACE_UDP_HOST, FACE_UDP_PORT, f"EMO {emo}")
+
+
+def face_mouth(level01: float):
+    # if your face service supports MOUTH 0..1 (it does)
+    try:
+        lv = max(0.0, min(1.0, float(level01)))
+    except Exception:
+        lv = 0.0
+    _udp_send(FACE_UDP_HOST, FACE_UDP_PORT, f"MOUTH {lv:.3f}")
+
+
+# ==========================
+# Video service helpers
+# ==========================
+VIDEO_SERVICE_NAME = "robot-video-player.service"
+
+# Env file for service to read.
+# You said robot_video-player is in /home/matthewlupi/matthew_pidog
+VIDEO_ENV_FILE = "/home/matthewlupi/matthew_pidog/robot_video_player.env"
+
+# Optional: if your service supports these keys.
+VIDEO_ENV_KEY_URL = "YOUTUBE_URL"
+VIDEO_ENV_KEY_VOL = "VOLUME"
+
+# If you want to force stop video when switching to audio
+VIDEO_STOP_ON_AUDIO = True
+
+
+def _write_env_kv(env_path: str, kv: Dict[str, str]):
+    """
+    Write simple KEY=VALUE lines (overwrites file).
+    """
+    lines = []
+    for k, v in kv.items():
+        k = str(k).strip()
+        v = str(v).strip()
+        # quote if contains spaces
+        if " " in v or "\t" in v:
+            v = '"' + v.replace('"', '\\"') + '"'
+        lines.append(f"{k}={v}")
+    tmp = env_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, env_path)
+
+
+def video_is_active() -> bool:
+    try:
+        r = subprocess.run(
+            ["systemctl", "is-active", "--quiet", VIDEO_SERVICE_NAME],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def video_start(youtube_url: str, volume: Optional[int] = None) -> bool:
+    try:
+        kv = {VIDEO_ENV_KEY_URL: youtube_url}
+        if volume is not None:
+            kv[VIDEO_ENV_KEY_VOL] = str(int(volume))
+        _write_env_kv(VIDEO_ENV_FILE, kv)
+
+        # restart to apply new url
+        subprocess.run(
+            ["systemctl", "restart", VIDEO_SERVICE_NAME],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return True
+    except Exception as e:
+        print("[VIDEO] start error:", e)
+        return False
+
+
+def video_stop() -> bool:
+    try:
+        subprocess.run(
+            ["systemctl", "stop", VIDEO_SERVICE_NAME],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return True
+    except Exception as e:
+        print("[VIDEO] stop error:", e)
+        return False
+
+
+# ==========================
+# Config
+# ==========================
 @dataclass
 class ListenerCfg:
-    # audio input
+    # audio record
     mic_device: str = "default"
     sample_rate: int = 16000
 
@@ -145,25 +210,36 @@ class ListenerCfg:
     bark_wav: str = "tiengsua.wav"
     bark_times: int = 2
 
-    # cooldown to avoid self-trigger
-    playback_cooldown_sec: float = 0.7
+    # playback cooldown to avoid self-trigger
+    playback_cooldown_sec: float = 0.8
 
-    # speaker volume (0-100)
+    # speaker volume 0-100
     volume: int = 80
 
-    # local services
-    face_udp_host: str = "127.0.0.1"
-    face_udp_port: int = 39393
-    video_service_url: str = "http://127.0.0.1:9900"
+    # face behavior
+    face_idle: str = "what_is_it"
+    face_talk: str = "suprise"
+    face_bark: str = "sad"
 
-    # while playing youtube, disable mic this long if server provides no duration
-    youtube_default_block_sec: float = 240.0  # 4 minutes default
+    # video
+    video_default_volume: int = 80
+    video_guard_start_sec: float = 0.8  # small guard before recording after starting video
+    video_guard_stop_sec: float = 0.5   # guard after stopping video
 
 
-class ActiveListenerMain:
+class ActiveListenerV2:
     def __init__(self, cfg: ListenerCfg):
         self.cfg = cfg
         self._stop = False
+
+        # audio playing flag (TTS/music)
+        self._playing = False
+
+        # video playing flag
+        self._video_playing = False
+
+        # cooldown
+        self._cooldown_until = 0.0
 
         self.music = Music()
         try:
@@ -171,35 +247,45 @@ class ActiveListenerMain:
         except Exception:
             pass
 
-        self.face = FaceUdpClient(cfg.face_udp_host, cfg.face_udp_port)
-        self.video = VideoPlayerClient(cfg.video_service_url)
-
         self._mem_path = Path(self.cfg.memory_file)
         self._bark_path = Path(self.cfg.bark_wav)
 
         self._noise_rms: Optional[float] = None
 
-        self._playing_audio = False
-        self._block_until = 0.0  # for cooldown / youtube block
-
-        # unlock speaker pin if needed
+        # unlock speaker pin (if required)
         try:
             os.system("pinctrl set 12 op dh")
             time.sleep(0.1)
         except Exception:
             pass
 
+        # set idle face
+        face_set_emo(self.cfg.face_idle)
+
+        # sync initial video status
+        self._video_playing = video_is_active()
+
     def stop(self):
         self._stop = True
 
-    # ----------------------------
-    # Utilities: duration + lipsync envelope
-    # ----------------------------
-    def _ffprobe_duration(self, filepath: str) -> Optional[float]:
+    # ---------- duration helper ----------
+    def _get_audio_duration_sec(self, filepath: str) -> Optional[float]:
+        p = str(filepath)
+        if p.lower().endswith(".wav"):
+            try:
+                import wave
+                with wave.open(p, "rb") as wf:
+                    frames = wf.getnframes()
+                    rate = wf.getframerate()
+                    if rate > 0:
+                        return float(frames) / float(rate)
+            except Exception:
+                pass
+
         try:
             r = subprocess.run(
                 ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                 "-of", "default=noprint_wrappers=1:nokey=1", filepath],
+                 "-of", "default=noprint_wrappers=1:nokey=1", p],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False
             )
             s = (r.stdout or "").strip()
@@ -209,178 +295,149 @@ class ActiveListenerMain:
             pass
         return None
 
-    def _wav_rms_envelope(self, wav_path: str, frame_sec: float = 0.05) -> List[float]:
+    # ---------- SAFE MUSIC PLAY (BLOCKING) ----------
+    def _music_play_blocking(self, filepath: str, times: int = 1, talk_face: bool = False):
         """
-        Returns list of 0..1 mouth levels (rough envelope) for lipsync.
-        WAV must be mono 16-bit. If not, caller should convert.
+        BLOCK playback and disable mic logic while playing.
+        If talk_face=True: set suprise face before playing.
         """
-        import wave
+        if VIDEO_STOP_ON_AUDIO:
+            self._ensure_video_stopped()
+
+        self._playing = True
         try:
-            with wave.open(wav_path, "rb") as wf:
-                ch = wf.getnchannels()
-                sw = wf.getsampwidth()
-                sr = wf.getframerate()
-                if ch != 1 or sw != 2:
-                    return []
-                n = wf.getnframes()
-                raw = wf.readframes(n)
-        except Exception:
-            return []
+            if talk_face:
+                # show talk face and allow your face service to animate mouth itself.
+                face_set_emo(self.cfg.face_talk)
 
-        x = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
-        if x.size < 512:
-            return []
+            dur = self._get_audio_duration_sec(filepath)
+            loops = max(1, int(times))
 
-        hop = max(1, int(sr * frame_sec))
-        # normalize based on percentiles to avoid spikes
-        env = []
-        for i in range(0, len(x), hop):
-            seg = x[i:i+hop]
-            if seg.size < 64:
-                break
-            rms = float(np.sqrt(np.mean(seg * seg) + 1e-9))
-            env.append(rms)
-
-        if not env:
-            return []
-
-        a = np.array(env, dtype=np.float32)
-        p90 = float(np.percentile(a, 90))
-        p20 = float(np.percentile(a, 20))
-        den = max(1e-6, (p90 - p20))
-        out = []
-        for v in a:
-            lvl = (float(v) - p20) / den
-            lvl = max(0.0, min(1.0, lvl))
-            out.append(lvl)
-        return out
-
-    def _make_lipsync_envelope(self, audio_path: str) -> Tuple[List[float], float]:
-        """
-        Return (envelope_levels, frame_sec)
-        For mp3/m4a: convert to temp wav (mono 16k) via ffmpeg.
-        """
-        frame_sec = 0.05
-        p = audio_path.lower()
-
-        # direct wav
-        if p.endswith(".wav"):
-            env = self._wav_rms_envelope(audio_path, frame_sec=frame_sec)
-            return env, frame_sec
-
-        # convert with ffmpeg to a temp wav for envelope
-        tmpdir = tempfile.mkdtemp(prefix="lipsync_")
-        wav_tmp = os.path.join(tmpdir, "tmp.wav")
-        try:
-            # ffmpeg: decode to mono 16k wav
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", audio_path, "-ac", "1", "-ar", "16000", "-vn", wav_tmp],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
-            )
-            env = self._wav_rms_envelope(wav_tmp, frame_sec=frame_sec)
-            return env, frame_sec
-        finally:
+            # play
             try:
-                shutil.rmtree(tmpdir, ignore_errors=True)
+                self.music.music_set_volume(int(self.cfg.volume))
             except Exception:
                 pass
+            self.music.music_play(str(filepath), loops=loops)
 
-    # ----------------------------
-    # Audio play with mouth movement
-    # ----------------------------
-    def _play_audio_with_mouth(self, audio_path: str, emo: str = "suprise", loops: int = 1):
-        """
-        - Ensure face mode
-        - Set emotion (suprise)
-        - Play using robot_hat Music
-        - While playing: send MOUTH values (envelope-based if possible)
-        """
-        self._playing_audio = True
-        try:
-            self.video.show_face()
-
-            # set emotion before speaking
-            if emo:
-                self.face.emo(emo)
-
-            dur = self._ffprobe_duration(audio_path)
-            env, frame_sec = self._make_lipsync_envelope(audio_path)
-
-            # start playback
-            self.music.music_play(str(audio_path), loops=max(1, int(loops)))
-
-            # If we can’t get duration, fallback to 6s
-            total = dur if (dur is not None and dur > 0.1) else 6.0
-            total *= max(1, int(loops))
-
-            start = time.time()
-            idx = 0
-            while not self._stop:
-                now = time.time()
-                t = now - start
-                if t >= total:
-                    break
-
-                # mouth level
-                if env:
-                    # map time -> env index
-                    k = int(t / frame_sec)
-                    if k < 0:
-                        k = 0
-                    if k >= len(env):
-                        lvl = 0.0
-                    else:
-                        lvl = env[k]
-                else:
-                    # fallback: simple animated mouth
-                    lvl = 0.15 + 0.45 * abs(math.sin(now * 12.0))
-
-                self.face.mouth(lvl)
-                time.sleep(0.02)
+            # best-effort block
+            if dur is not None:
+                time.sleep(dur * loops + 0.20)
+            else:
+                time.sleep(2.5 * loops)
 
         except Exception as e:
-            print("[AUDIO] play error:", e)
+            print("[PLAY] error:", e)
         finally:
-            # stop mouth and return to neutral face
-            try:
-                self.face.mouth(0.0)
-            except Exception:
-                pass
-            try:
-                self.face.emo("what_is_it")
-            except Exception:
-                pass
+            self._playing = False
+            self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
+            # return to idle face (unless video is playing)
+            if not self._video_playing:
+                face_set_emo(self.cfg.face_idle)
 
-            self._playing_audio = False
-            self._block_until = time.time() + float(self.cfg.playback_cooldown_sec)
+    def _ensure_video_stopped(self):
+        """
+        Stop video service and apply a short guard (cooldown) to avoid self-record.
+        """
+        if self._video_playing or video_is_active():
+            print("[VIDEO] stopping ...")
+            video_stop()
+            self._video_playing = False
+            self._cooldown_until = max(self._cooldown_until, time.time() + float(self.cfg.video_guard_stop_sec))
 
-    # ----------------------------
-    # Bark (sad + local wav)
-    # ----------------------------
+    def _start_youtube_video(self, url: str):
+        """
+        Start video service (restart) with url, set video playing flag and pause mic recording.
+        """
+        if not url:
+            return
+        # set a "music" face while video running (optional)
+        face_set_emo("music")
+
+        ok = video_start(url, volume=int(self.cfg.video_default_volume))
+        self._video_playing = ok or video_is_active()
+        # guard: stop recording immediately after starting
+        self._cooldown_until = max(self._cooldown_until, time.time() + float(self.cfg.video_guard_start_sec))
+        print("[VIDEO] start url:", url, "ok=", self._video_playing)
+
     def _bark(self):
+        # bark => sad face + stop video + play local wav
+        self._ensure_video_stopped()
+        face_set_emo(self.cfg.face_bark)
+
         if not self._bark_path.exists():
             print(f"[WARN] bark file not found: {self._bark_path}")
             return
+        self._music_play_blocking(str(self._bark_path), times=int(self.cfg.bark_times), talk_face=False)
 
-        # sad face while barking
-        self.video.show_face()
-        self.face.emo("sad")
+    # ---------- MAIN ----------
+    def run_forever(self):
+        print("[ActiveListenerV2] start listening...")
+        self._calibrate_noise_floor()
 
-        # bark sound (no need perfect lipsync, but we still can animate mouth a bit)
-        self._play_audio_with_mouth(str(self._bark_path), emo="sad", loops=int(self.cfg.bark_times))
+        while not self._stop:
+            # update video status occasionally (cheap)
+            if int(time.time()) % 3 == 0:
+                self._video_playing = video_is_active()
 
-        # return to idle face
-        self.face.emo("what_is_it")
+            # ✅ mic off while playing audio OR video OR in cooldown
+            if self._playing or self._video_playing or (time.time() < self._cooldown_until):
+                time.sleep(0.05)
+                continue
 
-    # ----------------------------
-    # Noise calibration / gate
-    # ----------------------------
+            wav_path = self._record_wav(seconds=self.cfg.detect_chunk_sec)
+            if not wav_path:
+                time.sleep(0.08)
+                continue
+
+            try:
+                feats = self._extract_features(wav_path)
+                rms = feats["rms"]
+
+                if not self._passes_gate(rms):
+                    continue
+
+                # clap first
+                if self._is_clap(feats):
+                    print(f"[CLAP] rms={rms:.0f} pk/rms={feats['peak_ratio']:.1f} hi={feats['high_ratio']:.3f} zcr={feats['zcr']:.3f} -> BARK")
+                    self._bark()
+                    continue
+
+                # speech check
+                if feats["speech_score"] >= self.cfg.speech_score_threshold:
+                    print(f"[SPEECH] rms={rms:.0f} score={feats['speech_score']:.2f} dbg={self._dbg_dict(feats)} -> record full")
+
+                    full_wav = self._record_wav(seconds=self.cfg.record_sec)
+                    if not full_wav:
+                        continue
+
+                    image_bytes = self._capture_jpeg_frame()
+                    resp = self._send_to_server(full_wav, image_bytes=image_bytes)
+                    if resp:
+                        self._handle_server_reply(resp)
+
+                    try:
+                        os.remove(full_wav)
+                    except Exception:
+                        pass
+                else:
+                    # env noise => bark
+                    print(f"[ENV] rms={rms:.0f} score={feats['speech_score']:.2f} dbg={self._dbg_dict(feats)} -> BARK")
+                    self._bark()
+
+            finally:
+                try:
+                    os.remove(wav_path)
+                except Exception:
+                    pass
+
+    # ---------- NOISE FLOOR ----------
     def _calibrate_noise_floor(self):
         secs = max(1.0, float(self.cfg.noise_calib_sec))
         n_chunks = int(math.ceil(secs / max(0.2, self.cfg.detect_chunk_sec)))
         samples = []
 
-        print(f"[CALIB] measuring noise floor for ~{secs:.1f}s ... keep quiet")
+        print(f"[CALIB] measuring noise floor for ~{secs:.1f}s ... keep quiet if possible")
         for _ in range(max(2, n_chunks)):
             if self._stop:
                 break
@@ -402,9 +459,10 @@ class ActiveListenerMain:
         if not samples:
             self._noise_rms = float(self.cfg.min_rms_floor)
         else:
-            self._noise_rms = max(float(self.cfg.min_rms_floor), float(np.median(np.array(samples))))
+            med = float(np.median(np.array(samples)))
+            self._noise_rms = max(float(self.cfg.min_rms_floor), med)
 
-        print(f"[CALIB] noise_rms≈{self._noise_rms:.0f} gate=+{self.cfg.gate_db_above_noise:.1f}dB")
+        print(f"[CALIB] noise_rms≈{self._noise_rms:.0f}  gate=+{self.cfg.gate_db_above_noise:.1f}dB")
 
     def _passes_gate(self, rms: float) -> bool:
         if self._noise_rms is None:
@@ -412,14 +470,12 @@ class ActiveListenerMain:
         thr = self._noise_rms * (10.0 ** (float(self.cfg.gate_db_above_noise) / 20.0))
         return rms >= thr
 
-    # ----------------------------
-    # Audio record + features
-    # ----------------------------
+    # ---------- AUDIO RECORD ----------
     def _record_wav(self, seconds: float) -> Optional[str]:
         if seconds <= 0:
             return None
 
-        tmp = tempfile.NamedTemporaryFile(prefix="al_", suffix=".wav", delete=False)
+        tmp = tempfile.NamedTemporaryFile(prefix="al2_", suffix=".wav", delete=False)
         tmp.close()
         out = tmp.name
 
@@ -430,7 +486,7 @@ class ActiveListenerMain:
             "-c", "1",
             "-r", str(self.cfg.sample_rate),
             "-d", str(max(1, int(math.ceil(seconds)))),
-            out,
+            out
         ]
 
         try:
@@ -460,15 +516,14 @@ class ActiveListenerMain:
         except Exception:
             return None
 
+    # ---------- FEATURE EXTRACT ----------
     def _extract_features(self, wav_path: str) -> Dict[str, float]:
         x = self._read_wav_pcm16(wav_path)
         if x is None or len(x) < 256:
-            return {"rms": 0.0, "speech_score": 0.0, "flatness": 1.0,
-                    "speech_ratio": 0.0, "high_ratio": 0.0, "zcr": 0.0, "peak_ratio": 0.0}
+            return {"rms": 0.0, "speech_score": 0.0, "flatness": 1.0, "speech_ratio": 0.0, "high_ratio": 0.0, "low_ratio": 0.0, "zcr": 0.0, "peak_ratio": 0.0}
 
         rms = float(np.sqrt(np.mean(x * x) + 1e-9))
-        peak = float(np.max(np.abs(x)) + 1e-9
-                    )
+        peak = float(np.max(np.abs(x)) + 1e-9)
         peak_ratio = float(peak / (rms + 1e-9))
 
         y = x / (np.max(np.abs(x)) + 1e-9)
@@ -488,10 +543,12 @@ class ActiveListenerMain:
 
         e_speech = band_energy(300, 3400)
         e_high = band_energy(5000, 7500)
+        e_low = band_energy(50, 250)
         total = float(np.sum(ps))
 
         speech_ratio = e_speech / (total + 1e-9)
         high_ratio = e_high / (total + 1e-9)
+        low_ratio = e_low / (total + 1e-9)
 
         score = 0.0
         score += (1.0 - min(1.0, flatness * 3.0)) * 0.40
@@ -505,10 +562,22 @@ class ActiveListenerMain:
             "flatness": float(flatness),
             "speech_ratio": float(speech_ratio),
             "high_ratio": float(high_ratio),
+            "low_ratio": float(low_ratio),
             "zcr": float(zc),
             "peak_ratio": peak_ratio,
         }
 
+    def _dbg_dict(self, feats: Dict[str, float]) -> Dict[str, float]:
+        return {
+            "flat": round(feats["flatness"], 4),
+            "sp": round(feats["speech_ratio"], 4),
+            "hi": round(feats["high_ratio"], 4),
+            "zcr": round(feats["zcr"], 4),
+            "pk": round(feats["peak_ratio"], 2),
+            "noise": round(float(self._noise_rms or 0.0), 1),
+        }
+
+    # ---------- CLAP DETECT ----------
     def _is_clap(self, feats: Dict[str, float]) -> bool:
         return (
             feats["peak_ratio"] >= float(self.cfg.clap_peak_ratio)
@@ -516,9 +585,7 @@ class ActiveListenerMain:
             and feats["zcr"] >= float(self.cfg.clap_zcr)
         )
 
-    # ----------------------------
-    # Camera
-    # ----------------------------
+    # ---------- CAMERA ----------
     def _capture_jpeg_frame(self) -> Optional[bytes]:
         if cv2 is None:
             return None
@@ -562,9 +629,7 @@ class ActiveListenerMain:
             except Exception:
                 pass
 
-    # ----------------------------
-    # Memory
-    # ----------------------------
+    # ---------- MEMORY ----------
     def _load_recent_memory(self) -> List[Dict[str, Any]]:
         if not self._mem_path.exists():
             return []
@@ -590,9 +655,7 @@ class ActiveListenerMain:
         except Exception as e:
             print("[MEM] write error:", e)
 
-    # ----------------------------
-    # Server
-    # ----------------------------
+    # ---------- SERVER ----------
     def _send_to_server(self, wav_path: str, image_bytes: Optional[bytes]) -> Optional[Dict[str, Any]]:
         mem = self._load_recent_memory()
         meta = {"ts": time.time(), "client": "pidog", "memory": mem}
@@ -621,7 +684,7 @@ class ActiveListenerMain:
 
     def _download(self, url: str, dst: str) -> bool:
         try:
-            rr = requests.get(url, timeout=30)
+            rr = requests.get(url, timeout=45)
             if rr.status_code != 200:
                 return False
             with open(dst, "wb") as f:
@@ -630,24 +693,27 @@ class ActiveListenerMain:
         except Exception:
             return False
 
-    # ----------------------------
-    # Handle server reply:
-    # - play.youtube -> video service
-    # - audio_url -> stop video -> face suprise + mouth move -> play audio
-    # ----------------------------
+    # ---------- NEW reply handling ----------
     def _handle_server_reply(self, resp: Dict[str, Any]):
         transcript = (resp.get("transcript") or "").strip()
         label = (resp.get("label") or "unknown").strip()
         reply_text = (resp.get("reply_text") or "").strip()
         audio_url = resp.get("audio_url")
-        play = resp.get("play")  # NEW
+
+        # ✅ NEW: play field for youtube
+        play = resp.get("play") or {}
+        play_type = str(play.get("type") or "").strip().lower()
+        play_url = str(play.get("url") or play.get("youtube_url") or "").strip()
 
         print("[SERVER] label=", label)
-        print("[USER ]", transcript)
+        if transcript:
+            print("[USER ]", transcript)
         if reply_text:
             print("[BOT  ]", reply_text)
-        print("[AUDIO]", audio_url)
-        print("[PLAY ]", play)
+        if audio_url:
+            print("[AUDIO]", audio_url)
+        if play_type:
+            print("[PLAY ]", play_type, play_url)
 
         self._append_memory({
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -658,112 +724,41 @@ class ActiveListenerMain:
             "play": play,
         })
 
-        # clap label from server
+        # clap label => bark local
         if label.lower() == "clap":
+            print("[CLAP->BARK] local bark")
             self._bark()
             return
 
-        # ---- YOUTUBE PLAY ----
-        if isinstance(play, dict) and (play.get("type") == "youtube" or play.get("provider") == "youtube"):
-            player_url = play.get("playerUrl") or play.get("player_url") or play.get("watchUrl") or play.get("watch_url")
-            dur = play.get("duration_sec") or play.get("duration")  # optional
-            if player_url:
-                ok = self.video.play_youtube(player_url)
-                print("[VIDEO] play ok?" , ok)
-
-                # block mic to avoid self-triggering from music
-                block_sec = float(dur) if isinstance(dur, (int, float)) and dur > 1 else float(self.cfg.youtube_default_block_sec)
-                self._block_until = time.time() + block_sec
+        # ✅ If server tells youtube playback
+        if play_type == "youtube" and play_url:
+            # start video service, pause mic recording while playing
+            self._start_youtube_video(play_url)
             return
 
-        # ---- AUDIO (chat / tts) ----
+        # ✅ If server returns audio_url: stop video then talk face + play audio
         if not audio_url:
-            # nothing to play: just ensure face mode
-            self.video.show_face()
-            self.face.emo("what_is_it")
             return
 
-        # stop video if needed + show face
-        self.video.stop_video()
-        self.video.show_face()
-
-        # download audio then play with surprise + mouth moving
-        tmpdir = tempfile.mkdtemp(prefix="reply_")
+        tmpdir = tempfile.mkdtemp(prefix="al2_play_")
         local = os.path.join(tmpdir, "reply.mp3")
         try:
+            # stop video before speaking (requested)
+            if VIDEO_STOP_ON_AUDIO:
+                self._ensure_video_stopped()
+
             if not self._download(audio_url, local):
-                print("[AUDIO] download failed:", audio_url)
+                print("[PLAY] download failed:", audio_url)
                 return
-            self._play_audio_with_mouth(local, emo="suprise", loops=1)
+
+            # talk face + let your face service do mouth animation (already in your service)
+            self._music_play_blocking(local, times=1, talk_face=True)
+
         finally:
             try:
                 shutil.rmtree(tmpdir, ignore_errors=True)
             except Exception:
                 pass
-
-    # ----------------------------
-    # Main loop
-    # ----------------------------
-    def run_forever(self):
-        print("[ActiveListenerMain] start listening...")
-        self._calibrate_noise_floor()
-
-        # idle face
-        self.video.show_face()
-        self.face.emo("what_is_it")
-        self.face.mouth(0.0)
-
-        while not self._stop:
-            # block while playing audio or while youtube is playing (block_until)
-            if self._playing_audio or (time.time() < self._block_until):
-                time.sleep(0.08)
-                continue
-
-            wav_path = self._record_wav(seconds=self.cfg.detect_chunk_sec)
-            if not wav_path:
-                time.sleep(0.08)
-                continue
-
-            try:
-                feats = self._extract_features(wav_path)
-                rms = feats["rms"]
-
-                if not self._passes_gate(rms):
-                    continue
-
-                # clap -> bark
-                if self._is_clap(feats):
-                    print("[CLAP] -> bark")
-                    self._bark()
-                    continue
-
-                # speech?
-                if feats["speech_score"] >= self.cfg.speech_score_threshold:
-                    print(f"[SPEECH] rms={rms:.0f} score={feats['speech_score']:.2f}")
-
-                    full_wav = self._record_wav(seconds=self.cfg.record_sec)
-                    if not full_wav:
-                        continue
-
-                    image_bytes = self._capture_jpeg_frame()
-                    resp = self._send_to_server(full_wav, image_bytes=image_bytes)
-                    if resp:
-                        self._handle_server_reply(resp)
-
-                    try:
-                        os.remove(full_wav)
-                    except Exception:
-                        pass
-                else:
-                    # env noise -> bark (as your old logic)
-                    print("[ENV] -> bark")
-                    self._bark()
-
-            finally:
-                try:
-                    os.remove(wav_path)
-                except Exception:
-                    pass
 
 
 def main():
@@ -783,15 +778,15 @@ def main():
         cam_backend="v4l2",
         gate_db_above_noise=10.0,
         speech_score_threshold=0.62,
-        playback_cooldown_sec=0.7,
+        playback_cooldown_sec=0.8,
         volume=80,
-        face_udp_host="127.0.0.1",
-        face_udp_port=39393,
-        video_service_url="http://127.0.0.1:9900",
-        youtube_default_block_sec=240.0,
+        face_idle="what_is_it",
+        face_talk="suprise",
+        face_bark="sad",
+        video_default_volume=80,
     )
 
-    al = ActiveListenerMain(cfg)
+    al = ActiveListenerV2(cfg)
 
     try:
         al.run_forever()
