@@ -174,16 +174,16 @@ class ListenerCfg:
     mic_device: str = "default"
     sample_rate: int = 16000
 
-    detect_chunk_sec: float = 0.6
+    detect_chunk_sec: float = 0.8
     record_sec: float = 6.0
 
     # noise gate
     noise_calib_sec: float = 1.2
-    gate_db_above_noise: float = 6.0
-    min_rms_floor: float = 500.0
+    gate_db_above_noise: float = 3.0
+    min_rms_floor: float = 300.0
 
     # speech score
-    speech_score_threshold: float = 0.52
+    speech_score_threshold: float = 0.32
 
     # clap detector
     clap_peak_ratio: float = 5.0
