@@ -75,62 +75,40 @@ def video_stop():
     chromium_proc = None
 
 
-def video_play(url: str) -> bool:
-    """
-    Start chromium in kiosk mode for given url.
-    Return True if process started and still alive after a short delay.
-    """
+VIDEO_USER = os.environ.get("VIDEO_USER", "matthewlupi")
+CHROMIUM = os.environ.get("CHROMIUM_BIN", "/usr/bin/chromium")
+DISPLAY = os.environ.get("DISPLAY", ":0")
+XAUTH = os.environ.get("XAUTHORITY", f"/home/{VIDEO_USER}/.Xauthority")
+
+def video_play(url: str):
     global chromium_proc
-    url = (url or "").strip()
     if not url:
         return False
 
-    # nhường màn hình cho video
+    # stop face (root sẽ làm được)
     face_stop()
     video_stop()
 
-    # isolate profile to avoid "restore tabs / crash bubbles"
-    user_data_dir = "/tmp/chromium-kiosk-profile"
-    os.makedirs(user_data_dir, exist_ok=True)
+    # thêm autoplay param cho chắc
+    if "youtube.com/watch" in url and "autoplay=" not in url:
+        url = url + ("&" if "?" in url else "?") + "autoplay=1"
 
     cmd = [
-        CHROMIUM,
-        "--kiosk",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--autoplay-policy=no-user-gesture-required",
-        "--disable-infobars",
-        "--disable-session-crashed-bubble",
-        "--disable-features=TranslateUI",
-        "--disable-component-update",
-        "--noerrdialogs",
-        f"--user-data-dir={user_data_dir}",
-        "--new-window",
-        url,
+        "runuser", "-l", VIDEO_USER, "-c",
+        (
+            f'DISPLAY={DISPLAY} XAUTHORITY={XAUTH} '
+            f'{CHROMIUM} '
+            f'--autoplay-policy=no-user-gesture-required '
+            f'--kiosk --noerrdialogs --disable-infobars '
+            f'--no-sandbox --disable-dev-shm-usage '
+            f'--user-data-dir=/tmp/chromium-kiosk '
+            f'--app="{url}"'
+        )
     ]
 
-    try:
-        chromium_proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception as e:
-        print("[VIDEO] failed to spawn chromium:", e)
-        chromium_proc = None
-        # mở lại mặt nếu play fail
-        face_start()
-        return False
-
-    # give it a moment; if it exits immediately => fail
-    time.sleep(0.25)
-    if chromium_proc.poll() is not None:
-        print("[VIDEO] chromium exited immediately. check DISPLAY/XAUTHORITY or url")
-        chromium_proc = None
-        face_start()
-        return False
-
+    chromium_proc = subprocess.Popen(cmd)
     return True
+
 
 
 class Handler(BaseHTTPRequestHandler):
