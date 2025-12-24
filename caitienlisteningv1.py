@@ -22,7 +22,6 @@ from typing import Optional, Dict, Any, List
 import numpy as np
 import requests
 
-# CV2 vẫn có thể giữ, nhưng với snapshot_file thì ActiveListener sẽ không mở camera nữa
 try:
     import cv2
 except Exception:
@@ -69,7 +68,6 @@ MQTT_PORT = 8883
 MQTT_USER = "robot_matthew"
 MQTT_PASS = "29061992abCD!yesokmen"
 
-# topics sent by your gesture-detect service
 GESTURE_TOPICS = {
     "STOPMUSIC": "/robot/gesture/stopmusic",
     "STANDUP":   "robot/gesture/standup",
@@ -82,41 +80,34 @@ GESTURE_TOPICS = {
 
 # =========================
 # Dummy JPEG (1x1) fallback
-# - dùng khi snapshot chưa có / đọc lỗi
 # =========================
 _DUMMY_JPEG_B64 = (
-    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/wAALCAAaABoBAREA/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAHf/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPwB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwB//9k="
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/wAALCAAaABoBAREA/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAHf/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPwB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwB//9k="
 )
 DUMMY_JPEG_BYTES = base64.b64decode(_DUMMY_JPEG_B64)
 
 
 @dataclass
 class ListenerCfg:
-    # audio input
     mic_device: str = "default"
     sample_rate: int = 16000
 
     detect_chunk_sec: float = 0.6
     record_sec: float = 6.0
 
-    # ===== auto noise gate (LOW like your old) =====
     noise_calib_sec: float = 1.2
     gate_db_above_noise: float = 4.0
     min_rms_floor: float = 200.0
 
-    # speech score (LOW)
     speech_score_threshold: float = 0.55
 
-    # clap detector
     clap_peak_ratio: float = 5.0
     clap_high_ratio: float = 0.12
     clap_zcr: float = 0.10
 
-    # server (still used for STT/TTS)
     server_url: str = "https://embeddedprogramming-healtheworldserver.up.railway.app/pi_upload_audio_v2"
     timeout_sec: float = 30.0
 
-    # camera (legacy - nếu snapshot_file có thì ActiveListener sẽ không mở cam)
     cam_dev: str = "/dev/video0"
     cam_w: int = 640
     cam_h: int = 480
@@ -124,32 +115,23 @@ class ListenerCfg:
     cam_warmup_frames: int = 6
     cam_backend: str = "v4l2"
 
-    # snapshot (NEW) - đọc ảnh từ gesture service
     snapshot_file: Optional[str] = "/tmp/gesture_latest.jpg"
-    snapshot_max_age_sec: float = 3.0  # nếu file quá cũ => fallback dummy
+    snapshot_max_age_sec: float = 3.0
 
-    # server requires image
     always_send_image: bool = True
 
-    # memory
     memory_file: str = "robot_memory.jsonl"
     memory_max_items_send: int = 12
 
-    # bark
     bark_wav: str = "tiengsua.wav"
     bark_times: int = 2
 
-    # ✅ waiting message while waiting HTTP response
     waiting_wav: str = "waitingmessage.wav"
     waiting_enable: bool = True
 
-    # cooldown after playback to avoid self-trigger
     playback_cooldown_sec: float = 0.7
-
-    # volume
     volume: int = 80
 
-    # mqtt enable
     mqtt_enable: bool = True
 
 
@@ -163,7 +145,6 @@ class GestureMqttSubscriber:
         self.client = mqtt.Client(protocol=mqtt.MQTTv311)
         self.client.username_pw_set(MQTT_USER, MQTT_PASS)
 
-        # TLS insecure (no verify)
         self.client.tls_set(cert_reqs=ssl.CERT_NONE)
         self.client.tls_insecure_set(True)
 
@@ -229,6 +210,9 @@ class ActiveListenerV2:
         # allow STOPMUSIC/STOP to interrupt playback immediately
         self._playback_stop_evt = threading.Event()
 
+        # ✅ audio lock (avoid race between waiting/play/stop)
+        self._audio_lock = threading.Lock()
+
         # motion command queue (from MQTT)
         self._cmd_lock = threading.Lock()
         self._pending_cmds: List[str] = []
@@ -247,20 +231,17 @@ class ActiveListenerV2:
 
         self._noise_rms: Optional[float] = None
 
-        # unlock speaker pin if needed (Robot HAT)
         try:
             os.system("pinctrl set 12 op dh")
             time.sleep(0.1)
         except Exception:
             pass
 
-        # mqtt subscriber
         self._mqtt = None
         if self.cfg.mqtt_enable:
             self._mqtt = GestureMqttSubscriber(self._on_gesture_cmd)
             self._mqtt.start()
 
-        # default face
         set_face("what_is_it")
         set_mouth(0.0)
 
@@ -291,13 +272,27 @@ class ActiveListenerV2:
         with self._cmd_lock:
             self._pending_cmds.append(cmd)
 
+    def _clear_stop_evt_delayed(self, delay_sec: float = 0.3):
+        # ✅ prevent "STOP event stuck" killing future waiting audio
+        def _job():
+            time.sleep(max(0.0, float(delay_sec)))
+            self._playback_stop_evt.clear()
+        threading.Thread(target=_job, daemon=True).start()
+
     def request_stopmusic(self):
+        # set event to notify any playback loops
         self._playback_stop_evt.set()
+
+        # stop actual sound now
         self._stop_audio_playback()
+
         self._playing_audio = False
         self._cooldown_until = time.time() + 0.05
         set_face("what_is_it")
         set_mouth(0.0)
+
+        # ✅ IMPORTANT: clear later so waiting loop can play again
+        self._clear_stop_evt_delayed(0.3)
 
     def _pop_pending_cmds(self) -> List[str]:
         with self._cmd_lock:
@@ -351,8 +346,9 @@ class ActiveListenerV2:
     # ----------------------------
     def _stop_audio_playback(self):
         try:
-            if hasattr(self.music, "music_stop"):
-                self.music.music_stop()
+            with self._audio_lock:
+                if hasattr(self.music, "music_stop"):
+                    self.music.music_stop()
         except Exception:
             pass
 
@@ -412,6 +408,7 @@ class ActiveListenerV2:
 
     def _music_play_blocking_with_lipsync(self, filepath: str, times: int = 1):
         self._playing_audio = True
+        # ✅ clear old STOP so it doesn't poison this playback
         self._playback_stop_evt.clear()
 
         stop_evt = threading.Event()
@@ -426,7 +423,11 @@ class ActiveListenerV2:
             th = threading.Thread(target=self._lipsync_worker, args=(filepath, stop_evt), daemon=True)
             th.start()
 
-            self.music.music_play(str(filepath), loops=loops)
+            try:
+                with self._audio_lock:
+                    self.music.music_play(str(filepath), loops=loops)
+            except Exception as e:
+                print("[PLAY] music_play error:", e, flush=True)
 
             if dur is None:
                 dur = 2.5
@@ -454,10 +455,14 @@ class ActiveListenerV2:
             set_mouth(0.0)
             set_face("what_is_it")
 
-            if self._playback_stop_evt.is_set():
-                self._cooldown_until = time.time() + 0.05
-            else:
-                self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
+            # ✅ IMPORTANT: do not leave STOP stuck
+            self._playback_stop_evt.clear()
+
+            if self._cooldown_until < time.time():
+                if self._playback_stop_evt.is_set():
+                    self._cooldown_until = time.time() + 0.05
+                else:
+                    self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
 
     def _bark(self):
         if not self._bark_path.exists():
@@ -471,7 +476,12 @@ class ActiveListenerV2:
         set_mouth(0.0)
 
         try:
-            self.music.music_play(str(self._bark_path), loops=max(1, int(self.cfg.bark_times)))
+            try:
+                with self._audio_lock:
+                    self.music.music_play(str(self._bark_path), loops=max(1, int(self.cfg.bark_times)))
+            except Exception as e:
+                print("[BARK] music_play error:", e, flush=True)
+
             dur = self._get_audio_duration_sec(str(self._bark_path))
             if dur is None:
                 dur = 2.2
@@ -489,6 +499,9 @@ class ActiveListenerV2:
             self._playing_audio = False
             set_face("what_is_it")
             set_mouth(0.0)
+
+            # ✅ IMPORTANT: clear stuck STOP
+            self._playback_stop_evt.clear()
 
             if self._playback_stop_evt.is_set():
                 self._cooldown_until = time.time() + 0.05
@@ -518,14 +531,14 @@ class ActiveListenerV2:
         self._playing_audio = True
         try:
             while (not stop_evt.is_set()) and (not self._stop):
+                # If user does STOP while waiting -> stop immediately
                 if self._playback_stop_evt.is_set():
-                    # STOP/STOPMUSIC interrupt
                     self._stop_audio_playback()
                     break
 
-                # play once
                 try:
-                    self.music.music_play(str(p), loops=1)
+                    with self._audio_lock:
+                        self.music.music_play(str(p), loops=1)
                 except Exception as e:
                     print("[WAIT] play error:", e, flush=True)
                     break
@@ -533,20 +546,14 @@ class ActiveListenerV2:
                 t_end = time.time() + float(dur) + 0.05
                 while time.time() < t_end:
                     if stop_evt.is_set() or self._stop or self._playback_stop_evt.is_set():
-                        try:
-                            self._stop_audio_playback()
-                        except Exception:
-                            pass
+                        self._stop_audio_playback()
                         break
                     time.sleep(0.05)
-
-                # loop again if still waiting
         finally:
-            try:
-                self._stop_audio_playback()
-            except Exception:
-                pass
+            self._stop_audio_playback()
             self._playing_audio = False
+            # ✅ IMPORTANT: do not let old STOP block next waiting
+            self._playback_stop_evt.clear()
             print("[WAIT] stop waitingmessage loop", flush=True)
 
     # ----------------------------
@@ -589,10 +596,11 @@ class ActiveListenerV2:
                     if not full_wav:
                         continue
 
-                    # ✅ đọc ảnh snapshot từ gesture service
                     image_bytes = self._get_image_bytes_for_request()
 
-                    # ✅ START waiting sound while HTTP request is pending
+                    # ✅ FIX: clear old STOP before starting waiting sound
+                    self._playback_stop_evt.clear()
+
                     wait_stop = threading.Event()
                     wait_th = None
                     if self.cfg.waiting_enable and self._waiting_path.exists():
@@ -606,19 +614,16 @@ class ActiveListenerV2:
                     try:
                         resp = self._send_to_server(full_wav, image_bytes=image_bytes)
                     finally:
-                        # stop waiting loop immediately (even on error/timeout)
                         wait_stop.set()
-                        try:
-                            self._stop_audio_playback()
-                        except Exception:
-                            pass
+                        self._stop_audio_playback()
                         if wait_th:
                             try:
                                 wait_th.join(timeout=1.2)
                             except Exception:
                                 pass
-                        # ensure not stuck in playing state
                         self._playing_audio = False
+                        # ✅ ensure STOP not stuck after waiting finishes
+                        self._playback_stop_evt.clear()
 
                     if resp:
                         self._handle_server_reply(resp)
@@ -638,14 +643,9 @@ class ActiveListenerV2:
                     pass
 
     # ----------------------------
-    # Snapshot image (READ FROM FILE)
+    # Snapshot image
     # ----------------------------
     def _get_image_bytes_for_request(self) -> Optional[bytes]:
-        """
-        Ưu tiên snapshot_file (gesture service xuất ảnh ra /tmp).
-        - Nếu file không có / quá cũ / lỗi đọc => fallback dummy.
-        """
-        # 1) snapshot file first
         if self.cfg.snapshot_file:
             try:
                 p = Path(self.cfg.snapshot_file)
@@ -653,12 +653,9 @@ class ActiveListenerV2:
                     age = time.time() - p.stat().st_mtime
                     if age <= float(self.cfg.snapshot_max_age_sec):
                         return p.read_bytes()
-                    else:
-                        pass
             except Exception:
                 pass
 
-        # 2) fallback dummy
         if bool(self.cfg.always_send_image):
             return DUMMY_JPEG_BYTES
 
@@ -934,7 +931,6 @@ class ActiveListenerV2:
             "audio_url": audio_url,
         })
 
-        # NOTE: stop nhạc không nhận từ server nữa, mà qua MQTT STOP/STOPMUSIC
         if audio_url:
             tmpdir = tempfile.mkdtemp(prefix="al2_play_")
             local = os.path.join(tmpdir, "reply.mp3")
@@ -966,16 +962,13 @@ def main():
         bark_wav="tiengsua.wav",
         bark_times=2,
 
-        # ✅ waiting message
         waiting_wav="waitingmessage.wav",
         waiting_enable=True,
 
-        # ✅ snapshot from gesture service
         snapshot_file="/tmp/gesture_latest.jpg",
         snapshot_max_age_sec=3.0,
         always_send_image=True,
 
-        # legacy cam fields (không dùng nếu snapshot_file ok)
         cam_dev="/dev/video0",
         cam_backend="v4l2",
 
