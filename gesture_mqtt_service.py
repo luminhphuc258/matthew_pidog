@@ -152,7 +152,7 @@ def main():
             cam_dev="/dev/video0",
             w=640, h=480, fps=30,
             process_every=2,
-            action_cooldown_sec=0.45,
+            action_cooldown_sec=0.7,
 
             # vị trí: bạn có thể chỉnh nhanh ở đây nếu muốn nhạy hơn / khó hơn
             pos_left_x=0.18,
