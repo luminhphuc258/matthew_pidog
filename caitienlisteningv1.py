@@ -13,6 +13,7 @@ import tempfile
 import subprocess
 import threading
 import socket
+import ssl
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -24,6 +25,8 @@ try:
     import cv2
 except Exception:
     cv2 = None
+
+import paho.mqtt.client as mqtt
 
 from robot_hat import Music
 from motion_controller import MotionController
@@ -56,6 +59,25 @@ def set_mouth(level01: float):
     _udp_send(f"MOUTH {level01:.3f}")
 
 
+# =========================
+# MQTT Gesture topics (subscribe)
+# =========================
+MQTT_HOST = "rfff7184.ala.us-east-1.emqxsl.com"
+MQTT_PORT = 8883
+MQTT_USER = "robot_matthew"
+MQTT_PASS = "29061992abCD!yesokmen"
+
+# topics sent by your gesture-detect service
+GESTURE_TOPICS = {
+    "STOPMUSIC": "/robot/gesture/stopmusic",
+    "STANDUP":   "robot/gesture/standup",
+    "SIT":       "robot/gesture/sit",
+    "MOVELEFT":  "robot/gesture/moveleft",
+    "MOVERIGHT": "robot/moveright",
+    "STOP":      "/robot/gesture/stop",
+}
+
+
 @dataclass
 class ListenerCfg:
     # audio input
@@ -78,7 +100,7 @@ class ListenerCfg:
     clap_high_ratio: float = 0.12
     clap_zcr: float = 0.10
 
-    # server
+    # server (still used for STT/TTS)
     server_url: str = "https://embeddedprogramming-healtheworldserver.up.railway.app/pi_upload_audio_v2"
     timeout_sec: float = 30.0
 
@@ -104,15 +126,94 @@ class ListenerCfg:
     # volume
     volume: int = 80
 
+    # mqtt enable
+    mqtt_enable: bool = True
+
+
+class GestureMqttSubscriber:
+    """
+    Subscribe gesture topics and call callbacks.
+    TLS insecure: no CA.
+    """
+    def __init__(self, on_cmd):
+        self.on_cmd = on_cmd
+        self.client = mqtt.Client(protocol=mqtt.MQTTv311)
+        self.client.username_pw_set(MQTT_USER, MQTT_PASS)
+
+        # TLS insecure (no verify)
+        self.client.tls_set(cert_reqs=ssl.CERT_NONE)
+        self.client.tls_insecure_set(True)
+
+        self.client.on_connect = self._on_connect
+        self.client.on_message = self._on_message
+        self.client.on_disconnect = self._on_disconnect
+
+        self._connected = False
+
+        # reverse lookup: topic -> cmd
+        self._topic_to_cmd = {v: k for k, v in GESTURE_TOPICS.items()}
+
+    def _on_connect(self, client, userdata, flags, rc):
+        self._connected = (rc == 0)
+        print(f"[MQTT] connected rc={rc}", flush=True)
+        if rc == 0:
+            for tp in self._topic_to_cmd.keys():
+                try:
+                    client.subscribe(tp, qos=0)
+                    print(f"[MQTT] subscribe {tp}", flush=True)
+                except Exception as e:
+                    print("[MQTT] subscribe error:", e, flush=True)
+
+    def _on_disconnect(self, client, userdata, rc):
+        self._connected = False
+        print(f"[MQTT] disconnected rc={rc}", flush=True)
+
+    def _on_message(self, client, userdata, msg):
+        try:
+            topic = (msg.topic or "").strip()
+            cmd = self._topic_to_cmd.get(topic)
+            if not cmd:
+                return
+            # payload not required
+            print(f"[MQTT] recv {topic} -> {cmd}", flush=True)
+            self.on_cmd(cmd)
+        except Exception as e:
+            print("[MQTT] on_message error:", e, flush=True)
+
+    def start(self):
+        self.client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=30)
+        self.client.loop_start()
+
+    def stop(self):
+        try:
+            self.client.loop_stop()
+        except Exception:
+            pass
+        try:
+            self.client.disconnect()
+        except Exception:
+            pass
+
 
 class ActiveListenerV2:
-    def __init__(self, cfg: ListenerCfg):
+    def __init__(self, cfg: ListenerCfg, motion: Optional[MotionController] = None):
         self.cfg = cfg
+        self.motion = motion
+
         self._stop = False
 
         # playback state
         self._playing_audio = False
         self._cooldown_until = 0.0
+
+        # allow STOPMUSIC/STOP to interrupt playback immediately
+        self._playback_stop_evt = threading.Event()
+
+        # motion command queue (from MQTT)
+        self._cmd_lock = threading.Lock()
+        self._pending_cmds: List[str] = []
+        self._last_cmd_ts: Dict[str, float] = {}
+        self._cmd_cooldown = 0.25  # avoid spam
 
         self.music = Music()
         try:
@@ -122,7 +223,6 @@ class ActiveListenerV2:
 
         self._mem_path = Path(self.cfg.memory_file)
         self._bark_path = Path(self.cfg.bark_wav)
-
         self._noise_rms: Optional[float] = None
 
         # unlock speaker pin if needed (Robot HAT)
@@ -132,15 +232,119 @@ class ActiveListenerV2:
         except Exception:
             pass
 
+        # mqtt subscriber
+        self._mqtt = None
+        if self.cfg.mqtt_enable:
+            self._mqtt = GestureMqttSubscriber(self._on_gesture_cmd)
+            self._mqtt.start()
+
         # default face
         set_face("what_is_it")
         set_mouth(0.0)
 
     def stop(self):
         self._stop = True
+        try:
+            if self._mqtt:
+                self._mqtt.stop()
+        except Exception:
+            pass
 
     # ----------------------------
-    # Audio playback (blocking) + lipsync
+    # MQTT gesture handling
+    # ----------------------------
+    def _on_gesture_cmd(self, cmd: str):
+        """
+        cmd: STOPMUSIC / STANDUP / SIT / MOVELEFT / MOVERIGHT / STOP
+        """
+        now = time.time()
+        with self._cmd_lock:
+            last = self._last_cmd_ts.get(cmd, 0.0)
+            if (now - last) < self._cmd_cooldown:
+                return
+            self._last_cmd_ts[cmd] = now
+
+        # ✅ STOP hoặc STOPMUSIC: đều stop nhạc + resume listening ngay
+        if cmd in ("STOPMUSIC", "STOP"):
+            print(f"[GESTURE] {cmd} -> stop audio + resume listening", flush=True)
+            self.request_stopmusic()
+            return
+
+        # other commands: push to queue, handled in main loop
+        with self._cmd_lock:
+            self._pending_cmds.append(cmd)
+
+    def request_stopmusic(self):
+        """
+        STOP/STOPMUSIC:
+          - stop audio immediately
+          - clear playing flag so mic resumes NOW
+          - tiny cooldown only (avoid self-trigger)
+        """
+        self._playback_stop_evt.set()
+        self._stop_audio_playback()
+        self._playing_audio = False
+        self._cooldown_until = time.time() + 0.05
+        set_face("what_is_it")
+        set_mouth(0.0)
+
+    def _pop_pending_cmds(self) -> List[str]:
+        with self._cmd_lock:
+            cmds = self._pending_cmds[:]
+            self._pending_cmds.clear()
+        return cmds
+
+    def _handle_motion_cmd(self, cmd: str):
+        """
+        Best-effort call to MotionController.
+        """
+        if not self.motion:
+            return
+
+        # map gesture cmd -> action string
+        action = None
+        if cmd == "STANDUP":
+            action = "STAND"
+        elif cmd == "SIT":
+            action = "SIT"
+        elif cmd == "MOVELEFT":
+            action = "TURN_LEFT"
+        elif cmd == "MOVERIGHT":
+            action = "TURN_RIGHT"
+        elif cmd == "STOP":
+            action = "STOP"
+
+        if not action:
+            return
+
+        print(f"[MOTION] {cmd} -> {action}", flush=True)
+
+        # Try common APIs (safe)
+        try:
+            # 1) generic move(action)
+            if hasattr(self.motion, "move"):
+                self.motion.move(action)
+                return
+            # 2) command(action)
+            if hasattr(self.motion, "command"):
+                self.motion.command(action)
+                return
+            # 3) specific methods
+            if action == "STAND" and hasattr(self.motion, "stand"):
+                self.motion.stand(); return
+            if action == "SIT" and hasattr(self.motion, "sit"):
+                self.motion.sit(); return
+            if action == "TURN_LEFT" and hasattr(self.motion, "turn_left"):
+                self.motion.turn_left(); return
+            if action == "TURN_RIGHT" and hasattr(self.motion, "turn_right"):
+                self.motion.turn_right(); return
+            if action == "STOP" and hasattr(self.motion, "stop"):
+                self.motion.stop(); return
+        except Exception as e:
+            print("[MOTION] error:", e, flush=True)
+
+    # ----------------------------
+    # Audio playback + lipsync
     # ----------------------------
     def _stop_audio_playback(self):
         try:
@@ -176,10 +380,6 @@ class ActiveListenerV2:
         return None
 
     def _lipsync_worker(self, audio_path: str, stop_evt: threading.Event):
-        """
-        Decode audio -> estimate envelope -> send MOUTH level.
-        Uses ffmpeg to output raw s16le mono 16k.
-        """
         try:
             cmd = [
                 "ffmpeg", "-hide_banner", "-loglevel", "error",
@@ -196,7 +396,7 @@ class ActiveListenerV2:
                     break
                 x = np.frombuffer(buf, dtype=np.int16).astype(np.float32)
                 rms = float(np.sqrt(np.mean(x * x) + 1e-9))
-                level = min(1.0, max(0.0, (rms / 4000.0)))  # tune if needed
+                level = min(1.0, max(0.0, (rms / 4000.0)))
                 set_mouth(level)
             try:
                 p.terminate()
@@ -210,9 +410,11 @@ class ActiveListenerV2:
     def _music_play_blocking_with_lipsync(self, filepath: str, times: int = 1):
         """
         Play audio blocking AND lipsync mouth.
-        During playback: mic skip.
+        STOP/STOPMUSIC can interrupt playback immediately.
         """
         self._playing_audio = True
+        self._playback_stop_evt.clear()
+
         stop_evt = threading.Event()
         th = None
         try:
@@ -227,13 +429,20 @@ class ActiveListenerV2:
 
             self.music.music_play(str(filepath), loops=loops)
 
-            if dur is not None:
-                time.sleep(dur * loops + 0.15)
-            else:
-                time.sleep(2.5 * loops)
+            if dur is None:
+                dur = 2.5
+            total = dur * loops + 0.15
+
+            t_end = time.time() + total
+            while time.time() < t_end:
+                if self._playback_stop_evt.is_set():
+                    print("[PLAY] interrupted by STOP/STOPMUSIC", flush=True)
+                    self._stop_audio_playback()
+                    break
+                time.sleep(0.05)
 
         except Exception as e:
-            print("[PLAY] error:", e)
+            print("[PLAY] error:", e, flush=True)
         finally:
             stop_evt.set()
             try:
@@ -245,37 +454,63 @@ class ActiveListenerV2:
             self._playing_audio = False
             set_mouth(0.0)
             set_face("what_is_it")
-            self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
+
+            # if interrupted, resume fast; else normal cooldown
+            if self._playback_stop_evt.is_set():
+                self._cooldown_until = time.time() + 0.05
+            else:
+                self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
 
     def _bark(self):
         if not self._bark_path.exists():
-            print(f"[WARN] bark file not found: {self._bark_path}")
+            print(f"[WARN] bark file not found: {self._bark_path}", flush=True)
             return
+
+        self._playing_audio = True
+        self._playback_stop_evt.clear()
+
         set_face("sad")
         set_mouth(0.0)
 
-        self._playing_audio = True
         try:
             self.music.music_play(str(self._bark_path), loops=max(1, int(self.cfg.bark_times)))
             dur = self._get_audio_duration_sec(str(self._bark_path))
-            if dur:
-                time.sleep(dur * max(1, int(self.cfg.bark_times)) + 0.15)
-            else:
-                time.sleep(2.2 * max(1, int(self.cfg.bark_times)))
+            if dur is None:
+                dur = 2.2
+            total = dur * max(1, int(self.cfg.bark_times)) + 0.15
+
+            t_end = time.time() + total
+            while time.time() < t_end:
+                if self._playback_stop_evt.is_set():
+                    print("[BARK] interrupted by STOP/STOPMUSIC", flush=True)
+                    self._stop_audio_playback()
+                    break
+                time.sleep(0.05)
+
         finally:
             self._playing_audio = False
             set_face("what_is_it")
             set_mouth(0.0)
-            self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
+
+            if self._playback_stop_evt.is_set():
+                self._cooldown_until = time.time() + 0.05
+            else:
+                self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
 
     # ----------------------------
     # Main loop
     # ----------------------------
     def run_forever(self):
-        print("[ActiveListenerV2] start listening...")
+        print("[ActiveListenerV2] start listening...", flush=True)
         self._calibrate_noise_floor()
 
         while not self._stop:
+            # handle pending motion commands (from MQTT)
+            cmds = self._pop_pending_cmds()
+            for c in cmds:
+                self._handle_motion_cmd(c)
+
+            # mic skip during playback/cooldown
             if self._playing_audio or (time.time() < self._cooldown_until):
                 time.sleep(0.05)
                 continue
@@ -294,13 +529,13 @@ class ActiveListenerV2:
 
                 # Clap -> bark
                 if self._is_clap(feats):
-                    print(f"[CLAP] rms={rms:.0f} peak/rms={feats['peak_ratio']:.1f} hi={feats['high_ratio']:.3f} zcr={feats['zcr']:.3f} -> BARK")
+                    print(f"[CLAP] rms={rms:.0f} peak/rms={feats['peak_ratio']:.1f} hi={feats['high_ratio']:.3f} zcr={feats['zcr']:.3f} -> BARK", flush=True)
                     self._bark()
                     continue
 
                 # speech check
                 if feats["speech_score"] >= float(self.cfg.speech_score_threshold):
-                    print(f"[SPEECH] rms={rms:.0f} score={feats['speech_score']:.2f} dbg={self._dbg_dict(feats)} -> record full")
+                    print(f"[SPEECH] rms={rms:.0f} score={feats['speech_score']:.2f} dbg={self._dbg_dict(feats)} -> record full", flush=True)
 
                     full_wav = self._record_wav(seconds=self.cfg.record_sec)
                     if not full_wav:
@@ -317,7 +552,7 @@ class ActiveListenerV2:
                         pass
                 else:
                     # env noise => bark
-                    print(f"[ENV] rms={rms:.0f} score={feats['speech_score']:.2f} dbg={self._dbg_dict(feats)} -> BARK")
+                    print(f"[ENV] rms={rms:.0f} score={feats['speech_score']:.2f} dbg={self._dbg_dict(feats)} -> BARK", flush=True)
                     self._bark()
 
             finally:
@@ -334,7 +569,7 @@ class ActiveListenerV2:
         n_chunks = int(math.ceil(secs / max(0.2, self.cfg.detect_chunk_sec)))
         samples = []
 
-        print(f"[CALIB] measuring noise floor for ~{secs:.1f}s ... keep quiet if possible")
+        print(f"[CALIB] measuring noise floor for ~{secs:.1f}s ... keep quiet if possible", flush=True)
         for _ in range(max(2, n_chunks)):
             if self._stop:
                 break
@@ -359,7 +594,7 @@ class ActiveListenerV2:
             med = float(np.median(np.array(samples)))
             self._noise_rms = max(float(self.cfg.min_rms_floor), med)
 
-        print(f"[CALIB] noise_rms≈{self._noise_rms:.0f}  gate=+{self.cfg.gate_db_above_noise:.1f}dB")
+        print(f"[CALIB] noise_rms≈{self._noise_rms:.0f}  gate=+{self.cfg.gate_db_above_noise:.1f}dB", flush=True)
 
     def _passes_gate(self, rms: float) -> bool:
         floor = float(self.cfg.min_rms_floor)
@@ -560,7 +795,7 @@ class ActiveListenerV2:
             with self._mem_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception as e:
-            print("[MEM] write error:", e)
+            print("[MEM] write error:", e, flush=True)
 
     # ----------------------------
     # Server
@@ -576,14 +811,14 @@ class ActiveListenerV2:
         data = {"meta": json.dumps(meta, ensure_ascii=False)}
 
         try:
-            print("[HTTP] POST", self.cfg.server_url, "image=" + ("yes" if image_bytes else "no"))
+            print("[HTTP] POST", self.cfg.server_url, "image=" + ("yes" if image_bytes else "no"), flush=True)
             r = requests.post(self.cfg.server_url, files=files, data=data, timeout=self.cfg.timeout_sec)
             if r.status_code != 200:
-                print("[HTTP] bad status:", r.status_code, r.text[:300])
+                print("[HTTP] bad status:", r.status_code, r.text[:300], flush=True)
                 return None
             return r.json()
         except Exception as e:
-            print("[HTTP] error:", e)
+            print("[HTTP] error:", e, flush=True)
             return None
         finally:
             try:
@@ -611,11 +846,11 @@ class ActiveListenerV2:
         reply_text = (resp.get("reply_text") or "").strip()
         audio_url = resp.get("audio_url")
 
-        print("[SERVER] label=", label)
-        print("[USER ]", transcript)
+        print("[SERVER] label=", label, flush=True)
+        print("[USER ]", transcript, flush=True)
         if reply_text:
-            print("[BOT  ]", reply_text)
-        print("[AUDIO]", audio_url)
+            print("[BOT  ]", reply_text, flush=True)
+        print("[AUDIO]", audio_url, flush=True)
 
         self._append_memory({
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -625,25 +860,16 @@ class ActiveListenerV2:
             "audio_url": audio_url,
         })
 
-        # Stop playback command
-        if label.lower() in {"stop_playback", "stop"}:
-            print("[STOP] server asked stop playback")
-            self._stop_audio_playback()
-            set_face("what_is_it")
-            set_mouth(0.0)
-            self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
-            return
+        # NOTE: stop nhạc không nhận từ server nữa, mà qua MQTT STOP/STOPMUSIC
 
-        # Normal audio_url: play it
         if audio_url:
             tmpdir = tempfile.mkdtemp(prefix="al2_play_")
             local = os.path.join(tmpdir, "reply.mp3")
             try:
                 if not self._download(audio_url, local):
-                    print("[PLAY] download failed:", audio_url)
+                    print("[PLAY] download failed:", audio_url, flush=True)
                     return
 
-                # if label = nhac -> show music face while playing
                 if label.strip().lower() == "nhac":
                     set_face("music")
                 self._music_play_blocking_with_lipsync(local, times=1)
@@ -659,7 +885,7 @@ def main():
     POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
     mc = MotionController(pose_file=POSE_FILE)
 
-    print("[1] BOOT")
+    print("[1] BOOT", flush=True)
     mc.boot()
     time.sleep(0.8)
 
@@ -678,9 +904,10 @@ def main():
 
         playback_cooldown_sec=0.7,
         volume=80,
+        mqtt_enable=True,
     )
 
-    al = ActiveListenerV2(cfg)
+    al = ActiveListenerV2(cfg, motion=mc)
 
     try:
         al.run_forever()
