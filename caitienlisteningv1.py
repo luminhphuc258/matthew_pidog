@@ -14,6 +14,7 @@ import subprocess
 import threading
 import socket
 import ssl
+import base64
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -21,6 +22,7 @@ from typing import Optional, Dict, Any, List
 import numpy as np
 import requests
 
+# CV2 vẫn có thể giữ, nhưng với snapshot_file thì ActiveListener sẽ không mở camera nữa
 try:
     import cv2
 except Exception:
@@ -78,6 +80,16 @@ GESTURE_TOPICS = {
 }
 
 
+# =========================
+# Dummy JPEG (1x1) fallback
+# - dùng khi snapshot chưa có / đọc lỗi
+# =========================
+_DUMMY_JPEG_B64 = (
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/wAALCAAaABoBAREA/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAHf/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPwB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwB//9k="
+)
+DUMMY_JPEG_BYTES = base64.b64decode(_DUMMY_JPEG_B64)
+
+
 @dataclass
 class ListenerCfg:
     # audio input
@@ -104,13 +116,20 @@ class ListenerCfg:
     server_url: str = "https://embeddedprogramming-healtheworldserver.up.railway.app/pi_upload_audio_v2"
     timeout_sec: float = 30.0
 
-    # camera
+    # camera (legacy - nếu snapshot_file có thì ActiveListener sẽ không mở cam)
     cam_dev: str = "/dev/video0"
     cam_w: int = 640
     cam_h: int = 480
     jpeg_quality: int = 80
     cam_warmup_frames: int = 6
     cam_backend: str = "v4l2"
+
+    # snapshot (NEW) - đọc ảnh từ gesture service
+    snapshot_file: Optional[str] = "/tmp/gesture_latest.jpg"
+    snapshot_max_age_sec: float = 3.0  # nếu file quá cũ => fallback dummy
+
+    # server requires image
+    always_send_image: bool = True
 
     # memory
     memory_file: str = "robot_memory.jsonl"
@@ -149,8 +168,6 @@ class GestureMqttSubscriber:
         self.client.on_disconnect = self._on_disconnect
 
         self._connected = False
-
-        # reverse lookup: topic -> cmd
         self._topic_to_cmd = {v: k for k, v in GESTURE_TOPICS.items()}
 
     def _on_connect(self, client, userdata, flags, rc):
@@ -174,7 +191,6 @@ class GestureMqttSubscriber:
             cmd = self._topic_to_cmd.get(topic)
             if not cmd:
                 return
-            # payload not required
             print(f"[MQTT] recv {topic} -> {cmd}", flush=True)
             self.on_cmd(cmd)
         except Exception as e:
@@ -213,7 +229,7 @@ class ActiveListenerV2:
         self._cmd_lock = threading.Lock()
         self._pending_cmds: List[str] = []
         self._last_cmd_ts: Dict[str, float] = {}
-        self._cmd_cooldown = 0.25  # avoid spam
+        self._cmd_cooldown = 0.25
 
         self.music = Music()
         try:
@@ -254,9 +270,6 @@ class ActiveListenerV2:
     # MQTT gesture handling
     # ----------------------------
     def _on_gesture_cmd(self, cmd: str):
-        """
-        cmd: STOPMUSIC / STANDUP / SIT / MOVELEFT / MOVERIGHT / STOP
-        """
         now = time.time()
         with self._cmd_lock:
             last = self._last_cmd_ts.get(cmd, 0.0)
@@ -264,23 +277,15 @@ class ActiveListenerV2:
                 return
             self._last_cmd_ts[cmd] = now
 
-        # ✅ STOP hoặc STOPMUSIC: đều stop nhạc + resume listening ngay
         if cmd in ("STOPMUSIC", "STOP"):
             print(f"[GESTURE] {cmd} -> stop audio + resume listening", flush=True)
             self.request_stopmusic()
             return
 
-        # other commands: push to queue, handled in main loop
         with self._cmd_lock:
             self._pending_cmds.append(cmd)
 
     def request_stopmusic(self):
-        """
-        STOP/STOPMUSIC:
-          - stop audio immediately
-          - clear playing flag so mic resumes NOW
-          - tiny cooldown only (avoid self-trigger)
-        """
         self._playback_stop_evt.set()
         self._stop_audio_playback()
         self._playing_audio = False
@@ -295,13 +300,9 @@ class ActiveListenerV2:
         return cmds
 
     def _handle_motion_cmd(self, cmd: str):
-        """
-        Best-effort call to MotionController.
-        """
         if not self.motion:
             return
 
-        # map gesture cmd -> action string
         action = None
         if cmd == "STANDUP":
             action = "STAND"
@@ -319,17 +320,13 @@ class ActiveListenerV2:
 
         print(f"[MOTION] {cmd} -> {action}", flush=True)
 
-        # Try common APIs (safe)
         try:
-            # 1) generic move(action)
             if hasattr(self.motion, "move"):
                 self.motion.move(action)
                 return
-            # 2) command(action)
             if hasattr(self.motion, "command"):
                 self.motion.command(action)
                 return
-            # 3) specific methods
             if action == "STAND" and hasattr(self.motion, "stand"):
                 self.motion.stand(); return
             if action == "SIT" and hasattr(self.motion, "sit"):
@@ -388,7 +385,7 @@ class ActiveListenerV2:
                 "-f", "s16le", "pipe:1"
             ]
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            chunk_samples = int(16000 * 0.05)  # 50ms
+            chunk_samples = int(16000 * 0.05)
             chunk_bytes = chunk_samples * 2
             while not stop_evt.is_set():
                 buf = p.stdout.read(chunk_bytes) if p.stdout else b""
@@ -408,10 +405,6 @@ class ActiveListenerV2:
             set_mouth(0.0)
 
     def _music_play_blocking_with_lipsync(self, filepath: str, times: int = 1):
-        """
-        Play audio blocking AND lipsync mouth.
-        STOP/STOPMUSIC can interrupt playback immediately.
-        """
         self._playing_audio = True
         self._playback_stop_evt.clear()
 
@@ -455,7 +448,6 @@ class ActiveListenerV2:
             set_mouth(0.0)
             set_face("what_is_it")
 
-            # if interrupted, resume fast; else normal cooldown
             if self._playback_stop_evt.is_set():
                 self._cooldown_until = time.time() + 0.05
             else:
@@ -505,12 +497,10 @@ class ActiveListenerV2:
         self._calibrate_noise_floor()
 
         while not self._stop:
-            # handle pending motion commands (from MQTT)
             cmds = self._pop_pending_cmds()
             for c in cmds:
                 self._handle_motion_cmd(c)
 
-            # mic skip during playback/cooldown
             if self._playing_audio or (time.time() < self._cooldown_until):
                 time.sleep(0.05)
                 continue
@@ -527,13 +517,11 @@ class ActiveListenerV2:
                 if not self._passes_gate(rms):
                     continue
 
-                # Clap -> bark
                 if self._is_clap(feats):
                     print(f"[CLAP] rms={rms:.0f} peak/rms={feats['peak_ratio']:.1f} hi={feats['high_ratio']:.3f} zcr={feats['zcr']:.3f} -> BARK", flush=True)
                     self._bark()
                     continue
 
-                # speech check
                 if feats["speech_score"] >= float(self.cfg.speech_score_threshold):
                     print(f"[SPEECH] rms={rms:.0f} score={feats['speech_score']:.2f} dbg={self._dbg_dict(feats)} -> record full", flush=True)
 
@@ -541,7 +529,9 @@ class ActiveListenerV2:
                     if not full_wav:
                         continue
 
-                    image_bytes = self._capture_jpeg_frame()
+                    # ✅ đọc ảnh snapshot từ gesture service
+                    image_bytes = self._get_image_bytes_for_request()
+
                     resp = self._send_to_server(full_wav, image_bytes=image_bytes)
                     if resp:
                         self._handle_server_reply(resp)
@@ -551,7 +541,6 @@ class ActiveListenerV2:
                     except Exception:
                         pass
                 else:
-                    # env noise => bark
                     print(f"[ENV] rms={rms:.0f} score={feats['speech_score']:.2f} dbg={self._dbg_dict(feats)} -> BARK", flush=True)
                     self._bark()
 
@@ -560,6 +549,35 @@ class ActiveListenerV2:
                     os.remove(wav_path)
                 except Exception:
                     pass
+
+    # ----------------------------
+    # Snapshot image (READ FROM FILE)
+    # ----------------------------
+    def _get_image_bytes_for_request(self) -> Optional[bytes]:
+        """
+        Ưu tiên snapshot_file (gesture service xuất ảnh ra /tmp).
+        - Nếu file không có / quá cũ / lỗi đọc => fallback dummy.
+        """
+        # 1) snapshot file first
+        if self.cfg.snapshot_file:
+            try:
+                p = Path(self.cfg.snapshot_file)
+                if p.exists() and p.stat().st_size > 500:
+                    age = time.time() - p.stat().st_mtime
+                    if age <= float(self.cfg.snapshot_max_age_sec):
+                        return p.read_bytes()
+                    else:
+                        # file quá cũ => vẫn có thể đọc, nhưng ưu tiên dummy cho chắc
+                        # (bạn muốn vẫn gửi ảnh cũ thì đổi logic ở đây)
+                        pass
+            except Exception:
+                pass
+
+        # 2) fallback dummy
+        if bool(self.cfg.always_send_image):
+            return DUMMY_JPEG_BYTES
+
+        return None
 
     # ----------------------------
     # Noise floor / gate
@@ -724,52 +742,6 @@ class ActiveListenerV2:
         )
 
     # ----------------------------
-    # Camera
-    # ----------------------------
-    def _capture_jpeg_frame(self) -> Optional[bytes]:
-        if cv2 is None:
-            return None
-
-        cap = None
-        try:
-            backend = cv2.CAP_V4L2 if self.cfg.cam_backend.lower() == "v4l2" else 0
-            cap = cv2.VideoCapture(self.cfg.cam_dev, backend)
-            if not cap.isOpened():
-                return None
-
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg.cam_w)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg.cam_h)
-
-            try:
-                fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-                cap.set(cv2.CAP_PROP_FOURCC, fourcc)
-            except Exception:
-                pass
-
-            frame = None
-            for _ in range(max(2, int(self.cfg.cam_warmup_frames))):
-                ok, fr = cap.read()
-                if ok and fr is not None:
-                    frame = fr
-
-            if frame is None:
-                return None
-
-            ok2, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.cfg.jpeg_quality)])
-            if not ok2:
-                return None
-            return buf.tobytes()
-
-        except Exception:
-            return None
-        finally:
-            try:
-                if cap is not None:
-                    cap.release()
-            except Exception:
-                pass
-
-    # ----------------------------
     # Memory
     # ----------------------------
     def _load_recent_memory(self) -> List[Dict[str, Any]]:
@@ -804,25 +776,42 @@ class ActiveListenerV2:
         mem = self._load_recent_memory()
         meta = {"ts": time.time(), "client": "pidog", "memory": mem}
 
-        files = {"audio": ("audio.wav", open(wav_path, "rb"), "audio/wav")}
-        if image_bytes:
-            files["image"] = ("frame.jpg", image_bytes, "image/jpeg")
-
         data = {"meta": json.dumps(meta, ensure_ascii=False)}
 
+        audio_f = None
         try:
-            print("[HTTP] POST", self.cfg.server_url, "image=" + ("yes" if image_bytes else "no"), flush=True)
+            audio_f = open(wav_path, "rb")
+            files = {
+                "audio": ("audio.wav", audio_f, "audio/wav"),
+            }
+
+            if self.cfg.always_send_image:
+                if not image_bytes:
+                    image_bytes = DUMMY_JPEG_BYTES
+                files["image"] = ("frame.jpg", image_bytes, "image/jpeg")
+            else:
+                if image_bytes:
+                    files["image"] = ("frame.jpg", image_bytes, "image/jpeg")
+
+            is_dummy = ("image" in files and files["image"][1] == DUMMY_JPEG_BYTES)
+            print("[HTTP] POST", self.cfg.server_url,
+                  "image=" + ("yes" if ("image" in files) else "no"),
+                  "dummy=" + ("yes" if is_dummy else "no"),
+                  flush=True)
+
             r = requests.post(self.cfg.server_url, files=files, data=data, timeout=self.cfg.timeout_sec)
             if r.status_code != 200:
                 print("[HTTP] bad status:", r.status_code, r.text[:300], flush=True)
                 return None
             return r.json()
+
         except Exception as e:
             print("[HTTP] error:", e, flush=True)
             return None
         finally:
             try:
-                files["audio"][1].close()
+                if audio_f:
+                    audio_f.close()
             except Exception:
                 pass
 
@@ -861,7 +850,6 @@ class ActiveListenerV2:
         })
 
         # NOTE: stop nhạc không nhận từ server nữa, mà qua MQTT STOP/STOPMUSIC
-
         if audio_url:
             tmpdir = tempfile.mkdtemp(prefix="al2_play_")
             local = os.path.join(tmpdir, "reply.mp3")
@@ -869,11 +857,9 @@ class ActiveListenerV2:
                 if not self._download(audio_url, local):
                     print("[PLAY] download failed:", audio_url, flush=True)
                     return
-
                 if label.strip().lower() == "nhac":
                     set_face("music")
                 self._music_play_blocking_with_lipsync(local, times=1)
-
             finally:
                 try:
                     shutil.rmtree(tmpdir, ignore_errors=True)
@@ -894,6 +880,13 @@ def main():
         server_url="https://embeddedprogramming-healtheworldserver.up.railway.app/pi_upload_audio_v2",
         bark_wav="tiengsua.wav",
         bark_times=2,
+
+        # ✅ snapshot from gesture service
+        snapshot_file="/tmp/gesture_latest.jpg",
+        snapshot_max_age_sec=3.0,
+        always_send_image=True,
+
+        # legacy cam fields (không dùng nếu snapshot_file ok)
         cam_dev="/dev/video0",
         cam_backend="v4l2",
 

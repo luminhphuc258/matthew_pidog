@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import os
 import time
 import socket
 import ssl
@@ -36,7 +37,6 @@ TOPIC_MAP = {
     "STANDUP":   "robot/gesture/standup",
     "SIT":       "robot/gesture/sit",
     "MOVELEFT":  "robot/gesture/moveleft",
-    # bạn ghi "robot/moveright" (không /gesture) -> mình giữ đúng như bạn đưa:
     "MOVERIGHT": "robot/moveright",
     "STOP":      "/robot/gesture/stop",
 }
@@ -44,12 +44,19 @@ TOPIC_MAP = {
 PUBLISH_COOLDOWN_SEC = 0.35   # chống spam
 
 
+# ===== Snapshot export =====
+SNAPSHOT_PATH = "/tmp/gesture_latest.jpg"
+SNAPSHOT_JPEG_QUALITY = 80
+
+# ✅ throttle snapshot mỗi ~5 giây
+SNAPSHOT_INTERVAL_SEC = 5.0
+
+
 class MqttPublisher:
     def __init__(self):
         self.client = mqtt.Client(protocol=mqtt.MQTTv311)
         self.client.username_pw_set(MQTT_USER, MQTT_PASS)
 
-        # TLS but insecure (không verify cert)
         self.client.tls_set(cert_reqs=ssl.CERT_NONE)
         self.client.tls_insecure_set(True)
 
@@ -62,14 +69,13 @@ class MqttPublisher:
 
     def _on_connect(self, client, userdata, flags, rc):
         self._connected = (rc == 0)
-        print(f"[MQTT] connected rc={rc}")
+        print(f"[MQTT] connected rc={rc}", flush=True)
 
     def _on_disconnect(self, client, userdata, rc):
         self._connected = False
-        print(f"[MQTT] disconnected rc={rc}")
+        print(f"[MQTT] disconnected rc={rc}", flush=True)
 
     def start(self):
-        # connect_async + loop_start để không block
         self.client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=30)
         self.client.loop_start()
 
@@ -95,24 +101,53 @@ class MqttPublisher:
                 return
             self._last_pub[topic] = now
 
-        # payload rỗng theo yêu cầu "()" / không cần data
         payload = b""
         try:
             self.client.publish(topic, payload=payload, qos=0, retain=False)
-            print(f"[MQTT] publish {topic} ({action})")
+            print(f"[MQTT] publish {topic} ({action})", flush=True)
         except Exception as e:
-            print("[MQTT] publish error:", e)
+            print("[MQTT] publish error:", e, flush=True)
+
+
+def _write_snapshot_atomic(frame_bgr, out_path: str, quality: int = 80):
+    """
+    Ghi JPEG ra file theo kiểu atomic để process khác đọc không bị file hỏng.
+    """
+    try:
+        ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+        if not ok:
+            return
+        tmp_path = out_path + ".tmp"
+        with open(tmp_path, "wb") as f:
+            f.write(buf.tobytes())
+        os.replace(tmp_path, out_path)
+    except Exception:
+        pass
 
 
 # ===== camera (shared) =====
 class Camera:
-    def __init__(self, dev="/dev/video0", w=640, h=480, fps=30):
+    def __init__(self, dev="/dev/video0", w=640, h=480, fps=30,
+                 snapshot_path: str = SNAPSHOT_PATH,
+                 snapshot_interval_sec: float = SNAPSHOT_INTERVAL_SEC,
+                 snapshot_quality: int = SNAPSHOT_JPEG_QUALITY):
         self.cap = cv2.VideoCapture(dev)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
         self.cap.set(cv2.CAP_PROP_FPS, fps)
+
         self.last = None
         self.ts = 0.0
+
+        self.snapshot_path = snapshot_path
+        self.snapshot_interval_sec = float(snapshot_interval_sec)
+        self.snapshot_quality = int(snapshot_quality)
+        self._last_snapshot_ts = 0.0
+
+        try:
+            os.makedirs(os.path.dirname(self.snapshot_path), exist_ok=True)
+        except Exception:
+            pass
 
     def read(self):
         ok, frame = self.cap.read()
@@ -120,6 +155,14 @@ class Camera:
             return None
         self.last = frame
         self.ts = time.time()
+
+        # ✅ throttle snapshot mỗi N giây
+        now = self.ts
+        if (now - self._last_snapshot_ts) >= self.snapshot_interval_sec:
+            self._last_snapshot_ts = now
+            _write_snapshot_atomic(self.last, self.snapshot_path, quality=self.snapshot_quality)
+            print(f"[SNAP] wrote {self.snapshot_path}", flush=True)
+
         return frame
 
     def get_frame(self):
@@ -134,17 +177,17 @@ class Camera:
 
 
 def main():
-    cam = Camera(dev="/dev/video0", w=640, h=480, fps=30)
+    cam = Camera(dev="/dev/video0", w=640, h=480, fps=30,
+                 snapshot_path=SNAPSHOT_PATH,
+                 snapshot_interval_sec=SNAPSHOT_INTERVAL_SEC,
+                 snapshot_quality=SNAPSHOT_JPEG_QUALITY)
 
     pub = MqttPublisher()
     pub.start()
 
-    # ===== callback khi HandCommand detect action =====
     def on_action(action: str, face: str, bark: bool):
-        print(f"[ACT ] {action}")
+        print(f"[ACT ] {action}", flush=True)
         set_face(face)
-
-        # publish mqtt
         pub.publish_action(action)
 
     hc = HandCommand(
@@ -154,7 +197,6 @@ def main():
             process_every=2,
             action_cooldown_sec=0.7,
 
-            # vị trí: bạn có thể chỉnh nhanh ở đây nếu muốn nhạy hơn / khó hơn
             pos_left_x=0.18,
             pos_right_x=0.82,
             pos_up_y=0.22,
@@ -176,14 +218,16 @@ def main():
         port=8000,
         get_frame_bgr=cam.get_frame,
         avoid_obstacle=None,
-        on_manual_cmd=lambda m: print("[MANUAL CMD]", m),
+        on_manual_cmd=lambda m: print("[MANUAL CMD]", m, flush=True),
         rotate180=True,
         mqtt_enable=False,
-        hand_command=hc,   # giữ draw y chang
+        hand_command=hc,
     )
 
-    print("\n=== Gesture MQTT Service + WebDashboard ===")
-    print("Open browser: http://<pi_ip>:8000\n")
+    print("\n=== Gesture MQTT Service + WebDashboard ===", flush=True)
+    print("Snapshot:", SNAPSHOT_PATH, flush=True)
+    print("Snapshot interval:", SNAPSHOT_INTERVAL_SEC, "sec", flush=True)
+    print("Open browser: http://<pi_ip>:8000\n", flush=True)
 
     try:
         dash.run()
