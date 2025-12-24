@@ -139,6 +139,10 @@ class ListenerCfg:
     bark_wav: str = "tiengsua.wav"
     bark_times: int = 2
 
+    # ✅ waiting message while waiting HTTP response
+    waiting_wav: str = "waitingmessage.wav"
+    waiting_enable: bool = True
+
     # cooldown after playback to avoid self-trigger
     playback_cooldown_sec: float = 0.7
 
@@ -239,6 +243,8 @@ class ActiveListenerV2:
 
         self._mem_path = Path(self.cfg.memory_file)
         self._bark_path = Path(self.cfg.bark_wav)
+        self._waiting_path = Path(self.cfg.waiting_wav)
+
         self._noise_rms: Optional[float] = None
 
         # unlock speaker pin if needed (Robot HAT)
@@ -490,6 +496,60 @@ class ActiveListenerV2:
                 self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
 
     # ----------------------------
+    # ✅ Waiting message loop
+    # ----------------------------
+    def _waiting_message_loop(self, stop_evt: threading.Event):
+        """
+        Play waitingmessage.wav repeatedly while waiting server response.
+        Stops immediately when stop_evt set OR STOP/STOPMUSIC gesture triggered.
+        """
+        p = self._waiting_path
+        if not self.cfg.waiting_enable:
+            return
+        if not p.exists():
+            print(f"[WAIT] waiting file not found: {p}", flush=True)
+            return
+
+        dur = self._get_audio_duration_sec(str(p))
+        if dur is None or dur <= 0.05:
+            dur = 2.0
+
+        print("[WAIT] start waitingmessage loop...", flush=True)
+        self._playing_audio = True
+        try:
+            while (not stop_evt.is_set()) and (not self._stop):
+                if self._playback_stop_evt.is_set():
+                    # STOP/STOPMUSIC interrupt
+                    self._stop_audio_playback()
+                    break
+
+                # play once
+                try:
+                    self.music.music_play(str(p), loops=1)
+                except Exception as e:
+                    print("[WAIT] play error:", e, flush=True)
+                    break
+
+                t_end = time.time() + float(dur) + 0.05
+                while time.time() < t_end:
+                    if stop_evt.is_set() or self._stop or self._playback_stop_evt.is_set():
+                        try:
+                            self._stop_audio_playback()
+                        except Exception:
+                            pass
+                        break
+                    time.sleep(0.05)
+
+                # loop again if still waiting
+        finally:
+            try:
+                self._stop_audio_playback()
+            except Exception:
+                pass
+            self._playing_audio = False
+            print("[WAIT] stop waitingmessage loop", flush=True)
+
+    # ----------------------------
     # Main loop
     # ----------------------------
     def run_forever(self):
@@ -532,7 +592,34 @@ class ActiveListenerV2:
                     # ✅ đọc ảnh snapshot từ gesture service
                     image_bytes = self._get_image_bytes_for_request()
 
-                    resp = self._send_to_server(full_wav, image_bytes=image_bytes)
+                    # ✅ START waiting sound while HTTP request is pending
+                    wait_stop = threading.Event()
+                    wait_th = None
+                    if self.cfg.waiting_enable and self._waiting_path.exists():
+                        wait_th = threading.Thread(
+                            target=self._waiting_message_loop,
+                            args=(wait_stop,),
+                            daemon=True
+                        )
+                        wait_th.start()
+
+                    try:
+                        resp = self._send_to_server(full_wav, image_bytes=image_bytes)
+                    finally:
+                        # stop waiting loop immediately (even on error/timeout)
+                        wait_stop.set()
+                        try:
+                            self._stop_audio_playback()
+                        except Exception:
+                            pass
+                        if wait_th:
+                            try:
+                                wait_th.join(timeout=1.2)
+                            except Exception:
+                                pass
+                        # ensure not stuck in playing state
+                        self._playing_audio = False
+
                     if resp:
                         self._handle_server_reply(resp)
 
@@ -567,8 +654,6 @@ class ActiveListenerV2:
                     if age <= float(self.cfg.snapshot_max_age_sec):
                         return p.read_bytes()
                     else:
-                        # file quá cũ => vẫn có thể đọc, nhưng ưu tiên dummy cho chắc
-                        # (bạn muốn vẫn gửi ảnh cũ thì đổi logic ở đây)
                         pass
             except Exception:
                 pass
@@ -880,6 +965,10 @@ def main():
         server_url="https://embeddedprogramming-healtheworldserver.up.railway.app/pi_upload_audio_v2",
         bark_wav="tiengsua.wav",
         bark_times=2,
+
+        # ✅ waiting message
+        waiting_wav="waitingmessage.wav",
+        waiting_enable=True,
 
         # ✅ snapshot from gesture service
         snapshot_file="/tmp/gesture_latest.jpg",
