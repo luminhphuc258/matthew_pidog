@@ -21,6 +21,7 @@ from typing import Optional, Dict, Any, List
 
 import numpy as np
 import requests
+from requests import exceptions as req_exc
 
 try:
     import cv2
@@ -82,7 +83,7 @@ GESTURE_TOPICS = {
 # Dummy JPEG (1x1) fallback
 # =========================
 _DUMMY_JPEG_B64 = (
-    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/wAALCAAaABoBAREA/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAHf/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPwB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwB//9k="
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/wAALCAAaABoBAREA/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAHf/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPwB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwB//9k="
 )
 DUMMY_JPEG_BYTES = base64.b64decode(_DUMMY_JPEG_B64)
 
@@ -128,6 +129,9 @@ class ListenerCfg:
 
     waiting_wav: str = "waitingmessage.wav"
     waiting_enable: bool = True
+
+    # ✅ NEW: lỗi server/timeout -> play file này
+    error_wav: str = "errormessage.wav"
 
     playback_cooldown_sec: float = 0.7
     volume: int = 80
@@ -228,8 +232,13 @@ class ActiveListenerV2:
         self._mem_path = Path(self.cfg.memory_file)
         self._bark_path = Path(self.cfg.bark_wav)
         self._waiting_path = Path(self.cfg.waiting_wav)
+        self._error_path = Path(self.cfg.error_wav)
 
         self._noise_rms: Optional[float] = None
+
+        # ✅ store last http error info (for timeout / 502 etc.)
+        self._last_http_status: Optional[int] = None
+        self._last_http_exc: Optional[BaseException] = None
 
         try:
             os.system("pinctrl set 12 op dh")
@@ -499,14 +508,8 @@ class ActiveListenerV2:
             self._playing_audio = False
             set_face("what_is_it")
             set_mouth(0.0)
-
-            # ✅ IMPORTANT: clear stuck STOP
             self._playback_stop_evt.clear()
-
-            if self._playback_stop_evt.is_set():
-                self._cooldown_until = time.time() + 0.05
-            else:
-                self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
+            self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
 
     # ----------------------------
     # ✅ Waiting message loop
@@ -531,7 +534,6 @@ class ActiveListenerV2:
         self._playing_audio = True
         try:
             while (not stop_evt.is_set()) and (not self._stop):
-                # If user does STOP while waiting -> stop immediately
                 if self._playback_stop_evt.is_set():
                     self._stop_audio_playback()
                     break
@@ -552,9 +554,81 @@ class ActiveListenerV2:
         finally:
             self._stop_audio_playback()
             self._playing_audio = False
-            # ✅ IMPORTANT: do not let old STOP block next waiting
             self._playback_stop_evt.clear()
             print("[WAIT] stop waitingmessage loop", flush=True)
+
+    # ----------------------------
+    # ✅ Error message when server timeout / 5xx (502...)
+    # ----------------------------
+    def _should_play_error_message(self) -> bool:
+        st = self._last_http_status
+        ex = self._last_http_exc
+        if st is not None:
+            # user said "v62" -> assume 502
+            if st >= 500:
+                return True
+        if ex is not None:
+            if isinstance(ex, (req_exc.Timeout, req_exc.ReadTimeout, req_exc.ConnectTimeout)):
+                return True
+            # generic connection errors (DNS, TLS, etc.)
+            if isinstance(ex, (req_exc.ConnectionError, req_exc.SSLError)):
+                return True
+            # fallback by text
+            s = str(ex).lower()
+            if "timed out" in s or "timeout" in s or "read timed out" in s:
+                return True
+        return False
+
+    def _reset_error_state(self):
+        self._last_http_status = None
+        self._last_http_exc = None
+
+    def _play_error_message(self):
+        # play errormessage.wav then reset state so next run works
+        if not self._error_path.exists():
+            print(f"[ERRPLAY] error file not found: {self._error_path}", flush=True)
+            self._reset_error_state()
+            return
+
+        print("[ERRPLAY] server timeout/5xx -> play errormessage.wav", flush=True)
+
+        # ✅ stop anything currently playing (waiting sound)
+        self._stop_audio_playback()
+
+        # ✅ reset events to avoid stuck states
+        self._playback_stop_evt.clear()
+
+        self._playing_audio = True
+        try:
+            set_face("sad")
+            set_mouth(0.0)
+
+            dur = self._get_audio_duration_sec(str(self._error_path))
+            if dur is None:
+                dur = 2.0
+
+            try:
+                with self._audio_lock:
+                    self.music.music_play(str(self._error_path), loops=1)
+            except Exception as e:
+                print("[ERRPLAY] music_play error:", e, flush=True)
+
+            t_end = time.time() + float(dur) + 0.15
+            while time.time() < t_end:
+                if self._playback_stop_evt.is_set() or self._stop:
+                    self._stop_audio_playback()
+                    break
+                time.sleep(0.05)
+        finally:
+            self._stop_audio_playback()
+            self._playing_audio = False
+            set_face("what_is_it")
+            set_mouth(0.0)
+
+            # ✅ IMPORTANT: clear stop + cooldown + error state
+            self._playback_stop_evt.clear()
+            self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
+            self._reset_error_state()
 
     # ----------------------------
     # Main loop
@@ -611,9 +685,11 @@ class ActiveListenerV2:
                         )
                         wait_th.start()
 
+                    resp = None
                     try:
                         resp = self._send_to_server(full_wav, image_bytes=image_bytes)
                     finally:
+                        # stop waiting loop cleanly
                         wait_stop.set()
                         self._stop_audio_playback()
                         if wait_th:
@@ -622,11 +698,32 @@ class ActiveListenerV2:
                             except Exception:
                                 pass
                         self._playing_audio = False
-                        # ✅ ensure STOP not stuck after waiting finishes
                         self._playback_stop_evt.clear()
 
-                    if resp:
-                        self._handle_server_reply(resp)
+                    # ✅ NEW: nếu server timeout / 502 / 5xx -> play errormessage.wav ngay
+                    if not resp:
+                        if self._should_play_error_message():
+                            self._play_error_message()
+                        else:
+                            # reset to be safe
+                            self._reset_error_state()
+                        try:
+                            os.remove(full_wav)
+                        except Exception:
+                            pass
+                        continue
+
+                    # nếu server trả JSON nhưng báo error -> cũng play errormessage.wav
+                    if isinstance(resp, dict) and (resp.get("status") == "error"):
+                        print("[SERVER] status=error -> play errormessage.wav", flush=True)
+                        self._play_error_message()
+                        try:
+                            os.remove(full_wav)
+                        except Exception:
+                            pass
+                        continue
+
+                    self._handle_server_reply(resp)
 
                     try:
                         os.remove(full_wav)
@@ -855,6 +952,10 @@ class ActiveListenerV2:
     # Server
     # ----------------------------
     def _send_to_server(self, wav_path: str, image_bytes: Optional[bytes]) -> Optional[Dict[str, Any]]:
+        # reset last error info
+        self._last_http_status = None
+        self._last_http_exc = None
+
         mem = self._load_recent_memory()
         meta = {"ts": time.time(), "client": "pidog", "memory": mem}
 
@@ -882,12 +983,20 @@ class ActiveListenerV2:
                   flush=True)
 
             r = requests.post(self.cfg.server_url, files=files, data=data, timeout=self.cfg.timeout_sec)
+            self._last_http_status = int(r.status_code)
+
             if r.status_code != 200:
-                print("[HTTP] bad status:", r.status_code, r.text[:300], flush=True)
+                print("[HTTP] bad status:", r.status_code, (r.text or "")[:300], flush=True)
                 return None
-            return r.json()
+
+            try:
+                return r.json()
+            except Exception as e:
+                print("[HTTP] json parse error:", e, flush=True)
+                return None
 
         except Exception as e:
+            self._last_http_exc = e
             print("[HTTP] error:", e, flush=True)
             return None
         finally:
@@ -964,6 +1073,9 @@ def main():
 
         waiting_wav="waitingmessage.wav",
         waiting_enable=True,
+
+        # ✅ NEW
+        error_wav="errormessage.wav",
 
         snapshot_file="/tmp/gesture_latest.jpg",
         snapshot_max_age_sec=3.0,
