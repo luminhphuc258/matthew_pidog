@@ -121,6 +121,11 @@ class ListenerCfg:
     job_poll_timeout_sec: float = 10.0
     job_max_wait_sec: float = 20 * 60.0  # 20 phút (tuỳ bạn)
 
+    # ✅ podcast_next
+    podcast_next_timeout_sec: float = 60.0
+    podcast_next_retry_sleep_sec: float = 0.6
+    podcast_max_play_sec: float = 45 * 60.0  # chặn vô hạn: tối đa 45 phút / 1 podcast session
+
     snapshot_file: Optional[str] = "/tmp/gesture_latest.jpg"
     snapshot_max_age_sec: float = 3.0
     always_send_image: bool = True
@@ -224,6 +229,9 @@ class ActiveListenerV2:
         # ✅ waiting-loop abort
         self._waiting_abort_evt = threading.Event()
 
+        # ✅ podcast state
+        self._podcast_active = False
+
         # motion command queue (from MQTT)
         self._cmd_lock = threading.Lock()
         self._pending_cmds: List[str] = []
@@ -299,11 +307,13 @@ class ActiveListenerV2:
         threading.Thread(target=_job, daemon=True).start()
 
     def request_stopmusic(self):
+        # stop everything playback
         self._playback_stop_evt.set()
         self._stop_audio_playback()
 
-        # also stop waiting loop + job polling
+        # also stop waiting loop + job polling + podcast loop
         self._waiting_abort_evt.set()
+        self._podcast_active = False
 
         self._playing_audio = False
         self._cooldown_until = time.time() + 0.05
@@ -434,7 +444,7 @@ class ActiveListenerV2:
             dur = self._get_audio_duration_sec(filepath)
             loops = max(1, int(times))
 
-            set_face("suprise")
+            # face handled outside (music/podcast)
             set_mouth(0.0)
 
             th = threading.Thread(target=self._lipsync_worker, args=(filepath, stop_evt), daemon=True)
@@ -452,7 +462,7 @@ class ActiveListenerV2:
 
             t_end = time.time() + total
             while time.time() < t_end:
-                if self._playback_stop_evt.is_set() or self._waiting_abort_evt.is_set():
+                if self._playback_stop_evt.is_set() or self._waiting_abort_evt.is_set() or self._stop:
                     self._stop_audio_playback()
                     break
                 time.sleep(0.05)
@@ -469,8 +479,8 @@ class ActiveListenerV2:
 
             self._playing_audio = False
             set_mouth(0.0)
-            set_face("what_is_it")
 
+            # don't force face here; caller decides
             self._playback_stop_evt.clear()
 
             if self._cooldown_until < time.time():
@@ -501,7 +511,7 @@ class ActiveListenerV2:
 
             t_end = time.time() + total
             while time.time() < t_end:
-                if self._playback_stop_evt.is_set() or self._waiting_abort_evt.is_set():
+                if self._playback_stop_evt.is_set() or self._waiting_abort_evt.is_set() or self._stop:
                     self._stop_audio_playback()
                     break
                 time.sleep(0.05)
@@ -683,7 +693,6 @@ class ActiveListenerV2:
                     result = job.get("result")
                     if isinstance(result, dict):
                         return result
-                    # nếu server trả result rỗng
                     return {"status": "error", "error": "job done but result missing"}
 
                 if st == "error":
@@ -704,6 +713,136 @@ class ActiveListenerV2:
         q[k] = v
         new_q = urlencode(q)
         return urlunparse((u.scheme, u.netloc, u.path, u.params, new_q, u.fragment))
+
+    # ----------------------------
+    # ✅ Podcast_next helpers
+    # ----------------------------
+    def _podcast_next_url(self, podcast_id: str) -> str:
+        base = self._server_base()
+        return f"{base}/podcast_next?id={podcast_id}"
+
+    def _fetch_podcast_next(self, podcast_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Call /podcast_next once. Return dict or None.
+        """
+        try:
+            url = self._podcast_next_url(podcast_id)
+            rr = requests.get(url, timeout=float(self.cfg.podcast_next_timeout_sec))
+            self._last_http_status = int(rr.status_code)
+            if rr.status_code != 200:
+                print("[POD] bad status:", rr.status_code, (rr.text or "")[:200], flush=True)
+                return None
+            js = rr.json()
+            return js if isinstance(js, dict) else None
+        except Exception as e:
+            self._last_http_exc = e
+            print("[POD] request error:", e, flush=True)
+            return None
+
+    def _play_audio_url_once(self, audio_url: str, face_music: bool = False) -> bool:
+        """
+        Download + play one mp3. Return True if played (or partially) and not aborted.
+        """
+        if not audio_url:
+            return False
+
+        if self._stop or self._playback_stop_evt.is_set() or self._waiting_abort_evt.is_set():
+            return False
+
+        tmpdir = tempfile.mkdtemp(prefix="al2_play_")
+        local = os.path.join(tmpdir, "seg.mp3")
+        ok = False
+        try:
+            if not self._download(audio_url, local):
+                print("[PLAY] download failed:", audio_url, flush=True)
+                return False
+
+            if face_music:
+                set_face("music")
+
+            # block until finishes (or stop event)
+            self._music_play_blocking_with_lipsync(local, times=1)
+
+            if self._stop or self._playback_stop_evt.is_set() or self._waiting_abort_evt.is_set():
+                return False
+
+            ok = True
+            return ok
+        finally:
+            try:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+            if not face_music:
+                set_face("what_is_it")
+
+    def _play_podcast_until_done(self, podcast_id: str, first_audio_url: str, total: Optional[int] = None):
+        """
+        Play chunk0 then call /podcast_next to play remaining chunks.
+        Abort if STOP/STOPMUSIC.
+        """
+        if not podcast_id or not first_audio_url:
+            return
+
+        self._podcast_active = True
+        t0 = time.time()
+
+        print(f"[POD] start podcast={podcast_id} total={total}", flush=True)
+        set_face("music")
+
+        # play first
+        if not self._play_audio_url_once(first_audio_url, face_music=True):
+            print("[POD] aborted or failed at first chunk", flush=True)
+            self._podcast_active = False
+            set_face("what_is_it")
+            return
+
+        # loop next
+        while not self._stop and self._podcast_active:
+            if self._playback_stop_evt.is_set() or self._waiting_abort_evt.is_set():
+                print("[POD] abort by STOP/STOPMUSIC", flush=True)
+                break
+
+            if (time.time() - t0) > float(self.cfg.podcast_max_play_sec):
+                print("[POD] max play time reached -> stop podcast", flush=True)
+                break
+
+            js = self._fetch_podcast_next(podcast_id)
+            if js is None:
+                # network error -> stop podcast (không phát errormessage để tránh spam)
+                print("[POD] fetch next failed -> stop", flush=True)
+                break
+
+            if not js.get("ok", False):
+                print("[POD] server says not ok:", js.get("error"), flush=True)
+                break
+
+            if js.get("done", False):
+                print("[POD] done", flush=True)
+                break
+
+            audio_url = js.get("audio_url")
+            idx = js.get("index")
+            tot = js.get("total", total)
+
+            print(f"[POD] next index={idx}/{tot} audio={audio_url}", flush=True)
+
+            if not audio_url:
+                print("[POD] next audio_url empty -> stop", flush=True)
+                break
+
+            played = self._play_audio_url_once(audio_url, face_music=True)
+            if not played:
+                print("[POD] aborted while playing next chunk", flush=True)
+                break
+
+            time.sleep(max(0.05, float(self.cfg.podcast_next_retry_sleep_sec)))
+
+        self._podcast_active = False
+        set_face("what_is_it")
+        set_mouth(0.0)
+        self._cooldown_until = time.time() + 0.1
+        print("[POD] exit podcast -> back to listening", flush=True)
 
     # ----------------------------
     # Main loop
@@ -1132,7 +1271,6 @@ class ActiveListenerV2:
                 except Exception:
                     print("[HTTP] 202 but json parse failed:", (r.text or "")[:200], flush=True)
                     return None
-                # js: {status:"processing", job_id:"...", ...}
                 return js if isinstance(js, dict) else None
 
             if r.status_code != 200:
@@ -1176,11 +1314,20 @@ class ActiveListenerV2:
         reply_text = (resp.get("reply_text") or "").strip()
         audio_url = resp.get("audio_url")
 
+        podcast = resp.get("podcast")
+        podcast_id = None
+        podcast_total = None
+        if isinstance(podcast, dict):
+            podcast_id = podcast.get("podcast_id") or podcast.get("id")
+            podcast_total = podcast.get("total")
+
         print("[SERVER] label=", label, flush=True)
         print("[USER ]", transcript, flush=True)
         if reply_text:
             print("[BOT  ]", reply_text, flush=True)
         print("[AUDIO]", audio_url, flush=True)
+        if podcast_id:
+            print("[POD  ] id=", podcast_id, "total=", podcast_total, flush=True)
 
         self._append_memory({
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1188,8 +1335,15 @@ class ActiveListenerV2:
             "label": label,
             "reply_text": reply_text,
             "audio_url": audio_url,
+            "podcast": podcast if isinstance(podcast, dict) else None,
         })
 
+        # ✅ LONG VIDEO PODCAST: auto play all chunks
+        if (label.strip().lower() == "nhac") and podcast_id and audio_url:
+            self._play_podcast_until_done(str(podcast_id), str(audio_url), total=podcast_total)
+            return
+
+        # normal one-shot audio
         if audio_url:
             tmpdir = tempfile.mkdtemp(prefix="al2_play_")
             local = os.path.join(tmpdir, "reply.mp3")
@@ -1199,12 +1353,16 @@ class ActiveListenerV2:
                     return
                 if label.strip().lower() == "nhac":
                     set_face("music")
+                else:
+                    set_face("suprise")
                 self._music_play_blocking_with_lipsync(local, times=1)
             finally:
                 try:
                     shutil.rmtree(tmpdir, ignore_errors=True)
                 except Exception:
                     pass
+                set_face("what_is_it")
+                set_mouth(0.0)
 
 
 def main():
@@ -1227,6 +1385,11 @@ def main():
         job_poll_interval_sec=1.2,
         job_poll_timeout_sec=240.0,
         job_max_wait_sec=20 * 240.0,
+
+        # podcast_next
+        podcast_next_timeout_sec=120.0,
+        podcast_next_retry_sleep_sec=0.4,
+        podcast_max_play_sec=60 * 60.0,  # 60 phút
 
         bark_wav="tiengsua.wav",
         bark_times=2,
