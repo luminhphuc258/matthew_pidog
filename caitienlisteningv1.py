@@ -18,6 +18,7 @@ import base64
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any, List
+from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
 
 import numpy as np
 import requests
@@ -106,8 +107,19 @@ class ListenerCfg:
     clap_high_ratio: float = 0.12
     clap_zcr: float = 0.10
 
+    # ✅ server url
     server_url: str = "https://embeddedprogramming-healtheworldserver.up.railway.app/pi_upload_audio_v2"
+
+    # timeout cho POST ban đầu (ngắn cũng được vì server có thể trả 202 nhanh)
     timeout_sec: float = 30.0
+
+    # ✅ nếu muốn ép server wait sync (debug): thêm ?wait=1
+    server_wait_sync: bool = False
+
+    # ✅ poll job khi server trả 202
+    job_poll_interval_sec: float = 1.2
+    job_poll_timeout_sec: float = 10.0
+    job_max_wait_sec: float = 20 * 60.0  # 20 phút (tuỳ bạn)
 
     snapshot_file: Optional[str] = "/tmp/gesture_latest.jpg"
     snapshot_max_age_sec: float = 3.0
@@ -209,7 +221,7 @@ class ActiveListenerV2:
         # ✅ audio lock
         self._audio_lock = threading.Lock()
 
-        # ✅ waiting-loop abort (fix "waiting thread stuck" -> không quay lại active listening)
+        # ✅ waiting-loop abort
         self._waiting_abort_evt = threading.Event()
 
         # motion command queue (from MQTT)
@@ -290,7 +302,7 @@ class ActiveListenerV2:
         self._playback_stop_evt.set()
         self._stop_audio_playback()
 
-        # also stop waiting loop if it is running
+        # also stop waiting loop + job polling
         self._waiting_abort_evt.set()
 
         self._playing_audio = False
@@ -502,11 +514,11 @@ class ActiveListenerV2:
             self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
 
     # ----------------------------
-    # Waiting message loop (fix stuck)
+    # Waiting message loop
     # ----------------------------
     def _waiting_message_loop(self, stop_evt: threading.Event):
         """
-        Play waitingmessage.wav repeatedly while waiting server response.
+        Play waitingmessage.wav repeatedly while waiting server response / job polling.
         MUST exit when stop_evt OR waiting_abort_evt is set.
         """
         p = self._waiting_path
@@ -522,7 +534,6 @@ class ActiveListenerV2:
 
         print("[WAIT] start waitingmessage loop...", flush=True)
         try:
-            # mark we are playing audio (so main loop pauses)
             self._playing_audio = True
 
             while (not stop_evt.is_set()) and (not self._stop):
@@ -530,7 +541,6 @@ class ActiveListenerV2:
                     self._stop_audio_playback()
                     break
 
-                # play once
                 try:
                     with self._audio_lock:
                         self.music.music_play(str(p), loops=1)
@@ -545,14 +555,10 @@ class ActiveListenerV2:
                         break
                     time.sleep(0.05)
 
-                # loop continues unless stop_evt/abort
         finally:
             self._stop_audio_playback()
-
-            # ✅ IMPORTANT: force state back so main loop resumes listening
             self._playing_audio = False
             self._playback_stop_evt.clear()
-
             print("[WAIT] stop waitingmessage loop", flush=True)
 
     # ----------------------------
@@ -585,11 +591,8 @@ class ActiveListenerV2:
 
         print("[ERRPLAY] server timeout/5xx -> play errormessage.wav", flush=True)
 
-        # stop waiting + stop audio immediately
         self._waiting_abort_evt.set()
         self._stop_audio_playback()
-
-        # clear events so it can return to listening after playback
         self._playback_stop_evt.clear()
 
         self._playing_audio = True
@@ -616,17 +619,91 @@ class ActiveListenerV2:
         finally:
             self._stop_audio_playback()
             self._playing_audio = False
-
             set_face("what_is_it")
             set_mouth(0.0)
 
-            # ✅ VERY IMPORTANT: clear abort so main loop can run again
             self._waiting_abort_evt.clear()
-
             self._playback_stop_evt.clear()
-            # keep cooldown small so it immediately returns to active listening
             self._cooldown_until = time.time() + 0.05
             self._reset_error_state()
+
+    # ----------------------------
+    # ✅ Job polling helpers (server 202)
+    # ----------------------------
+    def _server_base(self) -> str:
+        """
+        from https://host/path/pi_upload_audio_v2 -> https://host
+        """
+        u = urlparse(self.cfg.server_url)
+        return urlunparse((u.scheme, u.netloc, "", "", "", ""))
+
+    def _job_url(self, job_id: str) -> str:
+        base = self._server_base()
+        return f"{base}/job?id={job_id}"
+
+    def _poll_job_until_done(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Poll /job endpoint until job.status == done, then return job.result.
+        Return None on abort/timeout.
+        """
+        t0 = time.time()
+        last_status = None
+
+        while not self._stop:
+            if self._waiting_abort_evt.is_set() or self._playback_stop_evt.is_set():
+                print("[JOB] aborted by STOP/STOPMUSIC", flush=True)
+                return None
+
+            if (time.time() - t0) > float(self.cfg.job_max_wait_sec):
+                print("[JOB] timeout waiting job done", flush=True)
+                self._last_http_exc = req_exc.Timeout("job polling timeout")
+                return None
+
+            try:
+                url = self._job_url(job_id)
+                rr = requests.get(url, timeout=float(self.cfg.job_poll_timeout_sec))
+                self._last_http_status = int(rr.status_code)
+
+                if rr.status_code != 200:
+                    print("[JOB] bad status:", rr.status_code, (rr.text or "")[:200], flush=True)
+                    return None
+
+                js = rr.json()
+                job = js.get("job") if isinstance(js, dict) else None
+                if not isinstance(job, dict):
+                    print("[JOB] invalid job payload", flush=True)
+                    return None
+
+                st = job.get("status")
+                if st != last_status:
+                    last_status = st
+                    print(f"[JOB] status={st} id={job_id}", flush=True)
+
+                if st == "done":
+                    result = job.get("result")
+                    if isinstance(result, dict):
+                        return result
+                    # nếu server trả result rỗng
+                    return {"status": "error", "error": "job done but result missing"}
+
+                if st == "error":
+                    err = job.get("error") or "job error"
+                    return {"status": "error", "error": err}
+
+            except Exception as e:
+                self._last_http_exc = e
+                print("[JOB] poll error:", e, flush=True)
+
+            time.sleep(float(self.cfg.job_poll_interval_sec))
+
+        return None
+
+    def _append_query_param(self, url: str, k: str, v: str) -> str:
+        u = urlparse(url)
+        q = dict(parse_qsl(u.query, keep_blank_values=True))
+        q[k] = v
+        new_q = urlencode(q)
+        return urlunparse((u.scheme, u.netloc, u.path, u.params, new_q, u.fragment))
 
     # ----------------------------
     # Main loop
@@ -674,6 +751,7 @@ class ActiveListenerV2:
                     self._playback_stop_evt.clear()
                     self._waiting_abort_evt.clear()
 
+                    # play waiting while POST
                     wait_stop = threading.Event()
                     wait_th = None
                     if self.cfg.waiting_enable and self._waiting_path.exists():
@@ -688,18 +766,15 @@ class ActiveListenerV2:
                     try:
                         resp = self._send_to_server(full_wav, image_bytes=image_bytes)
                     finally:
-                        # stop waiting loop cleanly
+                        # stop waiting loop after POST
                         wait_stop.set()
-                        self._waiting_abort_evt.set()   # ✅ hard abort
+                        self._waiting_abort_evt.set()
                         self._stop_audio_playback()
-
                         if wait_th:
                             try:
-                                wait_th.join(timeout=3.0)  # ✅ give more time to exit
+                                wait_th.join(timeout=3.0)
                             except Exception:
                                 pass
-
-                        # ✅ force back to listening state even if thread was weird
                         self._playing_audio = False
                         self._waiting_abort_evt.clear()
                         self._playback_stop_evt.clear()
@@ -709,13 +784,73 @@ class ActiveListenerV2:
                             self._play_error_message()
                         else:
                             self._reset_error_state()
-                            self._cooldown_until = time.time() + 0.05  # ensure loop continues
+                            self._cooldown_until = time.time() + 0.05
                         try:
                             os.remove(full_wav)
                         except Exception:
                             pass
                         continue
 
+                    # ✅ nếu server trả 202 job async
+                    if isinstance(resp, dict) and resp.get("status") == "processing" and resp.get("job_id"):
+                        job_id = str(resp.get("job_id"))
+                        print(f"[SERVER] 202 processing -> job_id={job_id}", flush=True)
+
+                        # play waiting while polling job
+                        poll_wait_stop = threading.Event()
+                        poll_wait_th = None
+                        if self.cfg.waiting_enable and self._waiting_path.exists():
+                            poll_wait_th = threading.Thread(
+                                target=self._waiting_message_loop,
+                                args=(poll_wait_stop,),
+                                daemon=True
+                            )
+                            poll_wait_th.start()
+
+                        job_result = None
+                        try:
+                            job_result = self._poll_job_until_done(job_id)
+                        finally:
+                            poll_wait_stop.set()
+                            self._waiting_abort_evt.set()
+                            self._stop_audio_playback()
+                            if poll_wait_th:
+                                try:
+                                    poll_wait_th.join(timeout=3.0)
+                                except Exception:
+                                    pass
+                            self._playing_audio = False
+                            self._waiting_abort_evt.clear()
+                            self._playback_stop_evt.clear()
+
+                        # nếu user STOP trong lúc chờ -> abort
+                        if job_result is None:
+                            print("[JOB] no result (abort/timeout). back to listening.", flush=True)
+                            try:
+                                os.remove(full_wav)
+                            except Exception:
+                                pass
+                            continue
+
+                        # nếu job trả error -> play errormessage
+                        if isinstance(job_result, dict) and job_result.get("status") == "error":
+                            print("[JOB] status=error:", job_result.get("error"), flush=True)
+                            self._play_error_message()
+                            try:
+                                os.remove(full_wav)
+                            except Exception:
+                                pass
+                            continue
+
+                        # handle job result giống như 200 bình thường
+                        self._handle_server_reply(job_result)
+                        try:
+                            os.remove(full_wav)
+                        except Exception:
+                            pass
+                        continue
+
+                    # server báo error dạng json
                     if isinstance(resp, dict) and (resp.get("status") == "error"):
                         print("[SERVER] status=error -> play errormessage.wav", flush=True)
                         self._play_error_message()
@@ -725,6 +860,7 @@ class ActiveListenerV2:
                             pass
                         continue
 
+                    # 200 OK normal
                     self._handle_server_reply(resp)
 
                     try:
@@ -962,6 +1098,11 @@ class ActiveListenerV2:
 
         data = {"meta": json.dumps(meta, ensure_ascii=False)}
 
+        # ✅ optional: ép server sync wait=1 (debug)
+        url = self.cfg.server_url
+        if self.cfg.server_wait_sync:
+            url = self._append_query_param(url, "wait", "1")
+
         audio_f = None
         try:
             audio_f = open(wav_path, "rb")
@@ -976,13 +1117,23 @@ class ActiveListenerV2:
                     files["image"] = ("frame.jpg", image_bytes, "image/jpeg")
 
             is_dummy = ("image" in files and files["image"][1] == DUMMY_JPEG_BYTES)
-            print("[HTTP] POST", self.cfg.server_url,
+            print("[HTTP] POST", url,
                   "image=" + ("yes" if ("image" in files) else "no"),
                   "dummy=" + ("yes" if is_dummy else "no"),
                   flush=True)
 
-            r = requests.post(self.cfg.server_url, files=files, data=data, timeout=self.cfg.timeout_sec)
+            r = requests.post(url, files=files, data=data, timeout=float(self.cfg.timeout_sec))
             self._last_http_status = int(r.status_code)
+
+            # ✅ 202: async job (long youtube)
+            if r.status_code == 202:
+                try:
+                    js = r.json()
+                except Exception:
+                    print("[HTTP] 202 but json parse failed:", (r.text or "")[:200], flush=True)
+                    return None
+                # js: {status:"processing", job_id:"...", ...}
+                return js if isinstance(js, dict) else None
 
             if r.status_code != 200:
                 print("[HTTP] bad status:", r.status_code, (r.text or "")[:300], flush=True)
@@ -1067,6 +1218,16 @@ def main():
     cfg = ListenerCfg(
         mic_device="default",
         server_url="https://embeddedprogramming-healtheworldserver.up.railway.app/pi_upload_audio_v2",
+        timeout_sec=30.0,
+
+        # ✅ để False (khuyến nghị) -> dùng job polling khi 202
+        server_wait_sync=False,
+
+        # polling
+        job_poll_interval_sec=1.2,
+        job_poll_timeout_sec=10.0,
+        job_max_wait_sec=20 * 60.0,
+
         bark_wav="tiengsua.wav",
         bark_times=2,
 
