@@ -1218,15 +1218,15 @@ def main():
     cfg = ListenerCfg(
         mic_device="default",
         server_url="https://embeddedprogramming-healtheworldserver.up.railway.app/pi_upload_audio_v2",
-        timeout_sec=30.0,
+        timeout_sec=240,
 
         # ✅ để False (khuyến nghị) -> dùng job polling khi 202
         server_wait_sync=False,
 
         # polling
         job_poll_interval_sec=1.2,
-        job_poll_timeout_sec=10.0,
-        job_max_wait_sec=20 * 60.0,
+        job_poll_timeout_sec=240.0,
+        job_max_wait_sec=20 * 240.0,
 
         bark_wav="tiengsua.wav",
         bark_times=2,
