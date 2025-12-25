@@ -109,16 +109,8 @@ class ListenerCfg:
     server_url: str = "https://embeddedprogramming-healtheworldserver.up.railway.app/pi_upload_audio_v2"
     timeout_sec: float = 30.0
 
-    cam_dev: str = "/dev/video0"
-    cam_w: int = 640
-    cam_h: int = 480
-    jpeg_quality: int = 80
-    cam_warmup_frames: int = 6
-    cam_backend: str = "v4l2"
-
     snapshot_file: Optional[str] = "/tmp/gesture_latest.jpg"
     snapshot_max_age_sec: float = 3.0
-
     always_send_image: bool = True
 
     memory_file: str = "robot_memory.jsonl"
@@ -130,7 +122,7 @@ class ListenerCfg:
     waiting_wav: str = "waitingmessage.wav"
     waiting_enable: bool = True
 
-    # ✅ NEW: lỗi server/timeout -> play file này
+    # ✅ server timeout/5xx -> play file này
     error_wav: str = "errormessage.wav"
 
     playback_cooldown_sec: float = 0.7
@@ -214,8 +206,11 @@ class ActiveListenerV2:
         # allow STOPMUSIC/STOP to interrupt playback immediately
         self._playback_stop_evt = threading.Event()
 
-        # ✅ audio lock (avoid race between waiting/play/stop)
+        # ✅ audio lock
         self._audio_lock = threading.Lock()
+
+        # ✅ waiting-loop abort (fix "waiting thread stuck" -> không quay lại active listening)
+        self._waiting_abort_evt = threading.Event()
 
         # motion command queue (from MQTT)
         self._cmd_lock = threading.Lock()
@@ -236,7 +231,7 @@ class ActiveListenerV2:
 
         self._noise_rms: Optional[float] = None
 
-        # ✅ store last http error info (for timeout / 502 etc.)
+        # last http error info
         self._last_http_status: Optional[int] = None
         self._last_http_exc: Optional[BaseException] = None
 
@@ -256,6 +251,10 @@ class ActiveListenerV2:
 
     def stop(self):
         self._stop = True
+        try:
+            self._waiting_abort_evt.set()
+        except Exception:
+            pass
         try:
             if self._mqtt:
                 self._mqtt.stop()
@@ -282,25 +281,23 @@ class ActiveListenerV2:
             self._pending_cmds.append(cmd)
 
     def _clear_stop_evt_delayed(self, delay_sec: float = 0.3):
-        # ✅ prevent "STOP event stuck" killing future waiting audio
         def _job():
             time.sleep(max(0.0, float(delay_sec)))
             self._playback_stop_evt.clear()
         threading.Thread(target=_job, daemon=True).start()
 
     def request_stopmusic(self):
-        # set event to notify any playback loops
         self._playback_stop_evt.set()
-
-        # stop actual sound now
         self._stop_audio_playback()
+
+        # also stop waiting loop if it is running
+        self._waiting_abort_evt.set()
 
         self._playing_audio = False
         self._cooldown_until = time.time() + 0.05
         set_face("what_is_it")
         set_mouth(0.0)
 
-        # ✅ IMPORTANT: clear later so waiting loop can play again
         self._clear_stop_evt_delayed(0.3)
 
     def _pop_pending_cmds(self) -> List[str]:
@@ -417,7 +414,6 @@ class ActiveListenerV2:
 
     def _music_play_blocking_with_lipsync(self, filepath: str, times: int = 1):
         self._playing_audio = True
-        # ✅ clear old STOP so it doesn't poison this playback
         self._playback_stop_evt.clear()
 
         stop_evt = threading.Event()
@@ -444,8 +440,7 @@ class ActiveListenerV2:
 
             t_end = time.time() + total
             while time.time() < t_end:
-                if self._playback_stop_evt.is_set():
-                    print("[PLAY] interrupted by STOP/STOPMUSIC", flush=True)
+                if self._playback_stop_evt.is_set() or self._waiting_abort_evt.is_set():
                     self._stop_audio_playback()
                     break
                 time.sleep(0.05)
@@ -464,14 +459,10 @@ class ActiveListenerV2:
             set_mouth(0.0)
             set_face("what_is_it")
 
-            # ✅ IMPORTANT: do not leave STOP stuck
             self._playback_stop_evt.clear()
 
             if self._cooldown_until < time.time():
-                if self._playback_stop_evt.is_set():
-                    self._cooldown_until = time.time() + 0.05
-                else:
-                    self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
+                self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
 
     def _bark(self):
         if not self._bark_path.exists():
@@ -498,8 +489,7 @@ class ActiveListenerV2:
 
             t_end = time.time() + total
             while time.time() < t_end:
-                if self._playback_stop_evt.is_set():
-                    print("[BARK] interrupted by STOP/STOPMUSIC", flush=True)
+                if self._playback_stop_evt.is_set() or self._waiting_abort_evt.is_set():
                     self._stop_audio_playback()
                     break
                 time.sleep(0.05)
@@ -512,12 +502,12 @@ class ActiveListenerV2:
             self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
 
     # ----------------------------
-    # ✅ Waiting message loop
+    # Waiting message loop (fix stuck)
     # ----------------------------
     def _waiting_message_loop(self, stop_evt: threading.Event):
         """
         Play waitingmessage.wav repeatedly while waiting server response.
-        Stops immediately when stop_evt set OR STOP/STOPMUSIC gesture triggered.
+        MUST exit when stop_evt OR waiting_abort_evt is set.
         """
         p = self._waiting_path
         if not self.cfg.waiting_enable:
@@ -531,13 +521,16 @@ class ActiveListenerV2:
             dur = 2.0
 
         print("[WAIT] start waitingmessage loop...", flush=True)
-        self._playing_audio = True
         try:
+            # mark we are playing audio (so main loop pauses)
+            self._playing_audio = True
+
             while (not stop_evt.is_set()) and (not self._stop):
-                if self._playback_stop_evt.is_set():
+                if self._waiting_abort_evt.is_set() or self._playback_stop_evt.is_set():
                     self._stop_audio_playback()
                     break
 
+                # play once
                 try:
                     with self._audio_lock:
                         self.music.music_play(str(p), loops=1)
@@ -547,33 +540,34 @@ class ActiveListenerV2:
 
                 t_end = time.time() + float(dur) + 0.05
                 while time.time() < t_end:
-                    if stop_evt.is_set() or self._stop or self._playback_stop_evt.is_set():
+                    if stop_evt.is_set() or self._stop or self._waiting_abort_evt.is_set() or self._playback_stop_evt.is_set():
                         self._stop_audio_playback()
                         break
                     time.sleep(0.05)
+
+                # loop continues unless stop_evt/abort
         finally:
             self._stop_audio_playback()
+
+            # ✅ IMPORTANT: force state back so main loop resumes listening
             self._playing_audio = False
             self._playback_stop_evt.clear()
+
             print("[WAIT] stop waitingmessage loop", flush=True)
 
     # ----------------------------
-    # ✅ Error message when server timeout / 5xx (502...)
+    # Error message when server timeout / 5xx
     # ----------------------------
     def _should_play_error_message(self) -> bool:
         st = self._last_http_status
         ex = self._last_http_exc
-        if st is not None:
-            # user said "v62" -> assume 502
-            if st >= 500:
-                return True
+        if st is not None and st >= 500:
+            return True
         if ex is not None:
             if isinstance(ex, (req_exc.Timeout, req_exc.ReadTimeout, req_exc.ConnectTimeout)):
                 return True
-            # generic connection errors (DNS, TLS, etc.)
             if isinstance(ex, (req_exc.ConnectionError, req_exc.SSLError)):
                 return True
-            # fallback by text
             s = str(ex).lower()
             if "timed out" in s or "timeout" in s or "read timed out" in s:
                 return True
@@ -584,7 +578,6 @@ class ActiveListenerV2:
         self._last_http_exc = None
 
     def _play_error_message(self):
-        # play errormessage.wav then reset state so next run works
         if not self._error_path.exists():
             print(f"[ERRPLAY] error file not found: {self._error_path}", flush=True)
             self._reset_error_state()
@@ -592,10 +585,11 @@ class ActiveListenerV2:
 
         print("[ERRPLAY] server timeout/5xx -> play errormessage.wav", flush=True)
 
-        # ✅ stop anything currently playing (waiting sound)
+        # stop waiting + stop audio immediately
+        self._waiting_abort_evt.set()
         self._stop_audio_playback()
 
-        # ✅ reset events to avoid stuck states
+        # clear events so it can return to listening after playback
         self._playback_stop_evt.clear()
 
         self._playing_audio = True
@@ -622,12 +616,16 @@ class ActiveListenerV2:
         finally:
             self._stop_audio_playback()
             self._playing_audio = False
+
             set_face("what_is_it")
             set_mouth(0.0)
 
-            # ✅ IMPORTANT: clear stop + cooldown + error state
+            # ✅ VERY IMPORTANT: clear abort so main loop can run again
+            self._waiting_abort_evt.clear()
+
             self._playback_stop_evt.clear()
-            self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
+            # keep cooldown small so it immediately returns to active listening
+            self._cooldown_until = time.time() + 0.05
             self._reset_error_state()
 
     # ----------------------------
@@ -672,8 +670,9 @@ class ActiveListenerV2:
 
                     image_bytes = self._get_image_bytes_for_request()
 
-                    # ✅ FIX: clear old STOP before starting waiting sound
+                    # clear old STOP + abort before waiting
                     self._playback_stop_evt.clear()
+                    self._waiting_abort_evt.clear()
 
                     wait_stop = threading.Event()
                     wait_th = None
@@ -691,29 +690,32 @@ class ActiveListenerV2:
                     finally:
                         # stop waiting loop cleanly
                         wait_stop.set()
+                        self._waiting_abort_evt.set()   # ✅ hard abort
                         self._stop_audio_playback()
+
                         if wait_th:
                             try:
-                                wait_th.join(timeout=1.2)
+                                wait_th.join(timeout=3.0)  # ✅ give more time to exit
                             except Exception:
                                 pass
+
+                        # ✅ force back to listening state even if thread was weird
                         self._playing_audio = False
+                        self._waiting_abort_evt.clear()
                         self._playback_stop_evt.clear()
 
-                    # ✅ NEW: nếu server timeout / 502 / 5xx -> play errormessage.wav ngay
                     if not resp:
                         if self._should_play_error_message():
                             self._play_error_message()
                         else:
-                            # reset to be safe
                             self._reset_error_state()
+                            self._cooldown_until = time.time() + 0.05  # ensure loop continues
                         try:
                             os.remove(full_wav)
                         except Exception:
                             pass
                         continue
 
-                    # nếu server trả JSON nhưng báo error -> cũng play errormessage.wav
                     if isinstance(resp, dict) and (resp.get("status") == "error"):
                         print("[SERVER] status=error -> play errormessage.wav", flush=True)
                         self._play_error_message()
@@ -952,7 +954,6 @@ class ActiveListenerV2:
     # Server
     # ----------------------------
     def _send_to_server(self, wav_path: str, image_bytes: Optional[bytes]) -> Optional[Dict[str, Any]]:
-        # reset last error info
         self._last_http_status = None
         self._last_http_exc = None
 
@@ -964,9 +965,7 @@ class ActiveListenerV2:
         audio_f = None
         try:
             audio_f = open(wav_path, "rb")
-            files = {
-                "audio": ("audio.wav", audio_f, "audio/wav"),
-            }
+            files = {"audio": ("audio.wav", audio_f, "audio/wav")}
 
             if self.cfg.always_send_image:
                 if not image_bytes:
@@ -1074,15 +1073,11 @@ def main():
         waiting_wav="waitingmessage.wav",
         waiting_enable=True,
 
-        # ✅ NEW
         error_wav="errormessage.wav",
 
         snapshot_file="/tmp/gesture_latest.jpg",
         snapshot_max_age_sec=3.0,
         always_send_image=True,
-
-        cam_dev="/dev/video0",
-        cam_backend="v4l2",
 
         noise_calib_sec=1.2,
         gate_db_above_noise=4.0,
