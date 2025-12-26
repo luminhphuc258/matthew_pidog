@@ -13,7 +13,6 @@ import tempfile
 import subprocess
 import threading
 import socket
-import ssl
 import base64
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,8 +27,6 @@ try:
     import cv2
 except Exception:
     cv2 = None
-
-import paho.mqtt.client as mqtt
 
 from robot_hat import Music
 from motion_controller import MotionController
@@ -63,28 +60,10 @@ def set_mouth(level01: float):
 
 
 # =========================
-# MQTT Gesture topics (subscribe)
-# =========================
-MQTT_HOST = "rfff7184.ala.us-east-1.emqxsl.com"
-MQTT_PORT = 8883
-MQTT_USER = "robot_matthew"
-MQTT_PASS = "29061992abCD!yesokmen"
-
-GESTURE_TOPICS = {
-    "STOPMUSIC": "/robot/gesture/stopmusic",
-    "STANDUP":   "robot/gesture/standup",
-    "SIT":       "robot/gesture/sit",
-    "MOVELEFT":  "robot/gesture/moveleft",
-    "MOVERIGHT": "robot/moveright",
-    "STOP":      "/robot/gesture/stop",
-}
-
-
-# =========================
 # Dummy JPEG (1x1) fallback
 # =========================
 _DUMMY_JPEG_B64 = (
-    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/wAALCAAaABoBAREA/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAHf/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPwB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwB//9k="
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/wAALCAAaABoBAREA/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAHf/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPwB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwB//9k="
 )
 DUMMY_JPEG_BYTES = base64.b64decode(_DUMMY_JPEG_B64)
 
@@ -109,22 +88,18 @@ class ListenerCfg:
 
     # server url
     server_url: str = "https://embeddedprogramming-healtheworldserver.up.railway.app/pi_upload_audio_v2"
-
-    # timeout cho POST ban đầu
     timeout_sec: float = 30.0
-
-    # nếu muốn ép server wait sync (debug): thêm ?wait=1
     server_wait_sync: bool = False
 
-    # poll job khi server trả 202
+    # poll job when server returns 202
     job_poll_interval_sec: float = 1.2
     job_poll_timeout_sec: float = 10.0
-    job_max_wait_sec: float = 20 * 60.0  # 20 phút
+    job_max_wait_sec: float = 20 * 60.0
 
     # podcast_next
     podcast_next_timeout_sec: float = 60.0
     podcast_next_retry_sleep_sec: float = 0.6
-    podcast_max_play_sec: float = 45 * 60.0  # tối đa 45 phút / 1 session
+    podcast_max_play_sec: float = 45 * 60.0
 
     snapshot_file: Optional[str] = "/tmp/gesture_latest.jpg"
     snapshot_max_age_sec: float = 3.0
@@ -139,74 +114,94 @@ class ListenerCfg:
     waiting_wav: str = "waitingmessage.wav"
     waiting_enable: bool = True
 
-    # server timeout/5xx -> play file này
+    # server timeout/5xx -> play this
     error_wav: str = "errormessage.wav"
 
     playback_cooldown_sec: float = 0.7
     volume: int = 80
 
-    mqtt_enable: bool = True
+    # ✅ NEW: gesture endpoint (NO MQTT)
+    gesture_api_url: str = "http://127.0.0.1:8000/take_gesture_meaning"
+    gesture_poll_interval_sec: float = 0.12   # 120ms
+    gesture_http_timeout_sec: float = 0.5     # very short
+    gesture_event_limit: int = 30
 
 
-class GestureMqttSubscriber:
+class GestureEndpointWatcher:
     """
-    Subscribe gesture topics and call callbacks.
-    TLS insecure: no CA.
+    Poll /take_gesture_meaning on localhost and call on_gesture(label) for NEW events only.
+    Uses since_ts to avoid duplicates.
     """
-    def __init__(self, on_cmd):
-        self.on_cmd = on_cmd
-        self.client = mqtt.Client(protocol=mqtt.MQTTv311)
-        self.client.username_pw_set(MQTT_USER, MQTT_PASS)
+    def __init__(self, cfg: ListenerCfg, on_gesture):
+        self.cfg = cfg
+        self.on_gesture = on_gesture
+        self._stop = threading.Event()
+        self._th = None
 
-        self.client.tls_set(cert_reqs=ssl.CERT_NONE)
-        self.client.tls_insecure_set(True)
-
-        self.client.on_connect = self._on_connect
-        self.client.on_message = self._on_message
-        self.client.on_disconnect = self._on_disconnect
-
-        self._connected = False
-        self._topic_to_cmd = {v: k for k, v in GESTURE_TOPICS.items()}
-
-    def _on_connect(self, client, userdata, flags, rc):
-        self._connected = (rc == 0)
-        print(f"[MQTT] connected rc={rc}", flush=True)
-        if rc == 0:
-            for tp in self._topic_to_cmd.keys():
-                try:
-                    client.subscribe(tp, qos=0)
-                    print(f"[MQTT] subscribe {tp}", flush=True)
-                except Exception as e:
-                    print("[MQTT] subscribe error:", e, flush=True)
-
-    def _on_disconnect(self, client, userdata, rc):
-        self._connected = False
-        print(f"[MQTT] disconnected rc={rc}", flush=True)
-
-    def _on_message(self, client, userdata, msg):
-        try:
-            topic = (msg.topic or "").strip()
-            cmd = self._topic_to_cmd.get(topic)
-            if not cmd:
-                return
-            print(f"[MQTT] recv {topic} -> {cmd}", flush=True)
-            self.on_cmd(cmd)
-        except Exception as e:
-            print("[MQTT] on_message error:", e, flush=True)
+        self._since_ts = 0.0
+        self._last_label_ts = 0.0
+        self._last_label = "NA"
 
     def start(self):
-        self.client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=30)
-        self.client.loop_start()
+        self._th = threading.Thread(target=self._loop, daemon=True)
+        self._th.start()
 
     def stop(self):
+        self._stop.set()
         try:
-            self.client.loop_stop()
+            if self._th:
+                self._th.join(timeout=1.2)
         except Exception:
             pass
-        try:
-            self.client.disconnect()
-        except Exception:
-            pass
+
+    def _loop(self):
+        url = str(self.cfg.gesture_api_url).strip()
+        interval = max(0.05, float(self.cfg.gesture_poll_interval_sec))
+        timeout = max(0.15, float(self.cfg.gesture_http_timeout_sec))
+        limit = int(self.cfg.gesture_event_limit)
+
+        print(f"[GESTURE-API] watcher -> {url}", flush=True)
+
+        while not self._stop.is_set():
+            try:
+                params = {"since_ts": f"{self._since_ts:.6f}", "limit": str(limit)}
+                r = requests.get(url, params=params, timeout=timeout)
+                if r.status_code == 200:
+                    js = r.json() if r.content else {}
+                    if isinstance(js, dict) and js.get("ok") is True:
+                        events = js.get("events", [])
+                        # events: [{label, ts, ...}]
+                        if isinstance(events, list) and events:
+                            # process in time order
+                            events_sorted = sorted(
+                                [e for e in events if isinstance(e, dict)],
+                                key=lambda x: float(x.get("ts", 0.0))
+                            )
+                            for e in events_sorted:
+                                ts = float(e.get("ts", 0.0))
+                                label = str(e.get("label", "")).strip().upper()
+                                if not label or label == "NA":
+                                    continue
+                                if ts <= self._since_ts:
+                                    continue
+                                # update since_ts progressively
+                                self._since_ts = max(self._since_ts, ts)
+                                self._last_label = label
+                                self._last_label_ts = ts
+                                self.on_gesture(label)
+                        else:
+                            # even if no events, we can still move since_ts by latest (optional)
+                            latest = js.get("latest", {})
+                            if isinstance(latest, dict):
+                                ts = float(latest.get("ts", 0.0) or 0.0)
+                                if ts > self._since_ts:
+                                    self._since_ts = ts
+                # else ignore
+            except Exception:
+                # ignore network errors silently (service might restart)
+                pass
+
+            time.sleep(interval)
 
 
 class ActiveListenerV2:
@@ -220,7 +215,7 @@ class ActiveListenerV2:
         self._playing_audio = False
         self._cooldown_until = 0.0
 
-        # allow STOPMUSIC/STOP to interrupt playback immediately
+        # allow gestures to interrupt playback immediately
         self._playback_stop_evt = threading.Event()
 
         # audio lock
@@ -231,12 +226,6 @@ class ActiveListenerV2:
 
         # podcast state
         self._podcast_active = False
-
-        # motion command queue (from MQTT)
-        self._cmd_lock = threading.Lock()
-        self._pending_cmds: List[str] = []
-        self._last_cmd_ts: Dict[str, float] = {}
-        self._cmd_cooldown = 0.25
 
         self.music = Music()
         try:
@@ -261,10 +250,9 @@ class ActiveListenerV2:
         except Exception:
             pass
 
-        self._mqtt = None
-        if self.cfg.mqtt_enable:
-            self._mqtt = GestureMqttSubscriber(self._on_gesture_cmd)
-            self._mqtt.start()
+        # ✅ Gesture watcher (NO MQTT)
+        self._gesture_watcher = GestureEndpointWatcher(self.cfg, self._on_gesture_label)
+        self._gesture_watcher.start()
 
         set_face("what_is_it")
         set_mouth(0.0)
@@ -276,23 +264,18 @@ class ActiveListenerV2:
         except Exception:
             pass
         try:
-            if self._mqtt:
-                self._mqtt.stop()
+            if self._gesture_watcher:
+                self._gesture_watcher.stop()
         except Exception:
             pass
 
     # ============================
-    # ✅ RESET HARD: quay lại listening
+    # ✅ RESET HARD: back to listening
     # ============================
     def _reset_to_listening(self, reason: str = "", cooldown: float = 0.2):
-        """
-        Dừng TẤT CẢ thread/loop đang chạy (waiting/podcast/playback),
-        clear event và đảm bảo quay lại active listening.
-        """
         if reason:
             print(f"[RESET] {reason}", flush=True)
 
-        # stop flags / loops
         self._podcast_active = False
 
         # stop waiting & playback immediately
@@ -301,12 +284,10 @@ class ActiveListenerV2:
 
         self._stop_audio_playback()
 
-        # reset state
         self._playing_audio = False
         set_mouth(0.0)
         set_face("what_is_it")
 
-        # clear events after a tiny delay (tránh race)
         def _clear():
             time.sleep(0.15)
             self._waiting_abort_evt.clear()
@@ -317,75 +298,32 @@ class ActiveListenerV2:
         self._cooldown_until = time.time() + float(max(0.05, cooldown))
         self._reset_error_state()
 
-    # ----------------------------
-    # MQTT gesture handling
-    # ----------------------------
-    def _on_gesture_cmd(self, cmd: str):
-        now = time.time()
-        with self._cmd_lock:
-            last = self._last_cmd_ts.get(cmd, 0.0)
-            if (now - last) < self._cmd_cooldown:
-                return
-            self._last_cmd_ts[cmd] = now
-
-        if cmd in ("STOPMUSIC", "STOP"):
-            print(f"[GESTURE] {cmd} -> stop audio + resume listening", flush=True)
-            self.request_stopmusic()
+    # ============================
+    # ✅ Gesture -> stop music immediately
+    # ============================
+    def _on_gesture_label(self, label: str):
+        """
+        Any hand movement should stop music.
+        Labels may be: SIT/STANDUP/MOVELEFT/MOVERIGHT/STOP/WAVE/STOPMUSIC/UP/DOWN...
+        """
+        if self._stop:
             return
 
-        with self._cmd_lock:
-            self._pending_cmds.append(cmd)
+        lbl = (label or "").strip().upper()
+        if not lbl or lbl == "NA":
+            return
+
+        # The user requirement: ANY gesture movement -> stop music
+        # (we still filter a few harmless ones if ever appear)
+        IGNORE = {"", "NA", "NONE"}
+        if lbl in IGNORE:
+            return
+
+        print(f"[GESTURE-API] recv {lbl} -> STOP MUSIC NOW", flush=True)
+        self.request_stopmusic()
 
     def request_stopmusic(self):
-        # stop everything
-        self._reset_to_listening("STOP/STOPMUSIC received", cooldown=0.1)
-
-    def _pop_pending_cmds(self) -> List[str]:
-        with self._cmd_lock:
-            cmds = self._pending_cmds[:]
-            self._pending_cmds.clear()
-        return cmds
-
-    def _handle_motion_cmd(self, cmd: str):
-        if not self.motion:
-            return
-
-        action = None
-        if cmd == "STANDUP":
-            action = "STAND"
-        elif cmd == "SIT":
-            action = "SIT"
-        elif cmd == "MOVELEFT":
-            action = "TURN_LEFT"
-        elif cmd == "MOVERIGHT":
-            action = "TURN_RIGHT"
-        elif cmd == "STOP":
-            action = "STOP"
-
-        if not action:
-            return
-
-        print(f"[MOTION] {cmd} -> {action}", flush=True)
-
-        try:
-            if hasattr(self.motion, "move"):
-                self.motion.move(action)
-                return
-            if hasattr(self.motion, "command"):
-                self.motion.command(action)
-                return
-            if action == "STAND" and hasattr(self.motion, "stand"):
-                self.motion.stand(); return
-            if action == "SIT" and hasattr(self.motion, "sit"):
-                self.motion.sit(); return
-            if action == "TURN_LEFT" and hasattr(self.motion, "turn_left"):
-                self.motion.turn_left(); return
-            if action == "TURN_RIGHT" and hasattr(self.motion, "turn_right"):
-                self.motion.turn_right(); return
-            if action == "STOP" and hasattr(self.motion, "stop"):
-                self.motion.stop(); return
-        except Exception as e:
-            print("[MOTION] error:", e, flush=True)
+        self._reset_to_listening("gesture -> stopmusic", cooldown=0.1)
 
     # ----------------------------
     # Audio playback + lipsync
@@ -436,6 +374,8 @@ class ActiveListenerV2:
             chunk_samples = int(16000 * 0.05)
             chunk_bytes = chunk_samples * 2
             while not stop_evt.is_set():
+                if self._playback_stop_evt.is_set() or self._waiting_abort_evt.is_set() or self._stop:
+                    break
                 buf = p.stdout.read(chunk_bytes) if p.stdout else b""
                 if not buf:
                     break
@@ -577,9 +517,6 @@ class ActiveListenerV2:
             print("[WAIT] stop waitingmessage loop", flush=True)
 
     def _start_waiting(self):
-        """
-        helper: start waiting loop thread
-        """
         if not (self.cfg.waiting_enable and self._waiting_path.exists()):
             return None, None
         stop_evt = threading.Event()
@@ -593,7 +530,6 @@ class ActiveListenerV2:
                 stop_evt.set()
         except Exception:
             pass
-        # force stop audio in case it's playing waiting.wav
         self._waiting_abort_evt.set()
         self._stop_audio_playback()
         try:
@@ -626,10 +562,6 @@ class ActiveListenerV2:
         self._last_http_exc = None
 
     def _play_error_message(self):
-        """
-        Chỉ dùng khi timeout/5xx.
-        Sau khi phát xong -> reset về listening.
-        """
         if not self._error_path.exists():
             print(f"[ERRPLAY] error file not found: {self._error_path}", flush=True)
             self._reset_to_listening("error_wav missing", cooldown=0.1)
@@ -637,7 +569,6 @@ class ActiveListenerV2:
 
         print("[ERRPLAY] server timeout/5xx -> play errormessage.wav", flush=True)
 
-        # ensure stop other loops first
         self._podcast_active = False
         self._waiting_abort_evt.set()
         self._playback_stop_evt.set()
@@ -660,32 +591,22 @@ class ActiveListenerV2:
 
             t_end = time.time() + float(dur) + 0.15
             while time.time() < t_end:
-                if self._stop:
+                if self._stop or self._playback_stop_evt.is_set():
                     break
                 time.sleep(0.05)
 
         finally:
             self._stop_audio_playback()
             self._playing_audio = False
-            # HARD reset back to listening
             self._reset_to_listening("played errormessage.wav -> back to listening", cooldown=0.2)
 
     def _handle_server_error(self, err: str, play_error_wav: bool = True):
-        """
-        ✅ Mọi lỗi server (job error, transcript empty, podcast_next error, status=error...)
-        đều chạy qua đây để chương trình KHÔNG CHẾT và quay lại active listening.
-        """
-        err = (err or "").strip()
-        if not err:
-            err = "server error"
+        err = (err or "").strip() or "server error"
         print(f"[SERVER-ERROR] {err}", flush=True)
 
-        # stop everything first
         self._reset_to_listening(f"server error -> reset ({err})", cooldown=0.2)
 
-        # optionally play error message (nhưng xong vẫn quay lại listening)
         if play_error_wav and self._error_path.exists():
-            # phát nhanh 1 lần rồi thôi, không chặn loop lâu
             try:
                 set_face("sad")
                 self._playing_audio = True
@@ -695,10 +616,7 @@ class ActiveListenerV2:
                 dur = self._get_audio_duration_sec(str(self._error_path)) or 2.0
                 t_end = time.time() + float(dur) + 0.1
                 while time.time() < t_end:
-                    if self._stop:
-                        break
-                    # nếu user STOP thì cũng bỏ phát
-                    if self._playback_stop_evt.is_set():
+                    if self._stop or self._playback_stop_evt.is_set():
                         break
                     time.sleep(0.05)
             except Exception:
@@ -724,7 +642,7 @@ class ActiveListenerV2:
 
         while not self._stop:
             if self._waiting_abort_evt.is_set() or self._playback_stop_evt.is_set():
-                print("[JOB] aborted by STOP/STOPMUSIC", flush=True)
+                print("[JOB] aborted by gesture stop", flush=True)
                 return None
 
             if (time.time() - t0) > float(self.cfg.job_max_wait_sec):
@@ -834,12 +752,10 @@ class ActiveListenerV2:
         print(f"[POD] start podcast={podcast_id} total={total}", flush=True)
         set_face("music")
 
-        # play first
         if not self._play_audio_url_once(first_audio_url):
             self._reset_to_listening("[POD] failed/aborted at first chunk", cooldown=0.15)
             return
 
-        # next chunks
         while not self._stop and self._podcast_active:
             if self._playback_stop_evt.is_set():
                 break
@@ -1159,7 +1075,6 @@ class ActiveListenerV2:
     # Handle server reply
     # ----------------------------
     def _handle_server_reply(self, resp: Dict[str, Any]):
-        # ✅ nếu server trả status=error
         if isinstance(resp, dict) and resp.get("status") == "error":
             self._handle_server_error(resp.get("error") or "server status=error", play_error_wav=True)
             return
@@ -1193,12 +1108,10 @@ class ActiveListenerV2:
             "podcast": podcast if isinstance(podcast, dict) else None,
         })
 
-        # LONG VIDEO PODCAST: auto play all chunks
         if (label.strip().lower() == "nhac") and podcast_id and audio_url:
             self._play_podcast_until_done(str(podcast_id), str(audio_url), total=podcast_total)
             return
 
-        # normal one-shot audio
         if audio_url:
             set_face("music" if label.strip().lower() == "nhac" else "suprise")
             ok = self._play_audio_url_once(audio_url)
@@ -1207,7 +1120,6 @@ class ActiveListenerV2:
             else:
                 self._reset_to_listening("finished playing -> back to listening", cooldown=0.12)
         else:
-            # không có audio_url thì vẫn reset để không bị kẹt
             self._reset_to_listening("no audio_url -> back to listening", cooldown=0.12)
 
     # ----------------------------
@@ -1218,12 +1130,7 @@ class ActiveListenerV2:
         self._calibrate_noise_floor()
 
         while not self._stop:
-            # luôn nuốt mọi lỗi để chương trình không chết
             try:
-                cmds = self._pop_pending_cmds()
-                for c in cmds:
-                    self._handle_motion_cmd(c)
-
                 if self._playing_audio or (time.time() < self._cooldown_until):
                     time.sleep(0.05)
                     continue
@@ -1254,9 +1161,7 @@ class ActiveListenerV2:
 
                         image_bytes = self._get_image_bytes_for_request()
 
-                        # waiting while POST
                         w_stop, w_th = self._start_waiting()
-
                         try:
                             resp = self._send_to_server(full_wav, image_bytes=image_bytes)
                         finally:
@@ -1274,7 +1179,6 @@ class ActiveListenerV2:
                                 self._handle_server_error("server returned empty/invalid", play_error_wav=True)
                             continue
 
-                        # 202 -> poll job
                         if resp.get("status") == "processing" and resp.get("job_id"):
                             job_id = str(resp.get("job_id"))
                             print(f"[SERVER] 202 processing -> job_id={job_id}", flush=True)
@@ -1296,7 +1200,6 @@ class ActiveListenerV2:
                             self._handle_server_reply(job_result)
                             continue
 
-                        # 200 OK
                         self._handle_server_reply(resp)
 
                     else:
@@ -1310,7 +1213,6 @@ class ActiveListenerV2:
                         pass
 
             except Exception as e:
-                # ✅ tuyệt đối không để chết loop
                 print("[FATAL-GUARD] exception:", e, flush=True)
                 self._reset_to_listening(f"guard exception -> reset ({e})", cooldown=0.3)
                 time.sleep(0.1)
@@ -1358,7 +1260,12 @@ def main():
 
         playback_cooldown_sec=0.7,
         volume=80,
-        mqtt_enable=True,
+
+        # ✅ NEW: gesture endpoint
+        gesture_api_url="http://127.0.0.1:8000/take_gesture_meaning",
+        gesture_poll_interval_sec=0.12,
+        gesture_http_timeout_sec=0.5,
+        gesture_event_limit=30,
     )
 
     al = ActiveListenerV2(cfg, motion=mc)
