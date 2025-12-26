@@ -42,13 +42,18 @@ GESTURE_RING_MAX = int(os.environ.get("GESTURE_RING_MAX", "60"))
 
 ALWAYS_STOPMUSIC_ON_ANY_GESTURE = os.environ.get("ALWAYS_STOPMUSIC_ON_ANY_GESTURE", "1").strip() == "1"
 
-# ✅ FIX đảo hướng: xoay frame 180° NGAY TỪ CAMERA (default bật)
+# rotate input frame at source => keep direction correct
 CAM_ROTATE_180 = os.environ.get("CAM_ROTATE_180", "1").strip() == "1"
 
-# Obstacle "near-only" tuning
-OBS_MIN_AREA_RATIO = float(os.environ.get("OBS_MIN_AREA_RATIO", "0.10"))
+# Obstacle tuning
+OBS_MIN_AREA_RATIO = float(os.environ.get("OBS_MIN_AREA_RATIO", "0.10"))      # near = big
 OBS_CENTER_REGION_RATIO = float(os.environ.get("OBS_CENTER_REGION_RATIO", "0.75"))
 OBS_MIN_BOTTOM_RATIO = float(os.environ.get("OBS_MIN_BOTTOM_RATIO", "0.45"))
+
+# ✅ NEW: reject false huge boxes
+OBS_REJECT_FULLSCREEN_RATIO = float(os.environ.get("OBS_REJECT_FULLSCREEN_RATIO", "0.65"))  # box area >= 65% => ignore
+OBS_REJECT_THIN_AR = float(os.environ.get("OBS_REJECT_THIN_AR", "6.0"))  # long-thin line boxes => ignore
+OBS_EDGE_MARGIN_PX = int(os.environ.get("OBS_EDGE_MARGIN_PX", "8"))      # contour touching edges => ignore
 
 
 def _write_snapshot_atomic(frame_bgr, out_path: str, quality: int = 80):
@@ -90,7 +95,6 @@ class Camera:
         if not ok:
             return None
 
-        # ✅ rotate at source => hand labels không bị đảo nữa
         if self.rotate180:
             frame = cv2.rotate(frame, cv2.ROTATE_180)
 
@@ -170,11 +174,14 @@ class CameraObstacleDetector:
 
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (7, 7), 0)
+
+        # edges
         edges = cv2.Canny(gray, 60, 160)
         edges = cv2.dilate(edges, None, iterations=2)
 
         cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+        # central region
         cx_min = int(w * (1.0 - self.center_region_ratio) / 2.0)
         cx_max = int(w - cx_min)
         cy_min = int(h * (1.0 - self.center_region_ratio) / 2.0)
@@ -184,21 +191,39 @@ class CameraObstacleDetector:
 
         for cnt in cnts:
             area = abs(cv2.contourArea(cnt))
-            if area < 400:
+            if area < 500:
                 continue
 
             x, y, bw, bh = cv2.boundingRect(cnt)
             box_area = float(bw * bh)
             box_ratio = box_area / (frame_area + 1e-9)
 
+            # ✅ reject huge/fullscreen false box
+            if box_ratio >= OBS_REJECT_FULLSCREEN_RATIO:
+                continue
+
+            # ✅ reject long thin boxes (lines / edges)
+            ar = max(bw / float(bh + 1e-9), bh / float(bw + 1e-9))
+            if ar >= OBS_REJECT_THIN_AR:
+                continue
+
+            # ✅ reject boxes touching image border (very common false)
+            if (x <= OBS_EDGE_MARGIN_PX or y <= OBS_EDGE_MARGIN_PX or
+                (x + bw) >= (w - OBS_EDGE_MARGIN_PX) or
+                (y + bh) >= (h - OBS_EDGE_MARGIN_PX)):
+                continue
+
+            # must be large enough (near)
             if box_ratio < self.min_area_ratio:
                 continue
 
+            # must be in center
             center_x = x + bw // 2
             center_y = y + bh // 2
             if not (cx_min <= center_x <= cx_max and cy_min <= center_y <= cy_max):
                 continue
 
+            # must be near: bottom edge low in frame
             bottom_y = y + bh
             if bottom_y < int(h * self.min_bottom_ratio):
                 continue
@@ -222,29 +247,34 @@ class CameraObstacleDetector:
                 "boxes": [{"x": x, "y": y, "w": w, "h": h, "shape": s} for (x, y, w, h, s) in self._near_boxes],
             }
 
-    def draw_overlay_clean(self, frame_bgr: np.ndarray, top_left_text: str, top_right_text: str) -> np.ndarray:
+    def draw_overlay_clean(self, frame_bgr: np.ndarray, obstacle_yes: bool, gesture_label: str) -> np.ndarray:
         with self._lock:
             boxes = list(self._near_boxes)
 
         out = frame_bgr.copy()
         h, w = out.shape[:2]
 
-        # draw boxes only (less messy)
+        # draw near boxes
         for (x, y, bw, bh, shape) in boxes:
             cv2.rectangle(out, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
             cv2.putText(out, shape, (x, max(0, y - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
         # top bar
-        bar_h = 42
+        bar_h = 48
         cv2.rectangle(out, (0, 0), (w, bar_h), (0, 0, 0), -1)
-        cv2.putText(out, top_left_text, (10, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-        (tw, _), _ = cv2.getTextSize(top_right_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+        obs_text = "YES" if obstacle_yes else "NO"
+        left_text = f"OBSTACLE: {obs_text}"
+        right_text = f"GESTURE: {gesture_label}"
+
+        cv2.putText(out, left_text, (10, 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+
+        (tw, _), _ = cv2.getTextSize(right_text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
         rx = max(10, w - tw - 10)
-        cv2.putText(out, top_right_text, (rx, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(out, right_text, (rx, 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
 
         return out
 
@@ -317,6 +347,11 @@ def attach_routes_to_flask_app(flask_app: Flask, detector: CameraObstacleDetecto
             "gesture_latest": gl,
             "gesture_ring_n": ring_n,
             "cam_rotate_180": CAM_ROTATE_180,
+            "obs_filters": {
+                "reject_fullscreen_ratio": OBS_REJECT_FULLSCREEN_RATIO,
+                "reject_thin_ar": OBS_REJECT_THIN_AR,
+                "edge_margin_px": OBS_EDGE_MARGIN_PX
+            }
         })
 
 
@@ -333,7 +368,7 @@ def main():
         min_bottom_ratio=OBS_MIN_BOTTOM_RATIO
     )
 
-    # HandCommand dùng frame đã được rotate đúng => label không bị đảo nữa
+    # HandCommand uses the same rotated frame => directions consistent
     def get_frame_raw():
         return cam.get_frame()
 
@@ -344,23 +379,29 @@ def main():
             return None
 
         detector.compute(frame)
-
-        cam_state = detector.get_state()
-        obs_lbl = cam_state.get("label", "no obstacle")
+        st = detector.get_state()
+        obstacle_yes = (st.get("label") == "yes have obstacle")
 
         with gesture_lock:
             g_lbl = gesture_latest.get("label", "NA")
 
-        left_text = f"OBSTACLE: {obs_lbl}"
-        right_text = f"GESTURE: {g_lbl}"
+        return detector.draw_overlay_clean(frame, obstacle_yes=obstacle_yes, gesture_label=g_lbl)
 
-        return detector.draw_overlay_clean(frame, left_text, right_text)
+    # ✅ Swap SIT <-> STANDUP to match your old mapping
+    def _swap_action(a: str) -> str:
+        if a == "SIT":
+            return "STANDUP"
+        if a == "STANDUP":
+            return "SIT"
+        return a
 
     def on_action(action: str, face: str, bark: bool):
         a = (action or "").strip().upper()
         f = (face or "").strip()
         if not a:
             return
+
+        a = _swap_action(a)  # ✅ fix SIT/STAND swapped
 
         if f:
             set_face(f)
@@ -398,7 +439,7 @@ def main():
         get_frame_bgr=get_frame_for_dashboard,
         avoid_obstacle=None,
         on_manual_cmd=lambda m: print("[MANUAL CMD]", m, flush=True),
-        rotate180=False,      # ✅ IMPORTANT: đã rotate ở Camera rồi, nên tắt ở dashboard
+        rotate180=False,   # already rotated in Camera
         mqtt_enable=False,
         hand_command=hc,
     )
@@ -414,9 +455,8 @@ def main():
     print("\n=== Gesture Service (NO MQTT) + WebDashboard ===", flush=True)
     print("WebDashboard: http://<pi_ip>:8000", flush=True)
     if attached:
-        print("Endpoints (same 8000): /take_gesture_meaning  /take_camera_decision  /api/gesture_status", flush=True)
+        print("Endpoints: /take_gesture_meaning  /take_camera_decision  /api/gesture_status", flush=True)
     print("Snapshot:", SNAPSHOT_PATH, flush=True)
-    print("CAM_ROTATE_180:", CAM_ROTATE_180, flush=True)
 
     try:
         dash.run()
