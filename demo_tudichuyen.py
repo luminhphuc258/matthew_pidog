@@ -3,8 +3,6 @@
 
 import os
 import time
-import math
-import json
 import random
 import threading
 import subprocess
@@ -12,7 +10,6 @@ import socket
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 
-import numpy as np
 import requests
 from flask import Flask, jsonify, Response
 
@@ -42,14 +39,25 @@ LOOP_HZ = 20.0
 HTTP_TIMEOUT = 0.6
 
 # Safety distances (cm)
-SAFE_FORWARD_CM = 65.0     # muốn đi thẳng thì front clearance >=
-SAFE_TURN_CM = 45.0        # rẽ trái/phải cần clearance >=
-EMERGENCY_STOP_CM = 18.0   # quá gần thì stop ngay
+SAFE_FORWARD_CM = 65.0
+SAFE_TURN_CM = 45.0
+EMERGENCY_STOP_CM = 18.0
 
-# Periodic rest sit
-REST_MIN_MINUTES = 2
-REST_MAX_MINUTES = 5
-REST_SIT_SECONDS = 30
+# =========================
+# REST SCHEDULE (as you requested)
+# =========================
+# Random time until next rest: 8..15 minutes
+REST_INTERVAL_MIN_MINUTES = 8
+REST_INTERVAL_MAX_MINUTES = 15
+
+# At rest time: SIT and hold random 9..15 minutes
+REST_HOLD_MIN = 9
+REST_HOLD_MAX = 15
+REST_HOLD_UNIT = "min"  # keep "min" as your latest requirement
+# If you want 9..15 seconds instead, set:
+# REST_HOLD_MIN = 9
+# REST_HOLD_MAX = 15
+# REST_HOLD_UNIT = "sec"
 
 # Gesture TTL
 GESTURE_TTL_SEC = 1.2
@@ -74,7 +82,6 @@ def run(cmd: List[str]):
     return subprocess.run(cmd, check=False)
 
 def set_volumes():
-    # giống code bạn (giữ nguyên)
     run(["amixer", "-q", "sset", "robot-hat speaker", "100%"])
     run(["amixer", "-q", "sset", "robot-hat speaker Playback Volume", "100%"])
     run(["amixer", "-q", "sset", "robot-hat mic", "100%"])
@@ -89,19 +96,22 @@ def http_get_json(url: str, timeout: float = HTTP_TIMEOUT) -> Optional[dict]:
     except Exception:
         return None
 
-def clamp(x, a, b):
-    return a if x < a else (b if x > b else x)
+def seconds_from_hold_value(v: float) -> float:
+    if REST_HOLD_UNIT == "sec":
+        return float(v)
+    # default minutes
+    return float(v) * 60.0
 
 # =========================
 # Robot Status Manager
 # =========================
 class RobotState:
     """
-    Lưu trạng thái để chuyển ổn định tránh té.
+    Lưu trạng thái để theo dõi SIT/...
     """
     def __init__(self):
-        self.mode = "BOOT"     # BOOT / STAND / SIT / MOVE / TURN / BACK / STOP
-        self.detail = ""       # e.g. TURN_RIGHT
+        self.mode = "BOOT"   # BOOT / STAND / SIT / MOVE / TURN / BACK / STOP
+        self.detail = ""
         self.ts = time.time()
 
     def set(self, mode: str, detail: str = ""):
@@ -112,19 +122,21 @@ class RobotState:
     def is_sitting(self) -> bool:
         return self.mode == "SIT"
 
-    def is_standing(self) -> bool:
-        return self.mode == "STAND"
-
     def __repr__(self):
         return f"{self.mode}:{self.detail}" if self.detail else self.mode
 
 # =========================
-# Motion wrapper (safe transitions)
+# Motion wrapper
 # =========================
 class RobotMotion:
-    def __init__(self, motion: MotionController, pose_file: Path, state: RobotState):
+    """
+    IMPORTANT RULES (per your request):
+    - boot() does NOT apply pose config outside (MotionController.boot already did)
+    - ONLY do support_stand when transitioning SIT -> STAND
+    - NO pose/stabilize for FORWARD/TURN/BACK
+    """
+    def __init__(self, motion: MotionController, state: RobotState):
         self.motion = motion
-        self.pose_file = pose_file
         self.state = state
         self.dog = getattr(motion, "dog", None)
 
@@ -135,32 +147,18 @@ class RobotMotion:
         except Exception:
             pass
 
-    def _apply_pose_config(self):
+    def boot_stand(self):
         """
-        Dùng y chang cách bạn đang xài (load_pose_config + apply_pose_from_cfg).
-        """
-        try:
-            cfg = self.motion.load_pose_config()
-            self.motion.apply_pose_from_cfg(cfg, per_servo_delay=0.02, settle_sec=0.6)
-        except Exception:
-            pass
-
-    def boot_pose_stand(self):
-        """
-        THỨ TỰ BẮT BUỘC:
-        1) boot
-        2) pose chuẩn
-        3) stand
+        boot() only. NO apply pose here.
         """
         self.state.set("BOOT")
         self.motion.boot()
         set_volumes()
-
-        # pose chuẩn trước
-        self._apply_pose_config()
-
-        # rồi stand
-        self.stop()
+        try:
+            self.motion.execute("STOP")
+        except Exception:
+            pass
+        self.set_led("white", bps=0.35)
         self.state.set("STAND")
 
     def stop(self):
@@ -173,52 +171,30 @@ class RobotMotion:
 
     def support_stand_from_sit(self):
         """
-        Nếu đang SIT thì gọi support stand trước (để khỏi té),
-        rồi mới apply pose và stand.
+        ONLY used when SIT -> STAND.
         """
-        # cố gắng đứng dậy trước
         t0 = time.time()
-        while time.time() - t0 < 0.7:
+        while time.time() - t0 < 0.8:
             try:
                 self.motion.execute("STANDUP")
             except Exception:
-                # fallback
                 try:
                     self.motion.execute("STOP")
                 except Exception:
                     pass
             time.sleep(0.02)
 
-    def ensure_stand_stable(self):
+    def sit_down_and_hold(self, hold_seconds: float):
         """
-        Nếu đang sit -> support stand -> pose -> STOP(stand)
+        Stop -> SIT -> hold (no stabilize except when standing up again)
         """
-        if self.state.is_sitting():
-            self.support_stand_from_sit()
-
-        # về pose chuẩn cho ổn định
-        self._apply_pose_config()
-
-        # stand
-        try:
-            self.motion.execute("STOP")
-        except Exception:
-            pass
-        self.set_led("white", bps=0.35)
-        self.state.set("STAND")
-
-    def sit_down(self, seconds: float = REST_SIT_SECONDS):
-        """
-        Stop -> SIT -> giữ -> đứng lên -> pose -> stand
-        """
-        # stop trước
         try:
             self.motion.execute("STOP")
         except Exception:
             pass
         time.sleep(0.1)
 
-        # sit
+        # SIT
         t0 = time.time()
         while time.time() - t0 < 0.9:
             try:
@@ -231,15 +207,28 @@ class RobotMotion:
         self.set_led("red", bps=0.35)
         set_face("sleep")
 
-        # giữ 30s
-        t_end = time.time() + float(seconds)
+        # hold
+        t_end = time.time() + float(hold_seconds)
         while time.time() < t_end:
-            time.sleep(0.1)
+            time.sleep(0.2)
 
-        # đứng lên ổn định lại
+    def stand_from_sit_only(self):
+        """
+        EXACT requirement:
+        - ONLY stabilize/support stand when SIT -> STAND
+        """
+        if not self.state.is_sitting():
+            return
         set_face("what_is_it")
-        self.ensure_stand_stable()
+        self.support_stand_from_sit()
+        try:
+            self.motion.execute("STOP")
+        except Exception:
+            pass
+        self.set_led("white", bps=0.35)
+        self.state.set("STAND")
 
+    # Movement commands (NO stabilize inside)
     def forward(self):
         self.set_led("blue", bps=0.6)
         self.state.set("MOVE", "FORWARD")
@@ -254,7 +243,6 @@ class RobotMotion:
         try:
             self.motion.execute("BACK")
         except Exception:
-            # fallback
             try:
                 self.motion.execute("BACKWARD")
             except Exception:
@@ -277,15 +265,13 @@ class RobotMotion:
             pass
 
 # =========================
-# Gesture Poller (highest priority)
+# Gesture Poller
 # =========================
 class GesturePoller:
     def __init__(self):
         self.lock = threading.Lock()
         self.latest_label = ""
         self.latest_ts = 0.0
-        self.latest_raw = ""
-        self.latest_face = ""
 
         self._stop = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -303,16 +289,10 @@ class GesturePoller:
                 latest = js.get("latest", {}) or {}
                 label = str(latest.get("label", "") or "").upper().strip()
                 ts = float(latest.get("ts", 0.0) or 0.0)
-                raw = str(latest.get("raw", "") or "")
-                face = str(latest.get("face", "") or "")
-
                 with self.lock:
-                    # chỉ update khi có label mới
                     if label:
                         self.latest_label = label
                         self.latest_ts = ts
-                        self.latest_raw = raw
-                        self.latest_face = face
             time.sleep(0.10)
 
     def get_active(self) -> Optional[str]:
@@ -324,19 +304,12 @@ class GesturePoller:
             return self.latest_label
 
 # =========================
-# Lidar parsing + direction picking
+# Lidar parsing helpers
 # =========================
 def _extract_points(scan_json: dict) -> List[Tuple[float, float]]:
-    """
-    Return list of (angle_deg, dist_cm)
-    Tolerant với nhiều format.
-    """
     if not isinstance(scan_json, dict):
         return []
-
-    pts = []
-
-    # common keys
+    pts: List[Tuple[float, float]] = []
     for key in ("points", "scan", "data"):
         arr = scan_json.get(key, None)
         if isinstance(arr, list) and arr:
@@ -353,7 +326,6 @@ def _extract_points(scan_json: dict) -> List[Tuple[float, float]]:
             if pts:
                 return pts
 
-    # arrays style: angles + dists
     ang = scan_json.get("angles", None)
     dist = scan_json.get("dists_cm", scan_json.get("distances_cm", scan_json.get("dists", None)))
     if isinstance(ang, list) and isinstance(dist, list) and len(ang) == len(dist):
@@ -362,30 +334,21 @@ def _extract_points(scan_json: dict) -> List[Tuple[float, float]]:
                 pts.append((float(a), float(d)))
             except Exception:
                 pass
-
     return pts
 
 def _sector_min_distance(points: List[Tuple[float, float]], a1: float, a2: float) -> float:
-    """
-    min dist in [a1..a2] degrees (handle wrap if needed)
-    """
     if not points:
         return 9999.0
 
-    def in_range(a):
-        # normalize -180..180
-        while a > 180:
-            a -= 360
-        while a < -180:
-            a += 360
+    def norm(a):
+        while a > 180: a -= 360
+        while a < -180: a += 360
         return a
 
-    a1n = in_range(a1)
-    a2n = in_range(a2)
-
-    mins = []
+    a1n, a2n = norm(a1), norm(a2)
+    mins: List[float] = []
     for ang, dist in points:
-        an = in_range(ang)
+        an = norm(ang)
         d = float(dist)
         if d <= 0:
             continue
@@ -393,16 +356,11 @@ def _sector_min_distance(points: List[Tuple[float, float]], a1: float, a2: float
             if a1n <= an <= a2n:
                 mins.append(d)
         else:
-            # wrap
             if an >= a1n or an <= a2n:
                 mins.append(d)
-
     return min(mins) if mins else 9999.0
 
 def lidar_clearance(points: List[Tuple[float, float]]) -> Dict[str, float]:
-    """
-    Tính clearance (cm) theo sector.
-    """
     return {
         "FRONT": _sector_min_distance(points, -25, 25),
         "LEFT":  _sector_min_distance(points, 30, 110),
@@ -411,18 +369,12 @@ def lidar_clearance(points: List[Tuple[float, float]]) -> Dict[str, float]:
     }
 
 def pick_direction_by_clearance(clr: Dict[str, float], prefer: str = "FRONT") -> str:
-    """
-    Chọn hướng tốt nhất.
-    Return one of: FORWARD, TURN_LEFT, TURN_RIGHT, BACK, STOP
-    """
     front = clr.get("FRONT", 0.0)
     left = clr.get("LEFT", 0.0)
     right = clr.get("RIGHT", 0.0)
     back = clr.get("BACK", 0.0)
 
-    # emergency
     if min(front, left, right) < EMERGENCY_STOP_CM:
-        # nếu quá sát nhiều phía -> lùi nhẹ
         if back > SAFE_TURN_CM:
             return "BACK"
         return "STOP"
@@ -430,18 +382,10 @@ def pick_direction_by_clearance(clr: Dict[str, float], prefer: str = "FRONT") ->
     if prefer == "FRONT" and front >= SAFE_FORWARD_CM:
         return "FORWARD"
 
-    # choose max clearance among left/right/front/back
-    candidates = [
-        ("FORWARD", front),
-        ("TURN_LEFT", left),
-        ("TURN_RIGHT", right),
-        ("BACK", back),
-    ]
+    candidates = [("FORWARD", front), ("TURN_LEFT", left), ("TURN_RIGHT", right), ("BACK", back)]
     candidates.sort(key=lambda x: x[1], reverse=True)
-
     best_cmd, best_val = candidates[0]
 
-    # enforce minimums
     if best_cmd == "FORWARD" and best_val >= SAFE_FORWARD_CM:
         return "FORWARD"
     if best_cmd in ("TURN_LEFT", "TURN_RIGHT") and best_val >= SAFE_TURN_CM:
@@ -457,9 +401,8 @@ def pick_direction_by_clearance(clr: Dict[str, float], prefer: str = "FRONT") ->
 def camera_is_clear() -> bool:
     js = http_get_json(URL_CAMERA_DECISION, timeout=0.45)
     if not js or not js.get("ok"):
-        return True  # fail-open để robot vẫn có thể đi theo lidar
+        return True
     label = str(js.get("label", "") or "").lower().strip()
-    # service của bạn trả "no obstacle" / "yes have obstacle"
     return (label == "no obstacle")
 
 # =========================
@@ -469,18 +412,14 @@ def lidar_ready() -> bool:
     js = http_get_json(URL_LIDAR_STATUS, timeout=0.6)
     if not js:
         return False
-    # tolerant keys
     for k in ("ok", "ready", "lidar_ready", "running"):
         if k in js:
             try:
                 return bool(js[k])
             except Exception:
                 pass
-    # fallback: nếu có status string
     st = str(js.get("status", "") or "").lower()
-    if "ready" in st or "running" in st:
-        return True
-    return False
+    return ("ready" in st) or ("running" in st)
 
 def lidar_decision_label() -> Optional[str]:
     js = http_get_json(URL_LIDAR_DECISION, timeout=0.55)
@@ -496,8 +435,7 @@ def lidar_scan_points() -> List[Tuple[float, float]]:
     js = http_get_json(URL_LIDAR_DATA, timeout=0.65)
     if not js:
         return []
-    pts = _extract_points(js)
-    return pts
+    return _extract_points(js)
 
 # =========================
 # Map Web (fake 3D)
@@ -526,11 +464,9 @@ class MapServer:
 
         @self.app.get("/")
         def index():
-            html = self._html()
-            return Response(html, mimetype="text/html")
+            return Response(self._html(), mimetype="text/html")
 
     def _html(self) -> str:
-        # canvas "fake 3D": project polar -> x,y then perspective scaling
         return f"""
 <!doctype html>
 <html>
@@ -576,11 +512,9 @@ const ctx = cv.getContext('2d');
 function draw(data) {{
   ctx.clearRect(0,0,cv.width,cv.height);
 
-  // origin bottom-center for 3D feel
   const ox = cv.width * 0.5;
   const oy = cv.height * 0.78;
 
-  // grid
   ctx.strokeStyle = '#142033';
   ctx.lineWidth = 1;
   for (let i=1;i<=6;i++) {{
@@ -590,7 +524,6 @@ function draw(data) {{
     ctx.stroke();
   }}
 
-  // robot dot
   ctx.fillStyle = '#60a5fa';
   ctx.beginPath(); ctx.arc(ox, oy, 6, 0, Math.PI*2); ctx.fill();
 
@@ -600,24 +533,20 @@ function draw(data) {{
     const d = (p.dist_cm || 0);
     if (!d || d <= 0) continue;
 
-    // polar -> x,y (cm)
     const x = Math.sin(ang) * d;
     const y = Math.cos(ang) * d;
 
-    // perspective: farther points compress upward
     const depth = Math.max(1, d);
     const scale = 1.0 / (1.0 + depth/260.0);
 
     const sx = ox + x * 1.3 * scale;
     const sy = oy - y * 1.1 * scale;
 
-    // brightness: near = brighter
     const b = Math.max(40, Math.min(255, 300 - d));
     ctx.fillStyle = `rgb(${b},${b},${b})`;
     ctx.fillRect(sx, sy, 2, 2);
   }}
 
-  // text overlays
   document.getElementById('st').textContent = data.robot_state || '-';
   document.getElementById('cmd').textContent = data.cmd || '-';
   document.getElementById('ts').textContent = String(data.ts || '-');
@@ -666,25 +595,20 @@ def main():
     os.environ.setdefault("PULSE_SERVER", "")
     os.environ.setdefault("JACK_NO_START_SERVER", "1")
 
-    # motion
     state = RobotState()
     motion = MotionController(pose_file=POSE_FILE)
-    rm = RobotMotion(motion=motion, pose_file=POSE_FILE, state=state)
+    rm = RobotMotion(motion=motion, state=state)
 
-    # map web
     map_server = MapServer()
     map_server.run_bg()
 
-    # gesture poller
     gp = GesturePoller()
     gp.start()
 
-    # BOOT -> POSE -> STAND (đúng thứ tự)
-    rm.boot_pose_stand()
-    rm.set_led("white", bps=0.35)
+    # BOOT only (NO apply pose outside)
+    rm.boot_stand()
     set_face("what_is_it")
 
-    # Wait lidar ready
     print("[DEMO] waiting lidar ready...", flush=True)
     t0 = time.time()
     while True:
@@ -696,10 +620,9 @@ def main():
             break
         time.sleep(0.25)
 
-    # rest scheduler
-    next_rest_ts = time.time() + random.randint(REST_MIN_MINUTES * 60, REST_MAX_MINUTES * 60)
+    # next rest time: random 8..15 minutes
+    next_rest_ts = time.time() + random.randint(REST_INTERVAL_MIN_MINUTES * 60, REST_INTERVAL_MAX_MINUTES * 60)
 
-    # main loop
     dt = 1.0 / LOOP_HZ
     last_cmd = "STOP"
 
@@ -709,107 +632,102 @@ def main():
         while True:
             now = time.time()
 
-            # periodic sit rest
+            # ===== periodic rest =====
             if now >= next_rest_ts:
-                rm.sit_down(seconds=REST_SIT_SECONDS)
-                next_rest_ts = time.time() + random.randint(REST_MIN_MINUTES * 60, REST_MAX_MINUTES * 60)
+                # sit hold random 9..15 minutes (or seconds if you change REST_HOLD_UNIT)
+                hold_val = random.randint(REST_HOLD_MIN, REST_HOLD_MAX)
+                hold_seconds = seconds_from_hold_value(hold_val)
+                print(f"[REST] sit hold = {hold_val}{REST_HOLD_UNIT}", flush=True)
+
+                rm.sit_down_and_hold(hold_seconds=hold_seconds)
+
+                # IMPORTANT: only stabilize when SIT -> STAND
+                rm.stand_from_sit_only()
+
+                # schedule next rest: random 8..15 minutes
+                next_rest_ts = time.time() + random.randint(REST_INTERVAL_MIN_MINUTES * 60, REST_INTERVAL_MAX_MINUTES * 60)
 
             # get lidar scan
             pts = lidar_scan_points()
             clr = lidar_clearance(pts)
 
-            # update map
+            # update map (state + last_cmd)
             map_server.update(points=pts, clearance=clr, cmd=last_cmd, robot_state=str(state))
 
-            # ===== 1) Gesture has highest priority =====
+            # ===== 1) Gesture priority =====
             g = gp.get_active()
             if g:
                 g = g.upper().strip()
-                # optional face
-                # set_face("suprise")
 
-                # gesture mapping
                 if g in ("STOP", "STOPMUSIC"):
                     rm.stop()
                     last_cmd = "STOP"
 
                 elif g == "SIT":
-                    rm.sit_down(seconds=REST_SIT_SECONDS)
-                    last_cmd = "SIT"
+                    # gesture SIT: hold random 9..15 minutes
+                    hold_val = random.randint(REST_HOLD_MIN, REST_HOLD_MAX)
+                    hold_seconds = seconds_from_hold_value(hold_val)
+                    print(f"[GESTURE] SIT hold = {hold_val}{REST_HOLD_UNIT}", flush=True)
+
+                    rm.sit_down_and_hold(hold_seconds=hold_seconds)
+                    rm.stand_from_sit_only()
+                    last_cmd = "STOP"
 
                 elif g == "STANDUP":
-                    rm.ensure_stand_stable()
-                    last_cmd = "STAND"
+                    # Only do support stand if currently sitting
+                    rm.stand_from_sit_only()
+                    last_cmd = "STOP"
 
                 elif g in ("MOVELEFT", "TURNLEFT"):
-                    rm.ensure_stand_stable()
                     rm.turn_left()
                     last_cmd = "TURN_LEFT"
 
                 elif g in ("MOVERIGHT", "TURNRIGHT"):
-                    rm.ensure_stand_stable()
                     rm.turn_right()
                     last_cmd = "TURN_RIGHT"
 
                 elif g in ("BACK", "BACKWARD"):
-                    rm.ensure_stand_stable()
                     rm.back()
                     last_cmd = "BACK"
 
                 else:
-                    # unknown gesture => stop for safety
                     rm.stop()
                     last_cmd = "STOP"
 
+                map_server.update(points=pts, clearance=clr, cmd=last_cmd, robot_state=str(state))
                 time.sleep(dt)
                 continue
 
             # ===== 2) Auto move by lidar + camera =====
-            # - Nếu lidar nói forward clear -> check camera
-            # - Nếu camera không clear -> chọn hướng khác dựa scan
-            lidar_dec = lidar_decision_label()  # may be FORWARD / TURN_LEFT / TURN_RIGHT / STOP ...
-            if not lidar_dec:
-                lidar_dec = "FORWARD"
-
+            lidar_dec = lidar_decision_label() or "FORWARD"
             lidar_dec = lidar_dec.upper().strip()
             if lidar_dec == "BACKWARD":
                 lidar_dec = "BACK"
 
-            # emergency stop if too close
             if clr.get("FRONT", 9999.0) < EMERGENCY_STOP_CM:
                 rm.stop()
                 last_cmd = "STOP"
+                map_server.update(points=pts, clearance=clr, cmd=last_cmd, robot_state=str(state))
                 time.sleep(dt)
                 continue
 
-            # prefer by lidar
-            prefer_cmd = "FORWARD" if "FORWARD" in lidar_dec or lidar_dec == "FORWARD" else None
+            prefer_forward = ("FORWARD" in lidar_dec or lidar_dec == "FORWARD")
 
-            cmd = None
-
-            if prefer_cmd == "FORWARD" and clr.get("FRONT", 0.0) >= SAFE_FORWARD_CM:
-                # camera check
+            if prefer_forward and clr.get("FRONT", 0.0) >= SAFE_FORWARD_CM:
                 if camera_is_clear():
                     cmd = "FORWARD"
                 else:
-                    # camera thấy obstacle => né theo lidar scan
-                    cmd = pick_direction_by_clearance(clr, prefer="LEFT")  # ưu tiên né
+                    cmd = pick_direction_by_clearance(clr, prefer="LEFT")
             else:
-                # lidar muốn rẽ hoặc stop
                 if lidar_dec in ("TURN_LEFT", "TURN_RIGHT", "BACK", "STOP"):
                     cmd = lidar_dec
                 else:
-                    # fallback choose by clearance
                     cmd = pick_direction_by_clearance(clr, prefer="FRONT")
 
             if not cmd:
                 cmd = "STOP"
 
-            # ensure stable posture transitions
-            if cmd in ("FORWARD", "TURN_LEFT", "TURN_RIGHT", "BACK"):
-                rm.ensure_stand_stable()
-
-            # LED rules: forward blue, obstacle/avoid red
+            # IMPORTANT: NO stabilize for FORWARD/TURN/BACK
             if cmd == "FORWARD":
                 rm.forward()
             elif cmd == "TURN_LEFT":
@@ -822,9 +740,7 @@ def main():
                 rm.stop()
 
             last_cmd = cmd
-            # update map cmd immediately
             map_server.update(points=pts, clearance=clr, cmd=last_cmd, robot_state=str(state))
-
             time.sleep(dt)
 
     except KeyboardInterrupt:
