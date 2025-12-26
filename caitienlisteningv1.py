@@ -107,24 +107,24 @@ class ListenerCfg:
     clap_high_ratio: float = 0.12
     clap_zcr: float = 0.10
 
-    # ✅ server url
+    # server url
     server_url: str = "https://embeddedprogramming-healtheworldserver.up.railway.app/pi_upload_audio_v2"
 
-    # timeout cho POST ban đầu (ngắn cũng được vì server có thể trả 202 nhanh)
+    # timeout cho POST ban đầu
     timeout_sec: float = 30.0
 
-    # ✅ nếu muốn ép server wait sync (debug): thêm ?wait=1
+    # nếu muốn ép server wait sync (debug): thêm ?wait=1
     server_wait_sync: bool = False
 
-    # ✅ poll job khi server trả 202
+    # poll job khi server trả 202
     job_poll_interval_sec: float = 1.2
     job_poll_timeout_sec: float = 10.0
-    job_max_wait_sec: float = 20 * 60.0  # 20 phút (tuỳ bạn)
+    job_max_wait_sec: float = 20 * 60.0  # 20 phút
 
-    # ✅ podcast_next
+    # podcast_next
     podcast_next_timeout_sec: float = 60.0
     podcast_next_retry_sleep_sec: float = 0.6
-    podcast_max_play_sec: float = 45 * 60.0  # chặn vô hạn: tối đa 45 phút / 1 podcast session
+    podcast_max_play_sec: float = 45 * 60.0  # tối đa 45 phút / 1 session
 
     snapshot_file: Optional[str] = "/tmp/gesture_latest.jpg"
     snapshot_max_age_sec: float = 3.0
@@ -139,7 +139,7 @@ class ListenerCfg:
     waiting_wav: str = "waitingmessage.wav"
     waiting_enable: bool = True
 
-    # ✅ server timeout/5xx -> play file này
+    # server timeout/5xx -> play file này
     error_wav: str = "errormessage.wav"
 
     playback_cooldown_sec: float = 0.7
@@ -223,13 +223,13 @@ class ActiveListenerV2:
         # allow STOPMUSIC/STOP to interrupt playback immediately
         self._playback_stop_evt = threading.Event()
 
-        # ✅ audio lock
+        # audio lock
         self._audio_lock = threading.Lock()
 
-        # ✅ waiting-loop abort
+        # waiting-loop abort
         self._waiting_abort_evt = threading.Event()
 
-        # ✅ podcast state
+        # podcast state
         self._podcast_active = False
 
         # motion command queue (from MQTT)
@@ -281,6 +281,42 @@ class ActiveListenerV2:
         except Exception:
             pass
 
+    # ============================
+    # ✅ RESET HARD: quay lại listening
+    # ============================
+    def _reset_to_listening(self, reason: str = "", cooldown: float = 0.2):
+        """
+        Dừng TẤT CẢ thread/loop đang chạy (waiting/podcast/playback),
+        clear event và đảm bảo quay lại active listening.
+        """
+        if reason:
+            print(f"[RESET] {reason}", flush=True)
+
+        # stop flags / loops
+        self._podcast_active = False
+
+        # stop waiting & playback immediately
+        self._waiting_abort_evt.set()
+        self._playback_stop_evt.set()
+
+        self._stop_audio_playback()
+
+        # reset state
+        self._playing_audio = False
+        set_mouth(0.0)
+        set_face("what_is_it")
+
+        # clear events after a tiny delay (tránh race)
+        def _clear():
+            time.sleep(0.15)
+            self._waiting_abort_evt.clear()
+            self._playback_stop_evt.clear()
+
+        threading.Thread(target=_clear, daemon=True).start()
+
+        self._cooldown_until = time.time() + float(max(0.05, cooldown))
+        self._reset_error_state()
+
     # ----------------------------
     # MQTT gesture handling
     # ----------------------------
@@ -300,27 +336,9 @@ class ActiveListenerV2:
         with self._cmd_lock:
             self._pending_cmds.append(cmd)
 
-    def _clear_stop_evt_delayed(self, delay_sec: float = 0.3):
-        def _job():
-            time.sleep(max(0.0, float(delay_sec)))
-            self._playback_stop_evt.clear()
-        threading.Thread(target=_job, daemon=True).start()
-
     def request_stopmusic(self):
-        # stop everything playback
-        self._playback_stop_evt.set()
-        self._stop_audio_playback()
-
-        # also stop waiting loop + job polling + podcast loop
-        self._waiting_abort_evt.set()
-        self._podcast_active = False
-
-        self._playing_audio = False
-        self._cooldown_until = time.time() + 0.05
-        set_face("what_is_it")
-        set_mouth(0.0)
-
-        self._clear_stop_evt_delayed(0.3)
+        # stop everything
+        self._reset_to_listening("STOP/STOPMUSIC received", cooldown=0.1)
 
     def _pop_pending_cmds(self) -> List[str]:
         with self._cmd_lock:
@@ -436,7 +454,6 @@ class ActiveListenerV2:
 
     def _music_play_blocking_with_lipsync(self, filepath: str, times: int = 1):
         self._playing_audio = True
-        self._playback_stop_evt.clear()
 
         stop_evt = threading.Event()
         th = None
@@ -444,7 +461,6 @@ class ActiveListenerV2:
             dur = self._get_audio_duration_sec(filepath)
             loops = max(1, int(times))
 
-            # face handled outside (music/podcast)
             set_mouth(0.0)
 
             th = threading.Thread(target=self._lipsync_worker, args=(filepath, stop_evt), daemon=True)
@@ -479,9 +495,6 @@ class ActiveListenerV2:
 
             self._playing_audio = False
             set_mouth(0.0)
-
-            # don't force face here; caller decides
-            self._playback_stop_evt.clear()
 
             if self._cooldown_until < time.time():
                 self._cooldown_until = time.time() + float(self.cfg.playback_cooldown_sec)
@@ -527,10 +540,6 @@ class ActiveListenerV2:
     # Waiting message loop
     # ----------------------------
     def _waiting_message_loop(self, stop_evt: threading.Event):
-        """
-        Play waitingmessage.wav repeatedly while waiting server response / job polling.
-        MUST exit when stop_evt OR waiting_abort_evt is set.
-        """
         p = self._waiting_path
         if not self.cfg.waiting_enable:
             return
@@ -544,8 +553,6 @@ class ActiveListenerV2:
 
         print("[WAIT] start waitingmessage loop...", flush=True)
         try:
-            self._playing_audio = True
-
             while (not stop_evt.is_set()) and (not self._stop):
                 if self._waiting_abort_evt.is_set() or self._playback_stop_evt.is_set():
                     self._stop_audio_playback()
@@ -567,9 +574,34 @@ class ActiveListenerV2:
 
         finally:
             self._stop_audio_playback()
-            self._playing_audio = False
-            self._playback_stop_evt.clear()
             print("[WAIT] stop waitingmessage loop", flush=True)
+
+    def _start_waiting(self):
+        """
+        helper: start waiting loop thread
+        """
+        if not (self.cfg.waiting_enable and self._waiting_path.exists()):
+            return None, None
+        stop_evt = threading.Event()
+        th = threading.Thread(target=self._waiting_message_loop, args=(stop_evt,), daemon=True)
+        th.start()
+        return stop_evt, th
+
+    def _stop_waiting(self, stop_evt, th):
+        try:
+            if stop_evt:
+                stop_evt.set()
+        except Exception:
+            pass
+        # force stop audio in case it's playing waiting.wav
+        self._waiting_abort_evt.set()
+        self._stop_audio_playback()
+        try:
+            if th:
+                th.join(timeout=2.5)
+        except Exception:
+            pass
+        self._waiting_abort_evt.clear()
 
     # ----------------------------
     # Error message when server timeout / 5xx
@@ -594,16 +626,22 @@ class ActiveListenerV2:
         self._last_http_exc = None
 
     def _play_error_message(self):
+        """
+        Chỉ dùng khi timeout/5xx.
+        Sau khi phát xong -> reset về listening.
+        """
         if not self._error_path.exists():
             print(f"[ERRPLAY] error file not found: {self._error_path}", flush=True)
-            self._reset_error_state()
+            self._reset_to_listening("error_wav missing", cooldown=0.1)
             return
 
         print("[ERRPLAY] server timeout/5xx -> play errormessage.wav", flush=True)
 
+        # ensure stop other loops first
+        self._podcast_active = False
         self._waiting_abort_evt.set()
+        self._playback_stop_evt.set()
         self._stop_audio_playback()
-        self._playback_stop_evt.clear()
 
         self._playing_audio = True
         try:
@@ -622,40 +660,65 @@ class ActiveListenerV2:
 
             t_end = time.time() + float(dur) + 0.15
             while time.time() < t_end:
-                if self._playback_stop_evt.is_set() or self._stop:
-                    self._stop_audio_playback()
+                if self._stop:
                     break
                 time.sleep(0.05)
+
         finally:
             self._stop_audio_playback()
             self._playing_audio = False
-            set_face("what_is_it")
-            set_mouth(0.0)
+            # HARD reset back to listening
+            self._reset_to_listening("played errormessage.wav -> back to listening", cooldown=0.2)
 
-            self._waiting_abort_evt.clear()
-            self._playback_stop_evt.clear()
-            self._cooldown_until = time.time() + 0.05
-            self._reset_error_state()
+    def _handle_server_error(self, err: str, play_error_wav: bool = True):
+        """
+        ✅ Mọi lỗi server (job error, transcript empty, podcast_next error, status=error...)
+        đều chạy qua đây để chương trình KHÔNG CHẾT và quay lại active listening.
+        """
+        err = (err or "").strip()
+        if not err:
+            err = "server error"
+        print(f"[SERVER-ERROR] {err}", flush=True)
+
+        # stop everything first
+        self._reset_to_listening(f"server error -> reset ({err})", cooldown=0.2)
+
+        # optionally play error message (nhưng xong vẫn quay lại listening)
+        if play_error_wav and self._error_path.exists():
+            # phát nhanh 1 lần rồi thôi, không chặn loop lâu
+            try:
+                set_face("sad")
+                self._playing_audio = True
+                with self._audio_lock:
+                    self.music.music_play(str(self._error_path), loops=1)
+
+                dur = self._get_audio_duration_sec(str(self._error_path)) or 2.0
+                t_end = time.time() + float(dur) + 0.1
+                while time.time() < t_end:
+                    if self._stop:
+                        break
+                    # nếu user STOP thì cũng bỏ phát
+                    if self._playback_stop_evt.is_set():
+                        break
+                    time.sleep(0.05)
+            except Exception:
+                pass
+            finally:
+                self._stop_audio_playback()
+                self._playing_audio = False
+                self._reset_to_listening("after server-error wav -> back to listening", cooldown=0.15)
 
     # ----------------------------
-    # ✅ Job polling helpers (server 202)
+    # Job polling helpers (server 202)
     # ----------------------------
     def _server_base(self) -> str:
-        """
-        from https://host/path/pi_upload_audio_v2 -> https://host
-        """
         u = urlparse(self.cfg.server_url)
         return urlunparse((u.scheme, u.netloc, "", "", "", ""))
 
     def _job_url(self, job_id: str) -> str:
-        base = self._server_base()
-        return f"{base}/job?id={job_id}"
+        return f"{self._server_base()}/job?id={job_id}"
 
     def _poll_job_until_done(self, job_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Poll /job endpoint until job.status == done, then return job.result.
-        Return None on abort/timeout.
-        """
         t0 = time.time()
         last_status = None
 
@@ -667,22 +730,19 @@ class ActiveListenerV2:
             if (time.time() - t0) > float(self.cfg.job_max_wait_sec):
                 print("[JOB] timeout waiting job done", flush=True)
                 self._last_http_exc = req_exc.Timeout("job polling timeout")
-                return None
+                return {"status": "error", "error": "job polling timeout"}
 
             try:
-                url = self._job_url(job_id)
-                rr = requests.get(url, timeout=float(self.cfg.job_poll_timeout_sec))
+                rr = requests.get(self._job_url(job_id), timeout=float(self.cfg.job_poll_timeout_sec))
                 self._last_http_status = int(rr.status_code)
 
                 if rr.status_code != 200:
-                    print("[JOB] bad status:", rr.status_code, (rr.text or "")[:200], flush=True)
-                    return None
+                    return {"status": "error", "error": f"job http {rr.status_code}"}
 
                 js = rr.json()
                 job = js.get("job") if isinstance(js, dict) else None
                 if not isinstance(job, dict):
-                    print("[JOB] invalid job payload", flush=True)
-                    return None
+                    return {"status": "error", "error": "invalid job payload"}
 
                 st = job.get("status")
                 if st != last_status:
@@ -701,11 +761,11 @@ class ActiveListenerV2:
 
             except Exception as e:
                 self._last_http_exc = e
-                print("[JOB] poll error:", e, flush=True)
+                return {"status": "error", "error": f"job poll exception: {e}"}
 
             time.sleep(float(self.cfg.job_poll_interval_sec))
 
-        return None
+        return {"status": "error", "error": "stopped"}
 
     def _append_query_param(self, url: str, k: str, v: str) -> str:
         u = urlparse(url)
@@ -715,72 +775,56 @@ class ActiveListenerV2:
         return urlunparse((u.scheme, u.netloc, u.path, u.params, new_q, u.fragment))
 
     # ----------------------------
-    # ✅ Podcast_next helpers
+    # Podcast_next helpers
     # ----------------------------
     def _podcast_next_url(self, podcast_id: str) -> str:
-        base = self._server_base()
-        return f"{base}/podcast_next?id={podcast_id}"
+        return f"{self._server_base()}/podcast_next?id={podcast_id}"
 
     def _fetch_podcast_next(self, podcast_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Call /podcast_next once. Return dict or None.
-        """
         try:
-            url = self._podcast_next_url(podcast_id)
-            rr = requests.get(url, timeout=float(self.cfg.podcast_next_timeout_sec))
+            rr = requests.get(self._podcast_next_url(podcast_id), timeout=float(self.cfg.podcast_next_timeout_sec))
             self._last_http_status = int(rr.status_code)
             if rr.status_code != 200:
-                print("[POD] bad status:", rr.status_code, (rr.text or "")[:200], flush=True)
-                return None
+                return {"status": "error", "error": f"podcast_next http {rr.status_code}"}
             js = rr.json()
-            return js if isinstance(js, dict) else None
+            return js if isinstance(js, dict) else {"status": "error", "error": "podcast_next invalid json"}
         except Exception as e:
             self._last_http_exc = e
-            print("[POD] request error:", e, flush=True)
-            return None
+            return {"status": "error", "error": f"podcast_next exception: {e}"}
 
-    def _play_audio_url_once(self, audio_url: str, face_music: bool = False) -> bool:
-        """
-        Download + play one mp3. Return True if played (or partially) and not aborted.
-        """
-        if not audio_url:
+    def _download(self, url: str, dst: str) -> bool:
+        try:
+            rr = requests.get(url, timeout=30)
+            if rr.status_code != 200:
+                return False
+            with open(dst, "wb") as f:
+                f.write(rr.content)
+            return True
+        except Exception:
             return False
 
-        if self._stop or self._playback_stop_evt.is_set() or self._waiting_abort_evt.is_set():
+    def _play_audio_url_once(self, audio_url: str) -> bool:
+        if not audio_url:
+            return False
+        if self._stop or self._playback_stop_evt.is_set():
             return False
 
         tmpdir = tempfile.mkdtemp(prefix="al2_play_")
         local = os.path.join(tmpdir, "seg.mp3")
-        ok = False
         try:
             if not self._download(audio_url, local):
-                print("[PLAY] download failed:", audio_url, flush=True)
                 return False
-
-            if face_music:
-                set_face("music")
-
-            # block until finishes (or stop event)
             self._music_play_blocking_with_lipsync(local, times=1)
-
-            if self._stop or self._playback_stop_evt.is_set() or self._waiting_abort_evt.is_set():
+            if self._stop or self._playback_stop_evt.is_set():
                 return False
-
-            ok = True
-            return ok
+            return True
         finally:
             try:
                 shutil.rmtree(tmpdir, ignore_errors=True)
             except Exception:
                 pass
-            if not face_music:
-                set_face("what_is_it")
 
     def _play_podcast_until_done(self, podcast_id: str, first_audio_url: str, total: Optional[int] = None):
-        """
-        Play chunk0 then call /podcast_next to play remaining chunks.
-        Abort if STOP/STOPMUSIC.
-        """
         if not podcast_id or not first_audio_url:
             return
 
@@ -791,16 +835,13 @@ class ActiveListenerV2:
         set_face("music")
 
         # play first
-        if not self._play_audio_url_once(first_audio_url, face_music=True):
-            print("[POD] aborted or failed at first chunk", flush=True)
-            self._podcast_active = False
-            set_face("what_is_it")
+        if not self._play_audio_url_once(first_audio_url):
+            self._reset_to_listening("[POD] failed/aborted at first chunk", cooldown=0.15)
             return
 
-        # loop next
+        # next chunks
         while not self._stop and self._podcast_active:
-            if self._playback_stop_evt.is_set() or self._waiting_abort_evt.is_set():
-                print("[POD] abort by STOP/STOPMUSIC", flush=True)
+            if self._playback_stop_evt.is_set():
                 break
 
             if (time.time() - t0) > float(self.cfg.podcast_max_play_sec):
@@ -808,13 +849,16 @@ class ActiveListenerV2:
                 break
 
             js = self._fetch_podcast_next(podcast_id)
-            if js is None:
-                # network error -> stop podcast (không phát errormessage để tránh spam)
-                print("[POD] fetch next failed -> stop", flush=True)
+            if not isinstance(js, dict):
+                self._handle_server_error("podcast_next invalid response", play_error_wav=False)
+                break
+
+            if js.get("status") == "error":
+                self._handle_server_error(js.get("error") or "podcast_next error", play_error_wav=False)
                 break
 
             if not js.get("ok", False):
-                print("[POD] server says not ok:", js.get("error"), flush=True)
+                self._handle_server_error(js.get("error") or "podcast_next not ok", play_error_wav=False)
                 break
 
             if js.get("done", False):
@@ -824,197 +868,20 @@ class ActiveListenerV2:
             audio_url = js.get("audio_url")
             idx = js.get("index")
             tot = js.get("total", total)
-
             print(f"[POD] next index={idx}/{tot} audio={audio_url}", flush=True)
 
             if not audio_url:
-                print("[POD] next audio_url empty -> stop", flush=True)
+                self._handle_server_error("podcast_next audio_url empty", play_error_wav=False)
                 break
 
-            played = self._play_audio_url_once(audio_url, face_music=True)
-            if not played:
-                print("[POD] aborted while playing next chunk", flush=True)
+            if not self._play_audio_url_once(audio_url):
+                self._reset_to_listening("[POD] aborted while playing next chunk", cooldown=0.15)
                 break
 
             time.sleep(max(0.05, float(self.cfg.podcast_next_retry_sleep_sec)))
 
         self._podcast_active = False
-        set_face("what_is_it")
-        set_mouth(0.0)
-        self._cooldown_until = time.time() + 0.1
-        print("[POD] exit podcast -> back to listening", flush=True)
-
-    # ----------------------------
-    # Main loop
-    # ----------------------------
-    def run_forever(self):
-        print("[ActiveListenerV2] start listening...", flush=True)
-        self._calibrate_noise_floor()
-
-        while not self._stop:
-            cmds = self._pop_pending_cmds()
-            for c in cmds:
-                self._handle_motion_cmd(c)
-
-            if self._playing_audio or (time.time() < self._cooldown_until):
-                time.sleep(0.05)
-                continue
-
-            wav_path = self._record_wav(seconds=self.cfg.detect_chunk_sec)
-            if not wav_path:
-                time.sleep(0.08)
-                continue
-
-            try:
-                feats = self._extract_features(wav_path)
-                rms = feats["rms"]
-
-                if not self._passes_gate(rms):
-                    continue
-
-                if self._is_clap(feats):
-                    print(f"[CLAP] rms={rms:.0f} peak/rms={feats['peak_ratio']:.1f} hi={feats['high_ratio']:.3f} zcr={feats['zcr']:.3f} -> BARK", flush=True)
-                    self._bark()
-                    continue
-
-                if feats["speech_score"] >= float(self.cfg.speech_score_threshold):
-                    print(f"[SPEECH] rms={rms:.0f} score={feats['speech_score']:.2f} dbg={self._dbg_dict(feats)} -> record full", flush=True)
-
-                    full_wav = self._record_wav(seconds=self.cfg.record_sec)
-                    if not full_wav:
-                        continue
-
-                    image_bytes = self._get_image_bytes_for_request()
-
-                    # clear old STOP + abort before waiting
-                    self._playback_stop_evt.clear()
-                    self._waiting_abort_evt.clear()
-
-                    # play waiting while POST
-                    wait_stop = threading.Event()
-                    wait_th = None
-                    if self.cfg.waiting_enable and self._waiting_path.exists():
-                        wait_th = threading.Thread(
-                            target=self._waiting_message_loop,
-                            args=(wait_stop,),
-                            daemon=True
-                        )
-                        wait_th.start()
-
-                    resp = None
-                    try:
-                        resp = self._send_to_server(full_wav, image_bytes=image_bytes)
-                    finally:
-                        # stop waiting loop after POST
-                        wait_stop.set()
-                        self._waiting_abort_evt.set()
-                        self._stop_audio_playback()
-                        if wait_th:
-                            try:
-                                wait_th.join(timeout=3.0)
-                            except Exception:
-                                pass
-                        self._playing_audio = False
-                        self._waiting_abort_evt.clear()
-                        self._playback_stop_evt.clear()
-
-                    if not resp:
-                        if self._should_play_error_message():
-                            self._play_error_message()
-                        else:
-                            self._reset_error_state()
-                            self._cooldown_until = time.time() + 0.05
-                        try:
-                            os.remove(full_wav)
-                        except Exception:
-                            pass
-                        continue
-
-                    # ✅ nếu server trả 202 job async
-                    if isinstance(resp, dict) and resp.get("status") == "processing" and resp.get("job_id"):
-                        job_id = str(resp.get("job_id"))
-                        print(f"[SERVER] 202 processing -> job_id={job_id}", flush=True)
-
-                        # play waiting while polling job
-                        poll_wait_stop = threading.Event()
-                        poll_wait_th = None
-                        if self.cfg.waiting_enable and self._waiting_path.exists():
-                            poll_wait_th = threading.Thread(
-                                target=self._waiting_message_loop,
-                                args=(poll_wait_stop,),
-                                daemon=True
-                            )
-                            poll_wait_th.start()
-
-                        job_result = None
-                        try:
-                            job_result = self._poll_job_until_done(job_id)
-                        finally:
-                            poll_wait_stop.set()
-                            self._waiting_abort_evt.set()
-                            self._stop_audio_playback()
-                            if poll_wait_th:
-                                try:
-                                    poll_wait_th.join(timeout=3.0)
-                                except Exception:
-                                    pass
-                            self._playing_audio = False
-                            self._waiting_abort_evt.clear()
-                            self._playback_stop_evt.clear()
-
-                        # nếu user STOP trong lúc chờ -> abort
-                        if job_result is None:
-                            print("[JOB] no result (abort/timeout). back to listening.", flush=True)
-                            try:
-                                os.remove(full_wav)
-                            except Exception:
-                                pass
-                            continue
-
-                        # nếu job trả error -> play errormessage
-                        if isinstance(job_result, dict) and job_result.get("status") == "error":
-                            print("[JOB] status=error:", job_result.get("error"), flush=True)
-                            self._play_error_message()
-                            try:
-                                os.remove(full_wav)
-                            except Exception:
-                                pass
-                            continue
-
-                        # handle job result giống như 200 bình thường
-                        self._handle_server_reply(job_result)
-                        try:
-                            os.remove(full_wav)
-                        except Exception:
-                            pass
-                        continue
-
-                    # server báo error dạng json
-                    if isinstance(resp, dict) and (resp.get("status") == "error"):
-                        print("[SERVER] status=error -> play errormessage.wav", flush=True)
-                        self._play_error_message()
-                        try:
-                            os.remove(full_wav)
-                        except Exception:
-                            pass
-                        continue
-
-                    # 200 OK normal
-                    self._handle_server_reply(resp)
-
-                    try:
-                        os.remove(full_wav)
-                    except Exception:
-                        pass
-                else:
-                    print(f"[ENV] rms={rms:.0f} score={feats['speech_score']:.2f} dbg={self._dbg_dict(feats)} -> BARK", flush=True)
-                    self._bark()
-
-            finally:
-                try:
-                    os.remove(wav_path)
-                except Exception:
-                    pass
+        self._reset_to_listening("[POD] exit -> back to listening", cooldown=0.15)
 
     # ----------------------------
     # Snapshot image
@@ -1234,10 +1101,8 @@ class ActiveListenerV2:
 
         mem = self._load_recent_memory()
         meta = {"ts": time.time(), "client": "pidog", "memory": mem}
-
         data = {"meta": json.dumps(meta, ensure_ascii=False)}
 
-        # ✅ optional: ép server sync wait=1 (debug)
         url = self.cfg.server_url
         if self.cfg.server_wait_sync:
             url = self._append_query_param(url, "wait", "1")
@@ -1264,29 +1129,25 @@ class ActiveListenerV2:
             r = requests.post(url, files=files, data=data, timeout=float(self.cfg.timeout_sec))
             self._last_http_status = int(r.status_code)
 
-            # ✅ 202: async job (long youtube)
             if r.status_code == 202:
                 try:
                     js = r.json()
                 except Exception:
-                    print("[HTTP] 202 but json parse failed:", (r.text or "")[:200], flush=True)
-                    return None
-                return js if isinstance(js, dict) else None
+                    return {"status": "error", "error": "202 but json parse failed"}
+                return js if isinstance(js, dict) else {"status": "error", "error": "202 invalid json"}
 
             if r.status_code != 200:
-                print("[HTTP] bad status:", r.status_code, (r.text or "")[:300], flush=True)
-                return None
+                return {"status": "error", "error": f"http {r.status_code}"}
 
             try:
-                return r.json()
+                js = r.json()
+                return js if isinstance(js, dict) else {"status": "error", "error": "invalid json"}
             except Exception as e:
-                print("[HTTP] json parse error:", e, flush=True)
-                return None
+                return {"status": "error", "error": f"json parse error: {e}"}
 
         except Exception as e:
             self._last_http_exc = e
-            print("[HTTP] error:", e, flush=True)
-            return None
+            return {"status": "error", "error": f"http exception: {e}"}
         finally:
             try:
                 if audio_f:
@@ -1294,21 +1155,15 @@ class ActiveListenerV2:
             except Exception:
                 pass
 
-    def _download(self, url: str, dst: str) -> bool:
-        try:
-            rr = requests.get(url, timeout=30)
-            if rr.status_code != 200:
-                return False
-            with open(dst, "wb") as f:
-                f.write(rr.content)
-            return True
-        except Exception:
-            return False
-
     # ----------------------------
-    # Handle server reply (AUDIO-ONLY)
+    # Handle server reply
     # ----------------------------
     def _handle_server_reply(self, resp: Dict[str, Any]):
+        # ✅ nếu server trả status=error
+        if isinstance(resp, dict) and resp.get("status") == "error":
+            self._handle_server_error(resp.get("error") or "server status=error", play_error_wav=True)
+            return
+
         transcript = (resp.get("transcript") or resp.get("text") or "").strip()
         label = (resp.get("label") or "unknown").strip()
         reply_text = (resp.get("reply_text") or "").strip()
@@ -1338,31 +1193,127 @@ class ActiveListenerV2:
             "podcast": podcast if isinstance(podcast, dict) else None,
         })
 
-        # ✅ LONG VIDEO PODCAST: auto play all chunks
+        # LONG VIDEO PODCAST: auto play all chunks
         if (label.strip().lower() == "nhac") and podcast_id and audio_url:
             self._play_podcast_until_done(str(podcast_id), str(audio_url), total=podcast_total)
             return
 
         # normal one-shot audio
         if audio_url:
-            tmpdir = tempfile.mkdtemp(prefix="al2_play_")
-            local = os.path.join(tmpdir, "reply.mp3")
+            set_face("music" if label.strip().lower() == "nhac" else "suprise")
+            ok = self._play_audio_url_once(audio_url)
+            if not ok:
+                self._reset_to_listening("play audio_url failed -> back to listening", cooldown=0.15)
+            else:
+                self._reset_to_listening("finished playing -> back to listening", cooldown=0.12)
+        else:
+            # không có audio_url thì vẫn reset để không bị kẹt
+            self._reset_to_listening("no audio_url -> back to listening", cooldown=0.12)
+
+    # ----------------------------
+    # Main loop
+    # ----------------------------
+    def run_forever(self):
+        print("[ActiveListenerV2] start listening...", flush=True)
+        self._calibrate_noise_floor()
+
+        while not self._stop:
+            # luôn nuốt mọi lỗi để chương trình không chết
             try:
-                if not self._download(audio_url, local):
-                    print("[PLAY] download failed:", audio_url, flush=True)
-                    return
-                if label.strip().lower() == "nhac":
-                    set_face("music")
-                else:
-                    set_face("suprise")
-                self._music_play_blocking_with_lipsync(local, times=1)
-            finally:
+                cmds = self._pop_pending_cmds()
+                for c in cmds:
+                    self._handle_motion_cmd(c)
+
+                if self._playing_audio or (time.time() < self._cooldown_until):
+                    time.sleep(0.05)
+                    continue
+
+                wav_path = self._record_wav(seconds=self.cfg.detect_chunk_sec)
+                if not wav_path:
+                    time.sleep(0.08)
+                    continue
+
                 try:
-                    shutil.rmtree(tmpdir, ignore_errors=True)
-                except Exception:
-                    pass
-                set_face("what_is_it")
-                set_mouth(0.0)
+                    feats = self._extract_features(wav_path)
+                    rms = feats["rms"]
+
+                    if not self._passes_gate(rms):
+                        continue
+
+                    if self._is_clap(feats):
+                        print(f"[CLAP] rms={rms:.0f} peak/rms={feats['peak_ratio']:.1f} hi={feats['high_ratio']:.3f} zcr={feats['zcr']:.3f} -> BARK", flush=True)
+                        self._bark()
+                        continue
+
+                    if feats["speech_score"] >= float(self.cfg.speech_score_threshold):
+                        print(f"[SPEECH] rms={rms:.0f} score={feats['speech_score']:.2f} dbg={self._dbg_dict(feats)} -> record full", flush=True)
+
+                        full_wav = self._record_wav(seconds=self.cfg.record_sec)
+                        if not full_wav:
+                            continue
+
+                        image_bytes = self._get_image_bytes_for_request()
+
+                        # waiting while POST
+                        w_stop, w_th = self._start_waiting()
+
+                        try:
+                            resp = self._send_to_server(full_wav, image_bytes=image_bytes)
+                        finally:
+                            self._stop_waiting(w_stop, w_th)
+
+                        try:
+                            os.remove(full_wav)
+                        except Exception:
+                            pass
+
+                        if not isinstance(resp, dict):
+                            if self._should_play_error_message():
+                                self._play_error_message()
+                            else:
+                                self._handle_server_error("server returned empty/invalid", play_error_wav=True)
+                            continue
+
+                        # 202 -> poll job
+                        if resp.get("status") == "processing" and resp.get("job_id"):
+                            job_id = str(resp.get("job_id"))
+                            print(f"[SERVER] 202 processing -> job_id={job_id}", flush=True)
+
+                            pw_stop, pw_th = self._start_waiting()
+                            try:
+                                job_result = self._poll_job_until_done(job_id)
+                            finally:
+                                self._stop_waiting(pw_stop, pw_th)
+
+                            if not isinstance(job_result, dict):
+                                self._handle_server_error("job_result invalid", play_error_wav=True)
+                                continue
+
+                            if job_result.get("status") == "error":
+                                self._handle_server_error(job_result.get("error") or "job error", play_error_wav=True)
+                                continue
+
+                            self._handle_server_reply(job_result)
+                            continue
+
+                        # 200 OK
+                        self._handle_server_reply(resp)
+
+                    else:
+                        print(f"[ENV] rms={rms:.0f} score={feats['speech_score']:.2f} dbg={self._dbg_dict(feats)} -> BARK", flush=True)
+                        self._bark()
+
+                finally:
+                    try:
+                        os.remove(wav_path)
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                # ✅ tuyệt đối không để chết loop
+                print("[FATAL-GUARD] exception:", e, flush=True)
+                self._reset_to_listening(f"guard exception -> reset ({e})", cooldown=0.3)
+                time.sleep(0.1)
 
 
 def main():
@@ -1378,18 +1329,15 @@ def main():
         server_url="https://embeddedprogramming-healtheworldserver.up.railway.app/pi_upload_audio_v2",
         timeout_sec=240,
 
-        # ✅ để False (khuyến nghị) -> dùng job polling khi 202
         server_wait_sync=False,
 
-        # polling
         job_poll_interval_sec=1.2,
         job_poll_timeout_sec=240.0,
         job_max_wait_sec=20 * 240.0,
 
-        # podcast_next
         podcast_next_timeout_sec=120.0,
         podcast_next_retry_sleep_sec=0.4,
-        podcast_max_play_sec=60 * 60.0,  # 60 phút
+        podcast_max_play_sec=60 * 60.0,
 
         bark_wav="tiengsua.wav",
         bark_times=2,
