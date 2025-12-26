@@ -6,7 +6,7 @@ import time
 import socket
 import threading
 from collections import deque
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 import cv2
 import numpy as np
@@ -29,7 +29,7 @@ def set_face(emo: str):
 
 
 # =========================
-# ENV / CONFIG
+# CONFIG
 # =========================
 SNAPSHOT_PATH = os.environ.get("SNAPSHOT_PATH", "/tmp/gesture_latest.jpg")
 SNAPSHOT_JPEG_QUALITY = int(os.environ.get("SNAPSHOT_JPEG_QUALITY", "80"))
@@ -42,18 +42,18 @@ GESTURE_RING_MAX = int(os.environ.get("GESTURE_RING_MAX", "60"))
 
 ALWAYS_STOPMUSIC_ON_ANY_GESTURE = os.environ.get("ALWAYS_STOPMUSIC_ON_ANY_GESTURE", "1").strip() == "1"
 
-# rotate input frame at source => keep direction correct
+# Rotate at source so directions match (avoid up/down left/right reversed)
 CAM_ROTATE_180 = os.environ.get("CAM_ROTATE_180", "1").strip() == "1"
 
-# Obstacle tuning
-OBS_MIN_AREA_RATIO = float(os.environ.get("OBS_MIN_AREA_RATIO", "0.10"))      # near = big
-OBS_CENTER_REGION_RATIO = float(os.environ.get("OBS_CENTER_REGION_RATIO", "0.75"))
-OBS_MIN_BOTTOM_RATIO = float(os.environ.get("OBS_MIN_BOTTOM_RATIO", "0.45"))
+# ===== Near obstacle by "occlusion size" =====
+# If biggest component bbox covers >= threshold of frame => obstacle yes
+OBS_BBOX_AREA_RATIO_TH = float(os.environ.get("OBS_BBOX_AREA_RATIO_TH", "0.28"))  # ~28% frame area
+OBS_BBOX_W_RATIO_TH    = float(os.environ.get("OBS_BBOX_W_RATIO_TH", "0.35"))     # bbox width >= 35% frame width
+OBS_BBOX_H_RATIO_TH    = float(os.environ.get("OBS_BBOX_H_RATIO_TH", "0.35"))     # bbox height >= 35% frame height
 
-# ✅ NEW: reject false huge boxes
-OBS_REJECT_FULLSCREEN_RATIO = float(os.environ.get("OBS_REJECT_FULLSCREEN_RATIO", "0.65"))  # box area >= 65% => ignore
-OBS_REJECT_THIN_AR = float(os.environ.get("OBS_REJECT_THIN_AR", "6.0"))  # long-thin line boxes => ignore
-OBS_EDGE_MARGIN_PX = int(os.environ.get("OBS_EDGE_MARGIN_PX", "8"))      # contour touching edges => ignore
+# Binary mask threshold (gradient)
+OBS_EDGE_PERCENTILE = float(os.environ.get("OBS_EDGE_PERCENTILE", "80"))  # keep top 20% gradients
+OBS_MORPH_ITERS = int(os.environ.get("OBS_MORPH_ITERS", "2"))
 
 
 def _write_snapshot_atomic(frame_bgr, out_path: str, quality: int = 80):
@@ -121,47 +121,21 @@ class Camera:
             pass
 
 
-# =========================
-# Camera obstacle (near only)
-# =========================
+# ============================================================
+# CameraObstacleDetector: near obstacle by biggest "occlusion"
+# - works with partial shape (bottle close, pillow close, etc.)
+# ============================================================
 class CameraObstacleDetector:
-    def __init__(self,
-                 decision_interval_sec: float = 0.30,
-                 min_area_ratio: float = 0.10,
-                 center_region_ratio: float = 0.75,
-                 min_bottom_ratio: float = 0.45):
-        self.interval = float(decision_interval_sec)
-        self.min_area_ratio = float(min_area_ratio)
-        self.center_region_ratio = float(center_region_ratio)
-        self.min_bottom_ratio = float(min_bottom_ratio)
-
+    def __init__(self, interval_sec: float = 0.30):
+        self.interval = float(interval_sec)
         self._lock = threading.Lock()
         self._last_run = 0.0
+
         self._label = "no obstacle"
+        self._zone = "NONE"   # LEFT/CENTER/RIGHT/NONE
         self._ts = 0.0
-        self._near_boxes: List[Tuple[int, int, int, int, str]] = []  # x,y,w,h,shape
-
-    @staticmethod
-    def _shape_name(cnt: np.ndarray) -> str:
-        peri = cv2.arcLength(cnt, True)
-        if peri <= 1e-6:
-            return "unknown"
-        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-        v = len(approx)
-
-        area = abs(cv2.contourArea(cnt))
-        if area <= 1e-6:
-            return "unknown"
-
-        circularity = 4 * np.pi * area / (peri * peri + 1e-9)
-
-        if v == 4:
-            x, y, w, h = cv2.boundingRect(approx)
-            ar = w / float(h + 1e-9)
-            return "square" if 0.85 <= ar <= 1.15 else "rectangle"
-        if v > 5:
-            return "circle" if circularity > 0.80 else "ellipse"
-        return "object"
+        self._bbox: Optional[Tuple[int, int, int, int]] = None  # x,y,w,h
+        self._bbox_ratio = 0.0
 
     def compute(self, frame_bgr: np.ndarray):
         now = time.time()
@@ -172,109 +146,143 @@ class CameraObstacleDetector:
         h, w = frame_bgr.shape[:2]
         frame_area = float(w * h)
 
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        # downscale for stable + faster
+        small_w = 200
+        small_h = int(h * (small_w / float(w)))
+        small = cv2.resize(frame_bgr, (small_w, small_h), interpolation=cv2.INTER_AREA)
+
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (7, 7), 0)
 
-        # edges
-        edges = cv2.Canny(gray, 60, 160)
-        edges = cv2.dilate(edges, None, iterations=2)
+        # gradient magnitude (Sobel)
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        mag = cv2.magnitude(gx, gy)
 
-        cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # dynamic threshold by percentile
+        thr = np.percentile(mag, OBS_EDGE_PERCENTILE)
+        mask = (mag >= thr).astype(np.uint8) * 255
 
-        # central region
-        cx_min = int(w * (1.0 - self.center_region_ratio) / 2.0)
-        cx_max = int(w - cx_min)
-        cy_min = int(h * (1.0 - self.center_region_ratio) / 2.0)
-        cy_max = int(h - cy_min)
+        # close/dilate to form solid blobs
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
+        mask = cv2.dilate(mask, None, iterations=max(1, OBS_MORPH_ITERS))
 
-        near_boxes: List[Tuple[int, int, int, int, str]] = []
+        # connected components / contours
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            with self._lock:
+                self._label = "no obstacle"
+                self._zone = "NONE"
+                self._ts = now
+                self._bbox = None
+                self._bbox_ratio = 0.0
+            return
 
-        for cnt in cnts:
-            area = abs(cv2.contourArea(cnt))
-            if area < 500:
-                continue
+        # pick largest bbox
+        best = None
+        best_area = 0.0
+        for c in cnts:
+            x, y, bw, bh = cv2.boundingRect(c)
+            a = float(bw * bh)
+            if a > best_area:
+                best_area = a
+                best = (x, y, bw, bh)
 
-            x, y, bw, bh = cv2.boundingRect(cnt)
-            box_area = float(bw * bh)
-            box_ratio = box_area / (frame_area + 1e-9)
+        # scale bbox back to original
+        sx = w / float(small_w)
+        sy = h / float(small_h)
+        x, y, bw, bh = best
+        X = int(x * sx); Y = int(y * sy)
+        BW = int(bw * sx); BH = int(bh * sy)
 
-            # ✅ reject huge/fullscreen false box
-            if box_ratio >= OBS_REJECT_FULLSCREEN_RATIO:
-                continue
+        bbox_area = float(BW * BH)
+        bbox_ratio = bbox_area / (frame_area + 1e-9)
+        bw_ratio = BW / float(w + 1e-9)
+        bh_ratio = BH / float(h + 1e-9)
 
-            # ✅ reject long thin boxes (lines / edges)
-            ar = max(bw / float(bh + 1e-9), bh / float(bw + 1e-9))
-            if ar >= OBS_REJECT_THIN_AR:
-                continue
+        # Determine obstacle yes/no: big occlusion
+        obstacle_yes = (
+            bbox_ratio >= OBS_BBOX_AREA_RATIO_TH
+            and (bw_ratio >= OBS_BBOX_W_RATIO_TH or bh_ratio >= OBS_BBOX_H_RATIO_TH)
+        )
 
-            # ✅ reject boxes touching image border (very common false)
-            if (x <= OBS_EDGE_MARGIN_PX or y <= OBS_EDGE_MARGIN_PX or
-                (x + bw) >= (w - OBS_EDGE_MARGIN_PX) or
-                (y + bh) >= (h - OBS_EDGE_MARGIN_PX)):
-                continue
-
-            # must be large enough (near)
-            if box_ratio < self.min_area_ratio:
-                continue
-
-            # must be in center
-            center_x = x + bw // 2
-            center_y = y + bh // 2
-            if not (cx_min <= center_x <= cx_max and cy_min <= center_y <= cy_max):
-                continue
-
-            # must be near: bottom edge low in frame
-            bottom_y = y + bh
-            if bottom_y < int(h * self.min_bottom_ratio):
-                continue
-
-            shape = self._shape_name(cnt)
-            near_boxes.append((x, y, bw, bh, shape))
-
-        label = "yes have obstacle" if near_boxes else "no obstacle"
+        # zone by bbox center x
+        cx = X + BW // 2
+        if obstacle_yes:
+            if cx < int(w * 0.33):
+                zone = "LEFT"
+            elif cx > int(w * 0.66):
+                zone = "RIGHT"
+            else:
+                zone = "CENTER"
+            label = "yes have obstacle"
+        else:
+            zone = "NONE"
+            label = "no obstacle"
 
         with self._lock:
             self._label = label
+            self._zone = zone
             self._ts = now
-            self._near_boxes = near_boxes
+            self._bbox = (X, Y, BW, BH) if obstacle_yes else None
+            self._bbox_ratio = bbox_ratio
 
     def get_state(self) -> Dict[str, Any]:
         with self._lock:
             return {
                 "label": self._label,
+                "zone": self._zone,
                 "ts": self._ts,
-                "n": len(self._near_boxes),
-                "boxes": [{"x": x, "y": y, "w": w, "h": h, "shape": s} for (x, y, w, h, s) in self._near_boxes],
+                "bbox": ({"x": self._bbox[0], "y": self._bbox[1], "w": self._bbox[2], "h": self._bbox[3]}
+                         if self._bbox else None),
+                "bbox_ratio": self._bbox_ratio,
             }
 
-    def draw_overlay_clean(self, frame_bgr: np.ndarray, obstacle_yes: bool, gesture_label: str) -> np.ndarray:
-        with self._lock:
-            boxes = list(self._near_boxes)
-
+    def draw_overlay(self, frame_bgr: np.ndarray, gesture_label: str) -> np.ndarray:
+        st = self.get_state()
         out = frame_bgr.copy()
         h, w = out.shape[:2]
 
-        # draw near boxes
-        for (x, y, bw, bh, shape) in boxes:
+        obstacle_yes = (st["label"] == "yes have obstacle")
+        zone = st.get("zone", "NONE")
+
+        # draw bbox if yes
+        bb = st.get("bbox")
+        if bb:
+            x, y, bw, bh = bb["x"], bb["y"], bb["w"], bb["h"]
             cv2.rectangle(out, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
-            cv2.putText(out, shape, (x, max(0, y - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-        # top bar
-        bar_h = 48
+        # top info bar (gesture only to avoid messy)
+        bar_h = 42
         cv2.rectangle(out, (0, 0), (w, bar_h), (0, 0, 0), -1)
+        cv2.putText(out, f"GESTURE: {gesture_label}", (10, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-        obs_text = "YES" if obstacle_yes else "NO"
-        left_text = f"OBSTACLE: {obs_text}"
-        right_text = f"GESTURE: {gesture_label}"
+        # right-side obstacle box
+        box_w = 260
+        box_h = 80
+        x0 = w - box_w - 10
+        y0 = bar_h + 10
+        x1 = w - 10
+        y1 = y0 + box_h
 
-        cv2.putText(out, left_text, (10, 32),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+        # background color: green=no, red=yes
+        if obstacle_yes:
+            bg = (0, 0, 120)
+            txt = (255, 255, 255)
+        else:
+            bg = (0, 120, 0)
+            txt = (255, 255, 255)
 
-        (tw, _), _ = cv2.getTextSize(right_text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
-        rx = max(10, w - tw - 10)
-        cv2.putText(out, right_text, (rx, 32),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+        cv2.rectangle(out, (x0, y0), (x1, y1), bg, -1)
+        cv2.rectangle(out, (x0, y0), (x1, y1), (255, 255, 255), 2)
+
+        obs_txt = "YES" if obstacle_yes else "NO"
+        cv2.putText(out, f"OBSTACLE: {obs_txt}", (x0 + 12, y0 + 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, txt, 2)
+        cv2.putText(out, f"ZONE: {zone}", (x0 + 12, y0 + 64),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, txt, 2)
 
         return out
 
@@ -294,7 +302,6 @@ def _push_gesture(label: str, face: str = "", raw: str = ""):
         if (now - last) < GESTURE_COOLDOWN_SEC:
             return
         _last_gesture_ts_by_label[label] = now
-
         gesture_latest.update({"label": label, "ts": now, "face": face or "", "raw": raw or ""})
         gesture_ring.append({"label": label, "ts": now, "face": face or "", "raw": raw or ""})
 
@@ -326,13 +333,11 @@ def attach_routes_to_flask_app(flask_app: Flask, detector: CameraObstacleDetecto
             events = [e for e in events if float(e.get("ts", 0.0)) > since_ts_f]
 
         events = events[-max(1, min(200, limit_n)):]
-
         return jsonify({"ok": True, "latest": latest, "events": events})
 
     @flask_app.get("/take_camera_decision")
     def take_camera_decision():
-        st = detector.get_state()
-        return jsonify({"ok": True, **st})
+        return jsonify({"ok": True, **detector.get_state()})
 
     @flask_app.get("/api/gesture_status")
     def api_gesture_status():
@@ -347,11 +352,6 @@ def attach_routes_to_flask_app(flask_app: Flask, detector: CameraObstacleDetecto
             "gesture_latest": gl,
             "gesture_ring_n": ring_n,
             "cam_rotate_180": CAM_ROTATE_180,
-            "obs_filters": {
-                "reject_fullscreen_ratio": OBS_REJECT_FULLSCREEN_RATIO,
-                "reject_thin_ar": OBS_REJECT_THIN_AR,
-                "edge_margin_px": OBS_EDGE_MARGIN_PX
-            }
         })
 
 
@@ -360,39 +360,31 @@ def attach_routes_to_flask_app(flask_app: Flask, detector: CameraObstacleDetecto
 # =========================
 def main():
     cam = Camera(dev="/dev/video0", w=640, h=480, fps=30, rotate180=CAM_ROTATE_180)
+    detector = CameraObstacleDetector(interval_sec=CAM_DECISION_INTERVAL_SEC)
 
-    detector = CameraObstacleDetector(
-        decision_interval_sec=CAM_DECISION_INTERVAL_SEC,
-        min_area_ratio=OBS_MIN_AREA_RATIO,
-        center_region_ratio=OBS_CENTER_REGION_RATIO,
-        min_bottom_ratio=OBS_MIN_BOTTOM_RATIO
-    )
-
-    # HandCommand uses the same rotated frame => directions consistent
+    # Raw frame for HandCommand (already rotated correctly)
     def get_frame_raw():
         return cam.get_frame()
 
-    # Dashboard frame
+    # Dashboard overlay frame
     def get_frame_for_dashboard():
         frame = cam.get_frame()
         if frame is None:
             return None
 
         detector.compute(frame)
-        st = detector.get_state()
-        obstacle_yes = (st.get("label") == "yes have obstacle")
 
         with gesture_lock:
             g_lbl = gesture_latest.get("label", "NA")
 
-        return detector.draw_overlay_clean(frame, obstacle_yes=obstacle_yes, gesture_label=g_lbl)
+        return detector.draw_overlay(frame, gesture_label=g_lbl)
 
-    # ✅ Swap SIT <-> STANDUP to match your old mapping
-    def _swap_action(a: str) -> str:
-        if a == "SIT":
-            return "STANDUP"
+    # ✅ FIX: swap STANDUP <-> SIT
+    def swap_sit_stand(a: str) -> str:
         if a == "STANDUP":
             return "SIT"
+        if a == "SIT":
+            return "STANDUP"
         return a
 
     def on_action(action: str, face: str, bark: bool):
@@ -401,7 +393,7 @@ def main():
         if not a:
             return
 
-        a = _swap_action(a)  # ✅ fix SIT/STAND swapped
+        a = swap_sit_stand(a)
 
         if f:
             set_face(f)
