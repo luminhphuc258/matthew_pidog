@@ -35,6 +35,13 @@ from handcommand import HandCommand, HandCfg
 from web_dashboard import WebDashboard
 
 
+# =========================
+# ROTATION POLICY
+# - Chỉ rotate 1 lần (ở service) để tránh vẽ hand bị trùng
+# =========================
+ROTATE180 = True
+
+
 # ===== face UDP =====
 FACE_HOST = "127.0.0.1"
 FACE_PORT = 39393
@@ -132,7 +139,9 @@ class Camera:
 
 
 # ============================================================
-# OBSTACLE detector (giữ bản bạn đang dùng)
+# OBSTACLE detector
+# - Giữ stripe/hbar rules
+# - THÊM rule Edge density + Motion (so với background EMA)
 # ============================================================
 class ColorStripeObstacleDetector:
     def __init__(self,
@@ -140,6 +149,8 @@ class ColorStripeObstacleDetector:
                  window_sec: float = 2.0,
                  roi_y1_ratio: float = 0.10,
                  roi_y2_ratio: float = 0.96,
+
+                 # stripe/hbar params (giữ như bạn)
                  min_vstripe_width_ratio: float = 0.08,
                  max_vstripe_width_ratio: float = 0.70,
                  min_hbar_height_ratio: float = 0.06,
@@ -151,34 +162,69 @@ class ColorStripeObstacleDetector:
                  stable_mean_delta_thr: float = 10.0,
                  min_good_ratio_in_window: float = 0.65,
                  hbar_min_width_ratio: float = 0.86,
-                 neighbor_mean_delta_thr: float = 8.0
+                 neighbor_mean_delta_thr: float = 8.0,
+
+                 # ===== NEW: Edge + Motion =====
+                 motion_diff_thr: int = 28,           # pixel diff threshold
+                 motion_ratio_thr: float = 0.22,      # tỉ lệ pixel đổi lớn -> obstacle
+                 edge_ratio_thr: float = 0.055,       # tỉ lệ edges -> obstacle (case hoạ tiết)
+                 bg_alpha: float = 0.05,              # EMA update
+                 exposure_jump_v_thr: float = 18.0,   # nếu sáng thay đổi global mạnh -> skip update/bg
                  ):
         self.interval = float(decision_interval_sec)
         self.window_sec = float(window_sec)
+
         self.ry1 = float(roi_y1_ratio)
         self.ry2 = float(roi_y2_ratio)
+
         self.min_vw = float(min_vstripe_width_ratio)
         self.max_vw = float(max_vstripe_width_ratio)
+
         self.min_hh = float(min_hbar_height_ratio)
         self.max_hh = float(max_hbar_height_ratio)
+
         self.col_std_v_thr = float(col_std_v_thr)
         self.col_edge_thr = float(col_edge_thr)
+
         self.row_std_v_thr = float(row_std_v_thr)
         self.row_edge_thr = float(row_edge_thr)
+
         self.stable_mean_delta_thr = float(stable_mean_delta_thr)
         self.min_good_ratio_in_window = float(min_good_ratio_in_window)
+
         self.hbar_min_width_ratio = float(hbar_min_width_ratio)
         self.neighbor_mean_delta_thr = float(neighbor_mean_delta_thr)
 
+        # NEW
+        self.motion_diff_thr = int(motion_diff_thr)
+        self.motion_ratio_thr = float(motion_ratio_thr)
+        self.edge_ratio_thr = float(edge_ratio_thr)
+        self.bg_alpha = float(bg_alpha)
+        self.exposure_jump_v_thr = float(exposure_jump_v_thr)
+
         self._lock = threading.Lock()
         self._last_run = 0.0
+
+        # stripe/hbar history
         self._hist: deque = deque(maxlen=250)
+
+        # motion/edge history by zone: (ts, motion_ratio, edge_ratio)
+        self._zone_hist = {
+            "LEFT": deque(maxlen=250),
+            "CENTER": deque(maxlen=250),
+            "RIGHT": deque(maxlen=250),
+        }
+
+        # background model (gray float32) for ROI small
+        self._bg_gray: Optional[np.ndarray] = None
+        self._last_global_v: Optional[float] = None
 
         self._label = "no obstacle"
         self._zone = "NONE"
         self._orientation = "NONE"
         self._ts = 0.0
         self._shape: Optional[Dict[str, int]] = None
+        self._reason: str = ""   # debug: STRIPE / HBAR / MOTION
 
     @staticmethod
     def _zone_from_x(cx: int, w: int) -> str:
@@ -193,7 +239,7 @@ class ColorStripeObstacleDetector:
         if w <= target_w:
             return roi_bgr, 1.0
         scale = target_w / float(w)
-        small = cv2.resize(roi_bgr, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
+        small = cv2.resize(roi_bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
         return small, scale
 
     def _neighbor_delta_ok_vertical(self, vmap: np.ndarray, x1: int, x2: int) -> bool:
@@ -290,7 +336,7 @@ class ColorStripeObstacleDetector:
         else:
             x1, x2 = int(x1s), int(x2s)
 
-        x1 = max(0, min(w-1, x1))
+        x1 = max(0, min(w - 1, x1))
         x2 = max(0, min(w, x2))
         if x2 - x1 < int(self.min_vw * w):
             return False, None, 0.0
@@ -359,12 +405,102 @@ class ColorStripeObstacleDetector:
         else:
             y1, y2 = int(y1s), int(y2s)
 
-        y1 = max(0, min(h-1, y1))
+        y1 = max(0, min(h - 1, y1))
         y2 = max(0, min(h, y2))
         if y2 - y1 < int(self.min_hh * h):
             return False, None, 0.0
 
         return True, (y1, y2), meanV
+
+    def _global_exposure_jump(self, roi_bgr_small: np.ndarray) -> bool:
+        try:
+            hsv = cv2.cvtColor(roi_bgr_small, cv2.COLOR_BGR2HSV)
+            vmean = float(np.mean(hsv[:, :, 2]))
+        except Exception:
+            return False
+
+        if self._last_global_v is None:
+            self._last_global_v = vmean
+            return False
+
+        dv = abs(vmean - self._last_global_v)
+        self._last_global_v = vmean
+        return dv >= self.exposure_jump_v_thr
+
+    def _update_motion_edge(self, roi_bgr: np.ndarray, now: float):
+        """
+        Compute motion vs background (EMA) + edge density for 3 zones.
+        Lưu hist trong window_sec để quyết định.
+        """
+        small, _ = self._prep_small(roi_bgr, target_w=320)
+        jump = self._global_exposure_jump(small)
+
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        if self._bg_gray is None or self._bg_gray.shape != gray.shape:
+            self._bg_gray = gray.copy()
+
+        # compute edge ratio using Canny on uint8
+        g8 = np.clip(gray, 0, 255).astype(np.uint8)
+        edges = cv2.Canny(g8, 60, 160)
+        edges01 = (edges > 0).astype(np.float32)
+
+        Hs, Ws = gray.shape[:2]
+        zW = Ws // 3
+        zones = {
+            "LEFT": (0, zW),
+            "CENTER": (zW, 2 * zW),
+            "RIGHT": (2 * zW, Ws),
+        }
+
+        # motion vs bg
+        diff = np.abs(gray - self._bg_gray)
+        motion_mask = (diff >= float(self.motion_diff_thr)).astype(np.float32)
+
+        # Update history per zone
+        for zn, (x1, x2) in zones.items():
+            m = motion_mask[:, x1:x2]
+            e = edges01[:, x1:x2]
+            motion_ratio = float(np.mean(m)) if m.size else 0.0
+            edge_ratio = float(np.mean(e)) if e.size else 0.0
+            self._zone_hist[zn].append((now, motion_ratio, edge_ratio))
+
+        # Update bg if not exposure jump and scene seems stable (no big motion overall)
+        # (chỉ update khi motion toàn ROI nhỏ)
+        if not jump:
+            overall_motion = float(np.mean(motion_mask)) if motion_mask.size else 0.0
+            # chỉ update bg khi khá yên (không có vật cản lớn)
+            if overall_motion < (self.motion_ratio_thr * 0.55):
+                a = self.bg_alpha
+                self._bg_gray = (1.0 - a) * self._bg_gray + a * gray
+
+    def _decide_motion_zone(self, now: float) -> Optional[Tuple[str, float, float]]:
+        """
+        Quyết định obstacle theo rule (Motion + Edge) trong window_sec.
+        Return: (zone, avg_motion, avg_edge) or None
+        """
+        tmin = now - self.window_sec
+        best = None
+
+        for zn, dq in self._zone_hist.items():
+            items = [it for it in dq if it[0] >= tmin]
+            if len(items) < 6:
+                continue
+            good = [it for it in items if (it[1] >= self.motion_ratio_thr and it[2] >= self.edge_ratio_thr)]
+            if len(good) / float(len(items)) < self.min_good_ratio_in_window:
+                continue
+
+            avg_m = float(np.mean([it[1] for it in items]))
+            avg_e = float(np.mean([it[2] for it in items]))
+
+            # chọn zone mạnh nhất theo motion trước, rồi edge
+            cand = (zn, avg_m, avg_e)
+            if best is None:
+                best = cand
+            else:
+                if (cand[1] > best[1]) or (cand[1] == best[1] and cand[2] > best[2]):
+                    best = cand
+
+        return best
 
     def compute(self, frame_bgr: np.ndarray):
         now = time.time()
@@ -375,11 +511,15 @@ class ColorStripeObstacleDetector:
         H, W = frame_bgr.shape[:2]
         ry1 = int(H * self.ry1)
         ry2 = int(H * self.ry2)
-        ry1 = max(0, min(H-1, ry1))
-        ry2 = max(ry1+10, min(H, ry2))
+        ry1 = max(0, min(H - 1, ry1))
+        ry2 = max(ry1 + 10, min(H, ry2))
 
         roi = frame_bgr[ry1:ry2, :]
 
+        # update motion/edge first
+        self._update_motion_edge(roi, now)
+
+        # detect stripe/hbar
         vok, vrun, vmean = self._find_vertical_stripe(roi)
         vx1 = vx2 = -1
         if vok and vrun:
@@ -390,9 +530,11 @@ class ColorStripeObstacleDetector:
         if hok and hrun:
             hy1, hy2 = hrun[0], hrun[1]
 
+        # store stripe/hbar history
         self._hist.append((now, bool(vok), "VERTICAL", vx1 if vok else -1, vx2 if vok else -1, ry1, ry2, vmean if vok else 0.0))
-        self._hist.append((now, bool(hok), "HORIZONTAL", 0 if hok else -1, W if hok else -1, (ry1+hy1) if hok else -1, (ry1+hy2) if hok else -1, hmean if hok else 0.0))
+        self._hist.append((now, bool(hok), "HORIZONTAL", 0 if hok else -1, W if hok else -1, (ry1 + hy1) if hok else -1, (ry1 + hy2) if hok else -1, hmean if hok else 0.0))
 
+        # decide stripe/hbar in window
         tmin = now - self.window_sec
         items = [it for it in list(self._hist) if it[0] >= tmin]
         v_items = [it for it in items if it[2] == "VERTICAL"]
@@ -407,19 +549,46 @@ class ColorStripeObstacleDetector:
             vs = [it[7] for it in oks]
             if not vs or (max(vs) - min(vs)) > self.stable_mean_delta_thr:
                 return None
-            oks_sorted = sorted(oks, key=lambda x: (x[4]-x[3]) * max(1, (x[6]-x[5])), reverse=True)
+            oks_sorted = sorted(oks, key=lambda x: (x[4] - x[3]) * max(1, (x[6] - x[5])), reverse=True)
             return oks_sorted[0] if oks_sorted else None
 
         best_v = decide(v_items)
         best_h = decide(h_items)
 
         chosen = None
+        reason = ""
+
+        # ưu tiên hbar full width
         if best_h and (best_h[4] - best_h[3]) >= int(0.85 * W):
             chosen = best_h
+            reason = "HBAR"
         elif best_v:
             chosen = best_v
+            reason = "STRIPE"
         elif best_h:
             chosen = best_h
+            reason = "HBAR"
+
+        # nếu stripe/hbar fail -> dùng motion+edge
+        motion_pick = self._decide_motion_zone(now)
+        if chosen is None and motion_pick is not None:
+            zn, avg_m, avg_e = motion_pick
+            # shape là full-height zone stripe
+            if zn == "LEFT":
+                x1, x2 = 0, W // 3
+            elif zn == "CENTER":
+                x1, x2 = W // 3, 2 * (W // 3)
+            else:
+                x1, x2 = 2 * (W // 3), W
+
+            with self._lock:
+                self._label = "yes have obstacle"
+                self._zone = zn
+                self._orientation = "VERTICAL"
+                self._ts = now
+                self._shape = {"x1": int(x1), "x2": int(x2), "y1": int(ry1), "y2": int(ry2)}
+                self._reason = f"MOTION(m={avg_m:.2f},e={avg_e:.2f})"
+            return
 
         if not chosen:
             with self._lock:
@@ -428,6 +597,7 @@ class ColorStripeObstacleDetector:
                 self._orientation = "NONE"
                 self._ts = now
                 self._shape = None
+                self._reason = ""
             return
 
         _, _, ori, x1, x2, y1, y2, _ = chosen
@@ -446,10 +616,18 @@ class ColorStripeObstacleDetector:
             self._orientation = ori
             self._ts = now
             self._shape = shape
+            self._reason = reason
 
     def get_state(self) -> Dict[str, Any]:
         with self._lock:
-            return {"label": self._label, "zone": self._zone, "orientation": self._orientation, "ts": self._ts, "shape": self._shape}
+            return {
+                "label": self._label,
+                "zone": self._zone,
+                "orientation": self._orientation,
+                "ts": self._ts,
+                "shape": self._shape,
+                "reason": self._reason,
+            }
 
     def draw_overlay(self, frame_bgr: np.ndarray) -> np.ndarray:
         st = self.get_state()
@@ -459,17 +637,21 @@ class ColorStripeObstacleDetector:
         shp = st.get("shape")
         if not isinstance(shp, dict):
             return out
+
         x1 = int(shp.get("x1", 0)); x2 = int(shp.get("x2", 0))
         y1 = int(shp.get("y1", 0)); y2 = int(shp.get("y2", 0))
-        x1 = max(0, min(out.shape[1]-1, x1))
+
+        x1 = max(0, min(out.shape[1] - 1, x1))
         x2 = max(0, min(out.shape[1], x2))
-        y1 = max(0, min(out.shape[0]-1, y1))
+        y1 = max(0, min(out.shape[0] - 1, y1))
         y2 = max(0, min(out.shape[0], y2))
+
         if x2 > x1 and y2 > y1:
             overlay = out.copy()
             cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), -1)
             out = cv2.addWeighted(overlay, 0.18, out, 0.82, 0)
             cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
         return out
 
 
@@ -493,7 +675,7 @@ def _push_gesture(label: str, face: str = "", raw: str = ""):
 
 
 # =========================
-# Hand overlay (đúng kiểu cũ: draw_on_frame)
+# Hand overlay (draw_on_frame) + FIX duplicate top/bottom
 # =========================
 def _hand_enabled(hc: HandCommand) -> bool:
     try:
@@ -512,15 +694,47 @@ def _hand_enabled(hc: HandCommand) -> bool:
                 pass
     return True
 
+def _looks_like_black_banner(img: np.ndarray, y1: int, y2: int) -> bool:
+    try:
+        strip = img[y1:y2, :, :]
+        if strip.size < 10:
+            return False
+        # banner đen: mean thấp + khá đều
+        m = float(np.mean(strip))
+        return m < 35.0
+    except Exception:
+        return False
+
+def _fix_double_banner(base_bgr: np.ndarray, drawn_bgr: np.ndarray) -> np.ndarray:
+    """
+    Nếu có banner đen ở TOP và BOTTOM cùng lúc => xoá banner dưới bằng cách restore từ base.
+    """
+    if base_bgr is None or drawn_bgr is None:
+        return drawn_bgr
+
+    h = drawn_bgr.shape[0]
+    band = max(44, int(0.10 * h))  # ~10% height
+
+    top_black = _looks_like_black_banner(drawn_bgr, 0, band)
+    bot_black = _looks_like_black_banner(drawn_bgr, h - band, h)
+
+    if top_black and bot_black:
+        out = drawn_bgr.copy()
+        out[h - band:h, :, :] = base_bgr[h - band:h, :, :]
+        return out
+
+    return drawn_bgr
 
 def _draw_hand_old_style(hc: HandCommand, frame_bgr: np.ndarray) -> np.ndarray:
     if hc is None or not _hand_enabled(hc):
         return frame_bgr
 
+    base = frame_bgr
     if hasattr(hc, "draw_on_frame"):
         try:
-            out = hc.draw_on_frame(frame_bgr)
+            out = hc.draw_on_frame(frame_bgr.copy())
             if isinstance(out, np.ndarray) and out.shape[:2] == frame_bgr.shape[:2]:
+                out = _fix_double_banner(base, out)
                 return out
         except Exception:
             pass
@@ -555,14 +769,33 @@ def _route_exists(app, rule: str) -> bool:
     return False
 
 
+def _rot_if_needed(frame: np.ndarray) -> np.ndarray:
+    if frame is None:
+        return None
+    if ROTATE180:
+        try:
+            return cv2.rotate(frame, cv2.ROTATE_180)
+        except Exception:
+            return frame
+    return frame
+
+
 def main():
     cam = Camera(dev="/dev/video0", w=640, h=480, fps=30,
                  snapshot_path=SNAPSHOT_PATH,
                  snapshot_interval_sec=SNAPSHOT_INTERVAL_SEC,
                  snapshot_quality=SNAPSHOT_JPEG_QUALITY)
 
-    detector = ColorStripeObstacleDetector()
+    detector = ColorStripeObstacleDetector(
+        # bạn có thể tweak thêm nếu muốn
+        motion_diff_thr=28,
+        motion_ratio_thr=0.22,
+        edge_ratio_thr=0.055,
+        bg_alpha=0.05,
+        exposure_jump_v_thr=18.0
+    )
 
+    # FIX remap labels:
     ACTION_REMAP = {"UP": "SIT", "SIT": "STANDUP"}
 
     def on_action(action: str, face: str, bark: bool):
@@ -580,10 +813,15 @@ def main():
         if ALWAYS_STOPMUSIC_ON_ANY_GESTURE:
             _push_gesture("STOPMUSIC", face=face or "", raw=f"auto_from_{mapped}")
 
-    # ✅ shared camera: HandCommand KHÔNG mở camera nữa
+    # ===== shared camera frame provider (rotated) =====
+    def get_frame_rotated():
+        fr = cam.get_frame()
+        return _rot_if_needed(fr)
+
+    # HandCommand KHÔNG mở camera lần 2, chỉ lấy frame từ callback
     hc = HandCommand(
         cfg=HandCfg(
-            cam_dev="",  # ✅ tránh mở camera lần 2
+            cam_dev="",  # tránh mở camera lần 2
             w=640, h=480, fps=30,
             process_every=2,
             action_cooldown_sec=0.7,
@@ -595,7 +833,7 @@ def main():
         ),
         on_action=on_action,
         boot_helper=None,
-        get_frame_bgr=cam.get_frame,
+        get_frame_bgr=get_frame_rotated,   # ✅ feed rotated frame để overlay khớp camera view
         open_own_camera=False,
         clear_memory_on_start=True
     )
@@ -604,33 +842,38 @@ def main():
     hc.set_enabled(True)
 
     def get_frame_for_dashboard():
-        frame = cam.get_frame()
+        frame = get_frame_rotated()
         if frame is None:
             return None
+
         detector.compute(frame)
         out = detector.draw_overlay(frame)
+
+        # vẽ hand (fix duplicate)
         out = _draw_hand_old_style(hc, out)
         return out
 
+    # IMPORTANT: rotate180=False vì mình rotate ở service rồi (tránh double rotate)
     dash = WebDashboard(
         host="0.0.0.0",
         port=8000,
         get_frame_bgr=get_frame_for_dashboard,
         get_obstacle_state=lambda: detector.get_state(),
         on_manual_cmd=lambda m: print("[MANUAL CMD]", m, flush=True),
-        rotate180=True,
+        rotate180=False,  # ✅ FIX trùng overlay
         hand_command=hc,
     )
 
     app = dash.app
 
-    # ✅ chỉ add route nếu chưa tồn tại (tránh overwrite -> ABRT)
+    # add routes only if missing (tránh overwrite -> ABRT)
     if not _route_exists(app, "/take_gesture_meaning"):
         @app.get("/take_gesture_meaning")
         def take_gesture_meaning():
             from flask import jsonify, request
             since_ts = request.args.get("since_ts", None)
             limit = request.args.get("limit", None)
+
             try:
                 since_ts_f = float(since_ts) if since_ts is not None else None
             except Exception:
@@ -661,6 +904,7 @@ def main():
     print("Gesture API : http://<pi_ip>:8000/take_gesture_meaning", flush=True)
     print("Camera API  : http://<pi_ip>:8000/take_camera_decision", flush=True)
     print("Snapshot    :", SNAPSHOT_PATH, flush=True)
+    print("Rotate180   :", ROTATE180, flush=True)
 
     try:
         dash.run()
