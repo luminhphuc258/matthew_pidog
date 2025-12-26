@@ -22,7 +22,7 @@ _face_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 def set_face(emo: str):
     try:
-        _face_sock.sendto(emo.encode("utf-8"), (FACE_HOST, FACE_PORT))
+        _face_sock.sendto(str(emo).encode("utf-8"), (FACE_HOST, FACE_PORT))
     except Exception:
         pass
 
@@ -34,7 +34,7 @@ SNAPSHOT_PATH = os.environ.get("SNAPSHOT_PATH", "/tmp/gesture_latest.jpg")
 SNAPSHOT_JPEG_QUALITY = int(os.environ.get("SNAPSHOT_JPEG_QUALITY", "80"))
 SNAPSHOT_INTERVAL_SEC = float(os.environ.get("SNAPSHOT_INTERVAL_SEC", "5.0"))
 
-# Gesture internal publish
+# Gesture internal ring/cooldown
 GESTURE_COOLDOWN_SEC = float(os.environ.get("GESTURE_COOLDOWN_SEC", "0.35"))
 GESTURE_RING_MAX = int(os.environ.get("GESTURE_RING_MAX", "80"))
 
@@ -113,7 +113,7 @@ class Camera:
 
 # ============================================================
 # OBSTACLE by COLOR CONSISTENCY (2s) + FULL-HEIGHT STRIPE
-# + NEW: HORIZONTAL BAR (almost full width) -> obstacle too
+# + HORIZONTAL BAR (almost full width) -> obstacle too
 # ============================================================
 class ColorStripeObstacleDetector:
     def __init__(self,
@@ -141,9 +141,9 @@ class ColorStripeObstacleDetector:
                  stable_mean_delta_thr: float = 10.0,
                  min_good_ratio_in_window: float = 0.65,
 
-                 # NEW: full-width horizontal bar rule
-                 hbar_min_width_ratio: float = 0.86,  # gần full ngang -> coi là "ống nằm ngang"
-                 neighbor_mean_delta_thr: float = 8.0 # band phải khác nền xung quanh để tránh false positive
+                 # full-width horizontal bar rule
+                 hbar_min_width_ratio: float = 0.86,
+                 neighbor_mean_delta_thr: float = 8.0
                  ):
         self.interval = float(decision_interval_sec)
         self.window_sec = float(window_sec)
@@ -172,7 +172,6 @@ class ColorStripeObstacleDetector:
         self._lock = threading.Lock()
         self._last_run = 0.0
 
-        # rolling window history
         # item: (ts, ok, orientation, x1,x2,y1,y2, meanV)
         self._hist: deque = deque(maxlen=250)
 
@@ -180,7 +179,7 @@ class ColorStripeObstacleDetector:
         self._zone = "NONE"
         self._orientation = "NONE"
         self._ts = 0.0
-        self._shape: Optional[Dict[str, int]] = None  # box coords
+        self._shape: Optional[Dict[str, int]] = None
 
     @staticmethod
     def _zone_from_x(cx: int, w: int) -> str:
@@ -199,7 +198,6 @@ class ColorStripeObstacleDetector:
         return small, scale
 
     def _neighbor_delta_ok_vertical(self, vmap: np.ndarray, x1: int, x2: int) -> bool:
-        # vmap shape (H,W) float32
         H, W = vmap.shape[:2]
         band = vmap[:, x1:x2]
         if band.size < 10:
@@ -211,7 +209,7 @@ class ColorStripeObstacleDetector:
         xr1 = min(W, x2)
         xr2 = min(W, x2 + pad)
         if xl2 - xl1 < 2 or xr2 - xr1 < 2:
-            return True  # cannot compare -> allow
+            return True
         m_l = float(np.mean(vmap[:, xl1:xl2]))
         m_r = float(np.mean(vmap[:, xr1:xr2]))
         if (abs(m_band - m_l) < self.neighbor_mean_delta_thr) and (abs(m_band - m_r) < self.neighbor_mean_delta_thr):
@@ -284,11 +282,9 @@ class ColorStripeObstacleDetector:
         x1s, x2s = best_run
         meanV = float(np.mean(v[:, x1s:x2s]))
 
-        # neighbor delta filter to avoid background smooth region
         if not self._neighbor_delta_ok_vertical(v, x1s, x2s):
             return False, None, 0.0
 
-        # map back
         if scale != 1.0:
             x1 = int(x1s / scale)
             x2 = int(x2s / scale)
@@ -303,13 +299,6 @@ class ColorStripeObstacleDetector:
         return True, (x1, x2), meanV
 
     def _find_horizontal_bar(self, roi_bgr: np.ndarray) -> Tuple[bool, Optional[Tuple[int, int]], float]:
-        """
-        NEW RULE:
-        - find contiguous rows where each row is uniform across width (low std + low edges)
-        - band must span almost full width (we measure on full row already)
-        - band thickness within [min_hh, max_hh]
-        - band must differ from neighbors (above/below) to avoid static background
-        """
         h, w = roi_bgr.shape[:2]
         if w < 80 or h < 50:
             return False, None, 0.0
@@ -324,13 +313,11 @@ class ColorStripeObstacleDetector:
         edges = cv2.Canny(gray, 60, 160)
         edges = (edges > 0).astype(np.float32)
 
-        # per-row stats
-        row_std_v = np.std(v, axis=1)      # (hh,)
-        row_edge = np.mean(edges, axis=1)  # (hh,)
+        row_std_v = np.std(v, axis=1)
+        row_edge = np.mean(edges, axis=1)
 
         good = (row_std_v < self.row_std_v_thr) & (row_edge < self.row_edge_thr)
 
-        # longest run
         best_len = 0
         best_run = None
         i = 0
@@ -357,26 +344,16 @@ class ColorStripeObstacleDetector:
 
         y1s, y2s = best_run
 
-        # horizontal bar width rule: nearly full width
-        # (we already use full row), but still avoid cases where only center part uniform:
-        # check uniformity also on 90% middle width segment
         mid_x1 = int(0.05 * ww)
         mid_x2 = int(0.95 * ww)
-        band_mid = v[y1s:y2s, mid_x1:mid_x2]
-        if band_mid.size < 10:
-            return False, None, 0.0
-
-        # require that mid segment width ratio passes
         if (mid_x2 - mid_x1) / float(ww) < self.hbar_min_width_ratio:
             return False, None, 0.0
 
         meanV = float(np.mean(v[y1s:y2s, :]))
 
-        # neighbor delta filter
         if not self._neighbor_delta_ok_horizontal(v, y1s, y2s):
             return False, None, 0.0
 
-        # map back
         if scale != 1.0:
             y1 = int(y1s / scale)
             y2 = int(y2s / scale)
@@ -404,35 +381,29 @@ class ColorStripeObstacleDetector:
 
         roi = frame_bgr[ry1:ry2, :]
 
-        # detect vertical stripe
         vok, vrun, vmean = self._find_vertical_stripe(roi)
         vx1 = vx2 = -1
         if vok and vrun:
             vx1, vx2 = vrun[0], vrun[1]
 
-        # detect horizontal bar
         hok, hrun, hmean = self._find_horizontal_bar(roi)
         hy1 = hy2 = -1
         if hok and hrun:
             hy1, hy2 = hrun[0], hrun[1]
 
-        # push history items (prefer the stronger one later)
         if vok:
             self._hist.append((now, True, "VERTICAL", vx1, vx2, ry1, ry2, vmean))
         else:
             self._hist.append((now, False, "VERTICAL", -1, -1, ry1, ry2, 0.0))
 
         if hok:
-            # store horizontal shape with x spanning full width
             self._hist.append((now, True, "HORIZONTAL", 0, W, ry1 + hy1, ry1 + hy2, hmean))
         else:
             self._hist.append((now, False, "HORIZONTAL", -1, -1, -1, -1, 0.0))
 
-        # evaluate window
         tmin = now - self.window_sec
         items = [it for it in list(self._hist) if it[0] >= tmin]
 
-        # split by orientation
         v_items = [it for it in items if it[2] == "VERTICAL"]
         h_items = [it for it in items if it[2] == "HORIZONTAL"]
 
@@ -445,14 +416,12 @@ class ColorStripeObstacleDetector:
             vs = [it[7] for it in oks]
             if not vs or (max(vs) - min(vs)) > self.stable_mean_delta_thr:
                 return None
-            # pick widest/strongest
-            oks_sorted = sorted(oks, key=lambda x: (x[4]-x[3]) * (x[6]-x[5]), reverse=True)
+            oks_sorted = sorted(oks, key=lambda x: (x[4]-x[3]) * max(1, (x[6]-x[5])), reverse=True)
             return oks_sorted[0] if oks_sorted else None
 
         best_v = decide(v_items)
         best_h = decide(h_items)
 
-        # choose best: prefer horizontal if it spans almost full width (x2-x1 big)
         chosen = None
         if best_h and (best_h[4] - best_h[3]) >= int(0.85 * W):
             chosen = best_h
@@ -477,7 +446,6 @@ class ColorStripeObstacleDetector:
             zone = self._zone_from_x(cx, W)
             shape = {"x1": int(x1), "x2": int(x2), "y1": int(ry1), "y2": int(ry2)}
         else:
-            # horizontal: zone keep CENTER (spans width)
             zone = "CENTER"
             shape = {"x1": int(x1), "x2": int(x2), "y1": int(y1), "y2": int(y2)}
 
@@ -548,28 +516,35 @@ def _push_gesture(label: str, face: str = "", raw: str = ""):
 
 
 # =========================
-# Hand overlay helper (restore drawing)
+# Hand overlay (CODE CŨ style)
 # =========================
-def _try_hand_draw(hc: HandCommand, frame_bgr: np.ndarray) -> np.ndarray:
-    """
-    Cố gắng dùng các hàm draw/annotate có sẵn trong HandCommand.
-    Nếu không có thì fallback vẽ text từ status.
-    """
+def _hand_enabled(hc: HandCommand) -> bool:
     if hc is None:
-        return frame_bgr
-
-    # 1) Try known methods (tùy code bạn đặt tên gì)
-    for meth in ("get_debug_draw", "draw_debug", "annotate", "draw_overlay", "render_debug"):
-        if hasattr(hc, meth):
-            fn = getattr(hc, meth)
+        return False
+    # ưu tiên đọc status
+    try:
+        if hasattr(hc, "get_status"):
+            st = hc.get_status()
+            if isinstance(st, dict) and "enabled" in st:
+                return bool(st.get("enabled", False))
+    except Exception:
+        pass
+    # fallback attr
+    for attr in ("enabled", "is_enabled", "_enabled"):
+        if hasattr(hc, attr):
             try:
-                out = fn(frame_bgr)
-                if isinstance(out, np.ndarray) and out.shape[:2] == frame_bgr.shape[:2]:
-                    return out
+                v = getattr(hc, attr)
+                if isinstance(v, bool):
+                    return v
             except Exception:
                 pass
+    return True
 
-    # 2) Fallback: write status text
+
+def _try_hand_draw_fallback(hc: HandCommand, frame_bgr: np.ndarray) -> np.ndarray:
+    """
+    Fallback nếu HandCommand không có draw_on_frame hoặc bị lỗi.
+    """
     out = frame_bgr
     try:
         st = hc.get_status() if hasattr(hc, "get_status") else {}
@@ -579,13 +554,48 @@ def _try_hand_draw(hc: HandCommand, frame_bgr: np.ndarray) -> np.ndarray:
             fps = st.get("fps", None)
             fc = st.get("finger_count", None)
 
-            txt = f"HAND: {'ON' if en else 'OFF'}  {act if act else 'NA'}  fingers:{fc if fc is not None else 'NA'}  ({fps:.1f}fps)" if isinstance(fps, (int, float)) else \
-                  f"HAND: {'ON' if en else 'OFF'}  {act if act else 'NA'}  fingers:{fc if fc is not None else 'NA'}"
+            if isinstance(fps, (int, float)):
+                txt = f"HAND: {'ON' if en else 'OFF'}  {act if act else 'NA'}  fingers:{fc if fc is not None else 'NA'}  ({fps:.1f}fps)"
+            else:
+                txt = f"HAND: {'ON' if en else 'OFF'}  {act if act else 'NA'}  fingers:{fc if fc is not None else 'NA'}"
+
             cv2.putText(out, txt, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 255), 2)
     except Exception:
         pass
-
     return out
+
+
+def _draw_hand_like_old_code(hc: HandCommand, frame_bgr: np.ndarray) -> np.ndarray:
+    """
+    ✅ Đây là phần bạn yêu cầu: lấy "flow mới" nhưng restore code cũ vẽ hand:
+    if enabled: frame = hc.draw_on_frame(frame)
+    """
+    if hc is None:
+        return frame_bgr
+    if not _hand_enabled(hc):
+        return frame_bgr
+
+    # cốt lõi kiểu cũ
+    if hasattr(hc, "draw_on_frame"):
+        try:
+            out = hc.draw_on_frame(frame_bgr)
+            if isinstance(out, np.ndarray) and out.shape[:2] == frame_bgr.shape[:2]:
+                return out
+        except Exception:
+            pass
+
+    # fallback: thử một vài method khác nếu bạn đặt tên khác
+    for meth in ("draw_on_frame_bgr", "draw_debug", "annotate", "draw_overlay", "render_debug"):
+        if hasattr(hc, meth):
+            fn = getattr(hc, meth)
+            try:
+                out = fn(frame_bgr)
+                if isinstance(out, np.ndarray) and out.shape[:2] == frame_bgr.shape[:2]:
+                    return out
+            except Exception:
+                pass
+
+    return _try_hand_draw_fallback(hc, frame_bgr)
 
 
 # =========================
@@ -652,7 +662,6 @@ def main():
         if ALWAYS_STOPMUSIC_ON_ANY_GESTURE:
             _push_gesture("STOPMUSIC", face=face or "", raw=f"auto_from_{mapped}")
 
-    # HandCommand uses raw frame
     def get_frame_raw():
         return cam.get_frame()
 
@@ -679,7 +688,6 @@ def main():
     hc.start()
     hc.set_enabled(True)
 
-    # Dashboard frame: obstacle + hand overlay together
     def get_frame_for_dashboard():
         frame = cam.get_frame()
         if frame is None:
@@ -688,8 +696,8 @@ def main():
         detector.compute(frame)
         out = detector.draw_overlay(frame)
 
-        # restore hand drawing overlay
-        out = _try_hand_draw(hc, out)
+        # ✅ restore hand overlay đúng kiểu cũ
+        out = _draw_hand_like_old_code(hc, out)
         return out
 
     dash = WebDashboard(
