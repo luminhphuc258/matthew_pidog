@@ -2,6 +2,17 @@
 # -*- coding: utf-8 -*-
 
 import os
+
+# ===== chống crash OpenCV/MP khi chạy systemd =====
+os.environ.setdefault("OPENCV_VIDEOIO_PRIORITY_GSTREAMER", "0")
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import time
 import socket
 import threading
@@ -11,11 +22,20 @@ from typing import Optional, Dict, Any, List, Tuple
 import cv2
 import numpy as np
 
+try:
+    cv2.setNumThreads(1)
+except Exception:
+    pass
+try:
+    cv2.ocl.setUseOpenCL(False)
+except Exception:
+    pass
+
 from handcommand import HandCommand, HandCfg
 from web_dashboard import WebDashboard
 
 
-# ===== face UDP (giống face3d) =====
+# ===== face UDP =====
 FACE_HOST = "127.0.0.1"
 FACE_PORT = 39393
 _face_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -34,16 +54,13 @@ SNAPSHOT_PATH = os.environ.get("SNAPSHOT_PATH", "/tmp/gesture_latest.jpg")
 SNAPSHOT_JPEG_QUALITY = int(os.environ.get("SNAPSHOT_JPEG_QUALITY", "80"))
 SNAPSHOT_INTERVAL_SEC = float(os.environ.get("SNAPSHOT_INTERVAL_SEC", "5.0"))
 
-# Gesture internal ring/cooldown
 GESTURE_COOLDOWN_SEC = float(os.environ.get("GESTURE_COOLDOWN_SEC", "0.35"))
 GESTURE_RING_MAX = int(os.environ.get("GESTURE_RING_MAX", "80"))
 
-# Any gesture -> STOPMUSIC internal event
 ALWAYS_STOPMUSIC_ON_ANY_GESTURE = os.environ.get("ALWAYS_STOPMUSIC_ON_ANY_GESTURE", "1").strip() == "1"
 
 
 def _write_snapshot_atomic(frame_bgr, out_path: str, quality: int = 80):
-    """Ghi JPEG atomic để process khác đọc không bị file hỏng."""
     try:
         ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
         if not ok:
@@ -57,17 +74,23 @@ def _write_snapshot_atomic(frame_bgr, out_path: str, quality: int = 80):
 
 
 # =========================
-# Shared Camera
+# Shared Camera (V4L2 + MJPG)
 # =========================
 class Camera:
     def __init__(self, dev="/dev/video0", w=640, h=480, fps=30,
                  snapshot_path: str = SNAPSHOT_PATH,
                  snapshot_interval_sec: float = SNAPSHOT_INTERVAL_SEC,
                  snapshot_quality: int = SNAPSHOT_JPEG_QUALITY):
-        self.cap = cv2.VideoCapture(dev)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-        self.cap.set(cv2.CAP_PROP_FPS, fps)
+
+        self.cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
+        try:
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        except Exception:
+            pass
+
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(w))
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(h))
+        self.cap.set(cv2.CAP_PROP_FPS, int(fps))
 
         self.last = None
         self.ts = 0.0
@@ -88,15 +111,12 @@ class Camera:
         if not ok:
             return None
         now = time.time()
-
         with self._lock:
             self.last = frame
             self.ts = now
-
             if (now - self._last_snapshot_ts) >= self.snapshot_interval_sec:
                 self._last_snapshot_ts = now
                 _write_snapshot_atomic(self.last, self.snapshot_path, quality=self.snapshot_quality)
-
         return frame
 
     def get_frame(self):
@@ -112,8 +132,7 @@ class Camera:
 
 
 # ============================================================
-# OBSTACLE by COLOR CONSISTENCY (2s) + FULL-HEIGHT STRIPE
-# + HORIZONTAL BAR (almost full width) -> obstacle too
+# OBSTACLE detector (giữ bản bạn đang dùng)
 # ============================================================
 class ColorStripeObstacleDetector:
     def __init__(self,
@@ -121,58 +140,38 @@ class ColorStripeObstacleDetector:
                  window_sec: float = 2.0,
                  roi_y1_ratio: float = 0.10,
                  roi_y2_ratio: float = 0.96,
-
-                 # vertical stripe width limits
                  min_vstripe_width_ratio: float = 0.08,
                  max_vstripe_width_ratio: float = 0.70,
-
-                 # horizontal bar thickness limits (as ratio of height ROI)
                  min_hbar_height_ratio: float = 0.06,
                  max_hbar_height_ratio: float = 0.35,
-
-                 # thresholds for "uniform"
                  col_std_v_thr: float = 18.0,
                  col_edge_thr: float = 0.040,
-
                  row_std_v_thr: float = 16.0,
                  row_edge_thr: float = 0.045,
-
-                 # stable within window
                  stable_mean_delta_thr: float = 10.0,
                  min_good_ratio_in_window: float = 0.65,
-
-                 # full-width horizontal bar rule
                  hbar_min_width_ratio: float = 0.86,
                  neighbor_mean_delta_thr: float = 8.0
                  ):
         self.interval = float(decision_interval_sec)
         self.window_sec = float(window_sec)
-
         self.ry1 = float(roi_y1_ratio)
         self.ry2 = float(roi_y2_ratio)
-
         self.min_vw = float(min_vstripe_width_ratio)
         self.max_vw = float(max_vstripe_width_ratio)
-
         self.min_hh = float(min_hbar_height_ratio)
         self.max_hh = float(max_hbar_height_ratio)
-
         self.col_std_v_thr = float(col_std_v_thr)
         self.col_edge_thr = float(col_edge_thr)
-
         self.row_std_v_thr = float(row_std_v_thr)
         self.row_edge_thr = float(row_edge_thr)
-
         self.stable_mean_delta_thr = float(stable_mean_delta_thr)
         self.min_good_ratio_in_window = float(min_good_ratio_in_window)
-
         self.hbar_min_width_ratio = float(hbar_min_width_ratio)
         self.neighbor_mean_delta_thr = float(neighbor_mean_delta_thr)
 
         self._lock = threading.Lock()
         self._last_run = 0.0
-
-        # item: (ts, ok, orientation, x1,x2,y1,y2, meanV)
         self._hist: deque = deque(maxlen=250)
 
         self._label = "no obstacle"
@@ -391,19 +390,11 @@ class ColorStripeObstacleDetector:
         if hok and hrun:
             hy1, hy2 = hrun[0], hrun[1]
 
-        if vok:
-            self._hist.append((now, True, "VERTICAL", vx1, vx2, ry1, ry2, vmean))
-        else:
-            self._hist.append((now, False, "VERTICAL", -1, -1, ry1, ry2, 0.0))
-
-        if hok:
-            self._hist.append((now, True, "HORIZONTAL", 0, W, ry1 + hy1, ry1 + hy2, hmean))
-        else:
-            self._hist.append((now, False, "HORIZONTAL", -1, -1, -1, -1, 0.0))
+        self._hist.append((now, bool(vok), "VERTICAL", vx1 if vok else -1, vx2 if vok else -1, ry1, ry2, vmean if vok else 0.0))
+        self._hist.append((now, bool(hok), "HORIZONTAL", 0 if hok else -1, W if hok else -1, (ry1+hy1) if hok else -1, (ry1+hy2) if hok else -1, hmean if hok else 0.0))
 
         tmin = now - self.window_sec
         items = [it for it in list(self._hist) if it[0] >= tmin]
-
         v_items = [it for it in items if it[2] == "VERTICAL"]
         h_items = [it for it in items if it[2] == "HORIZONTAL"]
 
@@ -458,41 +449,27 @@ class ColorStripeObstacleDetector:
 
     def get_state(self) -> Dict[str, Any]:
         with self._lock:
-            return {
-                "label": self._label,
-                "zone": self._zone,
-                "orientation": self._orientation,
-                "ts": self._ts,
-                "shape": self._shape
-            }
+            return {"label": self._label, "zone": self._zone, "orientation": self._orientation, "ts": self._ts, "shape": self._shape}
 
     def draw_overlay(self, frame_bgr: np.ndarray) -> np.ndarray:
         st = self.get_state()
         out = frame_bgr.copy()
-
         if st.get("label") != "yes have obstacle":
             return out
-
         shp = st.get("shape")
         if not isinstance(shp, dict):
             return out
-
-        x1 = int(shp.get("x1", 0))
-        x2 = int(shp.get("x2", 0))
-        y1 = int(shp.get("y1", 0))
-        y2 = int(shp.get("y2", 0))
-
+        x1 = int(shp.get("x1", 0)); x2 = int(shp.get("x2", 0))
+        y1 = int(shp.get("y1", 0)); y2 = int(shp.get("y2", 0))
         x1 = max(0, min(out.shape[1]-1, x1))
         x2 = max(0, min(out.shape[1], x2))
         y1 = max(0, min(out.shape[0]-1, y1))
         y2 = max(0, min(out.shape[0], y2))
-
         if x2 > x1 and y2 > y1:
             overlay = out.copy()
             cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), -1)
             out = cv2.addWeighted(overlay, 0.18, out, 0.82, 0)
             cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
         return out
 
 
@@ -516,20 +493,15 @@ def _push_gesture(label: str, face: str = "", raw: str = ""):
 
 
 # =========================
-# Hand overlay (CODE CŨ style)
+# Hand overlay (đúng kiểu cũ: draw_on_frame)
 # =========================
 def _hand_enabled(hc: HandCommand) -> bool:
-    if hc is None:
-        return False
-    # ưu tiên đọc status
     try:
-        if hasattr(hc, "get_status"):
-            st = hc.get_status()
-            if isinstance(st, dict) and "enabled" in st:
-                return bool(st.get("enabled", False))
+        st = hc.get_status() if hasattr(hc, "get_status") else {}
+        if isinstance(st, dict) and "enabled" in st:
+            return bool(st.get("enabled", False))
     except Exception:
         pass
-    # fallback attr
     for attr in ("enabled", "is_enabled", "_enabled"):
         if hasattr(hc, attr):
             try:
@@ -541,41 +513,10 @@ def _hand_enabled(hc: HandCommand) -> bool:
     return True
 
 
-def _try_hand_draw_fallback(hc: HandCommand, frame_bgr: np.ndarray) -> np.ndarray:
-    """
-    Fallback nếu HandCommand không có draw_on_frame hoặc bị lỗi.
-    """
-    out = frame_bgr
-    try:
-        st = hc.get_status() if hasattr(hc, "get_status") else {}
-        if isinstance(st, dict):
-            en = st.get("enabled", False)
-            act = st.get("action", None)
-            fps = st.get("fps", None)
-            fc = st.get("finger_count", None)
-
-            if isinstance(fps, (int, float)):
-                txt = f"HAND: {'ON' if en else 'OFF'}  {act if act else 'NA'}  fingers:{fc if fc is not None else 'NA'}  ({fps:.1f}fps)"
-            else:
-                txt = f"HAND: {'ON' if en else 'OFF'}  {act if act else 'NA'}  fingers:{fc if fc is not None else 'NA'}"
-
-            cv2.putText(out, txt, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 255), 2)
-    except Exception:
-        pass
-    return out
-
-
-def _draw_hand_like_old_code(hc: HandCommand, frame_bgr: np.ndarray) -> np.ndarray:
-    """
-    ✅ Đây là phần bạn yêu cầu: lấy "flow mới" nhưng restore code cũ vẽ hand:
-    if enabled: frame = hc.draw_on_frame(frame)
-    """
-    if hc is None:
-        return frame_bgr
-    if not _hand_enabled(hc):
+def _draw_hand_old_style(hc: HandCommand, frame_bgr: np.ndarray) -> np.ndarray:
+    if hc is None or not _hand_enabled(hc):
         return frame_bgr
 
-    # cốt lõi kiểu cũ
     if hasattr(hc, "draw_on_frame"):
         try:
             out = hc.draw_on_frame(frame_bgr)
@@ -584,75 +525,52 @@ def _draw_hand_like_old_code(hc: HandCommand, frame_bgr: np.ndarray) -> np.ndarr
         except Exception:
             pass
 
-    # fallback: thử một vài method khác nếu bạn đặt tên khác
-    for meth in ("draw_on_frame_bgr", "draw_debug", "annotate", "draw_overlay", "render_debug"):
-        if hasattr(hc, meth):
-            fn = getattr(hc, meth)
-            try:
-                out = fn(frame_bgr)
-                if isinstance(out, np.ndarray) and out.shape[:2] == frame_bgr.shape[:2]:
-                    return out
-            except Exception:
-                pass
+    # fallback text
+    out = frame_bgr
+    try:
+        st = hc.get_status() if hasattr(hc, "get_status") else {}
+        if isinstance(st, dict):
+            en = st.get("enabled", False)
+            act = st.get("action", None)
+            fps = st.get("fps", None)
+            fc = st.get("finger_count", None)
+            if isinstance(fps, (int, float)):
+                txt = f"HAND: {'ON' if en else 'OFF'}  {act if act else 'NA'}  fingers:{fc if fc is not None else 'NA'}  ({fps:.1f}fps)"
+            else:
+                txt = f"HAND: {'ON' if en else 'OFF'}  {act if act else 'NA'}  fingers:{fc if fc is not None else 'NA'}"
+            cv2.putText(out, txt, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 255), 2)
+    except Exception:
+        pass
 
-    return _try_hand_draw_fallback(hc, frame_bgr)
+    return out
 
 
-# =========================
-# Main
-# =========================
+def _route_exists(app, rule: str) -> bool:
+    try:
+        for r in app.url_map.iter_rules():
+            if str(r.rule) == str(rule):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def main():
     cam = Camera(dev="/dev/video0", w=640, h=480, fps=30,
                  snapshot_path=SNAPSHOT_PATH,
                  snapshot_interval_sec=SNAPSHOT_INTERVAL_SEC,
                  snapshot_quality=SNAPSHOT_JPEG_QUALITY)
 
-    detector = ColorStripeObstacleDetector(
-        decision_interval_sec=0.10,
-        window_sec=2.0,
-        roi_y1_ratio=0.10,
-        roi_y2_ratio=0.96,
+    detector = ColorStripeObstacleDetector()
 
-        min_vstripe_width_ratio=0.08,
-        max_vstripe_width_ratio=0.70,
-
-        min_hbar_height_ratio=0.06,
-        max_hbar_height_ratio=0.35,
-
-        col_std_v_thr=18.0,
-        col_edge_thr=0.040,
-
-        row_std_v_thr=16.0,
-        row_edge_thr=0.045,
-
-        stable_mean_delta_thr=10.0,
-        min_good_ratio_in_window=0.65,
-
-        hbar_min_width_ratio=0.86,
-        neighbor_mean_delta_thr=8.0
-    )
-
-    # =========================
-    # FIX remap labels:
-    # UP -> SIT
-    # SIT -> STANDUP
-    # =========================
-    ACTION_REMAP = {
-        "UP": "SIT",
-        "SIT": "STANDUP",
-    }
+    ACTION_REMAP = {"UP": "SIT", "SIT": "STANDUP"}
 
     def on_action(action: str, face: str, bark: bool):
         raw = (action or "").strip().upper()
         if not raw:
             return
-
         mapped = ACTION_REMAP.get(raw, raw)
-
-        if mapped != raw:
-            print(f"[GEST] raw={raw} -> mapped={mapped}", flush=True)
-        else:
-            print(f"[GEST] {mapped}", flush=True)
+        print(f"[GEST] raw={raw} -> {mapped}" if mapped != raw else f"[GEST] {mapped}", flush=True)
 
         if face:
             set_face(face)
@@ -662,16 +580,13 @@ def main():
         if ALWAYS_STOPMUSIC_ON_ANY_GESTURE:
             _push_gesture("STOPMUSIC", face=face or "", raw=f"auto_from_{mapped}")
 
-    def get_frame_raw():
-        return cam.get_frame()
-
+    # ✅ shared camera: HandCommand KHÔNG mở camera nữa
     hc = HandCommand(
         cfg=HandCfg(
-            cam_dev="/dev/video0",
+            cam_dev="",  # ✅ tránh mở camera lần 2
             w=640, h=480, fps=30,
             process_every=2,
             action_cooldown_sec=0.7,
-
             pos_left_x=0.18,
             pos_right_x=0.82,
             pos_up_y=0.22,
@@ -680,7 +595,7 @@ def main():
         ),
         on_action=on_action,
         boot_helper=None,
-        get_frame_bgr=get_frame_raw,
+        get_frame_bgr=cam.get_frame,
         open_own_camera=False,
         clear_memory_on_start=True
     )
@@ -692,12 +607,9 @@ def main():
         frame = cam.get_frame()
         if frame is None:
             return None
-
         detector.compute(frame)
         out = detector.draw_overlay(frame)
-
-        # ✅ restore hand overlay đúng kiểu cũ
-        out = _draw_hand_like_old_code(hc, out)
+        out = _draw_hand_old_style(hc, out)
         return out
 
     dash = WebDashboard(
@@ -710,49 +622,39 @@ def main():
         hand_command=hc,
     )
 
-    # =========================
-    # ADD API ROUTES into same PORT 8000
-    # =========================
-    app = dash.app  # Flask instance from WebDashboard
+    app = dash.app
 
-    @app.get("/take_gesture_meaning")
-    def take_gesture_meaning():
-        """
-        Return latest gesture label + recent events.
-        Query:
-          - since_ts: float (optional)
-          - limit: int (optional)
-        """
-        from flask import jsonify, request
+    # ✅ chỉ add route nếu chưa tồn tại (tránh overwrite -> ABRT)
+    if not _route_exists(app, "/take_gesture_meaning"):
+        @app.get("/take_gesture_meaning")
+        def take_gesture_meaning():
+            from flask import jsonify, request
+            since_ts = request.args.get("since_ts", None)
+            limit = request.args.get("limit", None)
+            try:
+                since_ts_f = float(since_ts) if since_ts is not None else None
+            except Exception:
+                since_ts_f = None
+            try:
+                limit_n = int(limit) if limit is not None else 20
+            except Exception:
+                limit_n = 20
 
-        since_ts = request.args.get("since_ts", None)
-        limit = request.args.get("limit", None)
+            with gesture_lock:
+                latest = dict(gesture_latest)
+                events = list(gesture_ring)
 
-        try:
-            since_ts_f = float(since_ts) if since_ts is not None else None
-        except Exception:
-            since_ts_f = None
+            if since_ts_f is not None:
+                events = [e for e in events if float(e.get("ts", 0.0)) > since_ts_f]
+            events = events[-max(1, min(200, limit_n)):]
+            return jsonify({"ok": True, "latest": latest, "events": events})
 
-        try:
-            limit_n = int(limit) if limit is not None else 20
-        except Exception:
-            limit_n = 20
-
-        with gesture_lock:
-            latest = dict(gesture_latest)
-            events = list(gesture_ring)
-
-        if since_ts_f is not None:
-            events = [e for e in events if float(e.get("ts", 0.0)) > since_ts_f]
-
-        events = events[-max(1, min(200, limit_n)):]
-        return jsonify({"ok": True, "latest": latest, "events": events})
-
-    @app.get("/take_camera_decision")
-    def take_camera_decision():
-        from flask import jsonify
-        st = detector.get_state()
-        return jsonify({"ok": True, **st})
+    if not _route_exists(app, "/take_camera_decision"):
+        @app.get("/take_camera_decision")
+        def take_camera_decision():
+            from flask import jsonify
+            st = detector.get_state()
+            return jsonify({"ok": True, **st})
 
     print("\n=== Gesture Service + WebDashboard (SINGLE PORT 8000) ===", flush=True)
     print("WebDashboard: http://<pi_ip>:8000", flush=True)
