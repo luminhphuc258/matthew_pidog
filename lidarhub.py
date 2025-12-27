@@ -32,7 +32,7 @@ THROTTLE_MS = int(os.environ.get("THROTTLE_MS", "250"))
 THROTTLE_S = THROTTLE_MS / 1000.0
 
 # Decision thresholds (meters)
-STOP_NEAR_M = float(os.environ.get("STOP_NEAR_M", "0.30"))     # quá gần -> phải STOP ngay
+STOP_NEAR_M = float(os.environ.get("STOP_NEAR_M", "0.30"))     # quá gần -> STOP ngay
 PREDICT_T_SEC = float(os.environ.get("PREDICT_T_SEC", "1.0"))
 ROBOT_SPEED_MPS = float(os.environ.get("ROBOT_SPEED_MPS", "0.35"))
 SAFETY_MARGIN_M = float(os.environ.get("SAFETY_MARGIN_M", "0.10"))
@@ -40,14 +40,14 @@ SAFETY_MARGIN_M = float(os.environ.get("SAFETY_MARGIN_M", "0.10"))
 # Angle calibration
 FRONT_CENTER_DEG = float(os.environ.get("FRONT_CENTER_DEG", "0.0"))
 
-# Sector widths (deg) for debug distances
+# Sector widths (deg)
 FRONT_WIDTH_DEG = float(os.environ.get("FRONT_WIDTH_DEG", "30.0"))
 WIDE_WIDTH_DEG  = float(os.environ.get("WIDE_WIDTH_DEG", "70.0"))
 
 # ===== Corridor / gap check =====
-ROBOT_WIDTH_M = float(os.environ.get("ROBOT_WIDTH_M", "0.15"))          # robot ngang 15cm
-CLEARANCE_MARGIN_M = float(os.environ.get("CLEARANCE_MARGIN_M", "0.03"))# margin mỗi bên (3cm)
-LOOKAHEAD_M = float(os.environ.get("LOOKAHEAD_M", "1.20"))              # xét chướng ngại trong 1.2m phía trước
+ROBOT_WIDTH_M = float(os.environ.get("ROBOT_WIDTH_M", "0.15"))           # robot ngang 15cm
+CLEARANCE_MARGIN_M = float(os.environ.get("CLEARANCE_MARGIN_M", "0.03")) # margin mỗi bên
+LOOKAHEAD_M = float(os.environ.get("LOOKAHEAD_M", "1.20"))               # xét trong 1.2m phía trước
 
 # Candidate steering angles (relative to FRONT). Positive = turn LEFT.
 CAND_STEP_DEG = float(os.environ.get("CAND_STEP_DEG", "10.0"))
@@ -61,7 +61,7 @@ TURN_HOLD_SEC = float(os.environ.get("TURN_HOLD_SEC", "1.10"))
 BACK_HOLD_SEC = float(os.environ.get("BACK_HOLD_SEC", "0.45"))
 BACK_COOLDOWN_SEC = float(os.environ.get("BACK_COOLDOWN_SEC", "2.5"))
 
-# ultra_simple output sample:
+# ultra_simple output:
 # theta: 353.17 Dist: 02277.00 Q: 47
 LINE_RE = re.compile(r"theta:\s*([0-9.]+)\s+Dist:\s*([0-9.]+)\s+Q:\s*(\d+)")
 
@@ -72,7 +72,7 @@ app = Flask(__name__)
 
 lock = threading.Lock()
 
-# Each point: (theta_deg, dist_m, q, x_m, y_m, ts)  [x,y theo frame gốc của lidar]
+# Each point: (theta_deg, dist_m, q, x_m, y_m, ts)
 latest_points: List[Tuple[float, float, int, float, float, float]] = []
 latest_ts: float = 0.0
 
@@ -97,12 +97,16 @@ decision_state_lock = threading.Lock()
 latest_decision_label: str = "STOP"
 latest_decision_full: Dict[str, Any] = {"ok": False, "label": "STOP", "reason": "init", "ts": 0.0}
 
-# ===== Internal behavior memory (decision worker) =====
-behavior_lock = threading.Lock()
-_behavior_mode: str = "NORMAL"          # NORMAL / AVOID_STOP / AVOID_TURN / BACK
-_behavior_until: float = 0.0
-_behavior_next_label: str = "STOP"
+# ===== STOP -> TURN chain state =====
+_stop_turn_lock = threading.Lock()
+_stop_turn_label: str = ""     # TURN_LEFT / TURN_RIGHT
+_stop_turn_start: float = 0.0  # when to begin turning
+_stop_turn_end: float = 0.0    # when to stop turning
+
+# ===== BACK cooldown =====
+_behavior_lock = threading.Lock()
 _last_back_ts: float = 0.0
+_back_until: float = 0.0
 
 # =======================
 # Helpers
@@ -215,14 +219,12 @@ def _min_dist_in_sector(
     now = time.time()
     half = width_deg / 2.0
     best = float("inf")
-
     for (theta, dist_m, q, x, y, ts) in points:
         if now - ts > recent_sec:
             continue
         if _ang_dist_deg(theta, center_deg) <= half:
             if dist_m < best:
                 best = dist_m
-
     return best
 
 def _front_frame_xy(dist_m: float, theta_deg: float, front_center_deg: float, heading_rel_deg: float) -> Tuple[float, float]:
@@ -260,6 +262,7 @@ def _corridor_clearance(
             continue
         if dist_m <= 0.0:
             continue
+
         x, y = _front_frame_xy(dist_m, theta, front_center_deg, heading_rel_deg)
         if y <= 0:
             continue
@@ -272,10 +275,6 @@ def _corridor_clearance(
     return best_y
 
 def _pick_best_heading_by_corridor(pts: List[Tuple[float, float, int, float, float, float]]) -> Dict[str, Any]:
-    """
-    Pick heading angle that has the best corridor clearance while ensuring
-    the corridor is wide enough for robot width (handled by corridor_half_w).
-    """
     corridor_half_w = (ROBOT_WIDTH_M / 2.0) + CLEARANCE_MARGIN_M
     max_deg = float(CAND_MAX_DEG)
     step = float(CAND_STEP_DEG)
@@ -287,48 +286,85 @@ def _pick_best_heading_by_corridor(pts: List[Tuple[float, float, int, float, flo
         a += step
 
     clear0 = _corridor_clearance(pts, FRONT_CENTER_DEG, 0.0, corridor_half_w, LOOKAHEAD_M)
-    best = {"heading_deg": 0.0, "clearance_m": clear0}
-
-    # Prefer straighter slightly by penalty
+    best_heading = 0.0
+    best_clear = clear0
     best_score = (min(clear0, LOOKAHEAD_M) - 0.001 * abs(0.0))
 
     detail = []
     for h in candidates:
         c = _corridor_clearance(pts, FRONT_CENTER_DEG, h, corridor_half_w, LOOKAHEAD_M)
         c_cap = min(c, LOOKAHEAD_M)
-        score = c_cap - 0.001 * abs(h)  # tiny penalty for big turn
+        score = c_cap - 0.001 * abs(h)
         detail.append({"heading_deg": h, "clearance_m": c})
         if score > best_score:
             best_score = score
-            best = {"heading_deg": h, "clearance_m": c}
+            best_heading = h
+            best_clear = c
 
     return {
         "corridor_half_w_m": corridor_half_w,
         "lookahead_m": LOOKAHEAD_M,
-        "best_heading_deg": float(best["heading_deg"]),
-        "best_clearance_m": float(best["clearance_m"]),
+        "best_heading_deg": float(best_heading),
+        "best_clearance_m": float(best_clear),
         "clear0_m": float(clear0),
-        "candidates": detail[:],  # for debug in /api/decision
+        "candidates": detail,
     }
 
+def _arm_stop_then_turn(now: float, turn_label: str):
+    """Schedule TURN after STOP_HOLD_SEC."""
+    global _stop_turn_label, _stop_turn_start, _stop_turn_end
+    with _stop_turn_lock:
+        _stop_turn_label = turn_label
+        _stop_turn_start = now + STOP_HOLD_SEC
+        _stop_turn_end   = _stop_turn_start + TURN_HOLD_SEC
+
+def _check_stop_then_turn(now: float) -> Optional[str]:
+    """Return TURN label if we are in the TURN window."""
+    global _stop_turn_label, _stop_turn_start, _stop_turn_end
+    with _stop_turn_lock:
+        if not _stop_turn_label:
+            return None
+        if now < _stop_turn_start:
+            return None
+        if now <= _stop_turn_end:
+            return _stop_turn_label
+        # expired -> clear
+        _stop_turn_label = ""
+        _stop_turn_start = 0.0
+        _stop_turn_end = 0.0
+        return None
+
+def _clear_stop_then_turn():
+    global _stop_turn_label, _stop_turn_start, _stop_turn_end
+    with _stop_turn_lock:
+        _stop_turn_label = ""
+        _stop_turn_start = 0.0
+        _stop_turn_end = 0.0
+
 # =======================
-# Decision (stop -> turn -> go)
+# Decision
 # =======================
 def _compute_decision_snapshot() -> Dict[str, Any]:
+    global _last_back_ts, _back_until
+
     with lock:
         pts = list(latest_points)
         last_ts = latest_ts
 
     now = time.time()
     if not pts or (now - last_ts) > 2.0:
-        with behavior_lock:
-            global _behavior_mode, _behavior_until, _behavior_next_label
-            _behavior_mode = "NORMAL"
-            _behavior_until = 0.0
-            _behavior_next_label = "STOP"
+        _clear_stop_then_turn()
         return {"ok": False, "label": "STOP", "reason": "no_recent_lidar", "ts": now}
 
-    # Debug sector distances (like before)
+    corridor_info = _pick_best_heading_by_corridor(pts)
+    clear0 = float(corridor_info["clear0_m"])
+    best_h = float(corridor_info["best_heading_deg"])
+    best_clear = float(corridor_info["best_clearance_m"])
+
+    predict_dist = (ROBOT_SPEED_MPS * PREDICT_T_SEC) + SAFETY_MARGIN_M
+    block_th = max(STOP_NEAR_M, predict_dist)
+
+    # Debug distances
     front = _wrap_deg(FRONT_CENTER_DEG)
     left  = _wrap_deg(front + 90.0)
     right = _wrap_deg(front - 90.0)
@@ -343,9 +379,6 @@ def _compute_decision_snapshot() -> Dict[str, Any]:
     d_back_wide    = _min_dist_in_sector(pts, back,  WIDE_WIDTH_DEG)
     d_diag_l       = _min_dist_in_sector(pts, diag_l, 35.0)
     d_diag_r       = _min_dist_in_sector(pts, diag_r, 35.0)
-
-    predict_dist = (ROBOT_SPEED_MPS * PREDICT_T_SEC) + SAFETY_MARGIN_M
-    block_th = max(STOP_NEAR_M, predict_dist)
 
     dist_pack = {
         "front_narrow": d_front_narrow,
@@ -372,31 +405,39 @@ def _compute_decision_snapshot() -> Dict[str, Any]:
         "back_cooldown_sec": BACK_COOLDOWN_SEC,
     }
 
-    # ===== Behavior phase handling (STOP then TURN) =====
-    with behavior_lock:
-        global _behavior_mode, _behavior_until, _behavior_next_label, _last_back_ts
-        if _behavior_mode in ("AVOID_STOP", "AVOID_TURN", "BACK") and now < _behavior_until:
+    # 0) If we're in BACK hold window, keep backing
+    with _behavior_lock:
+        if now < _back_until:
             return {
                 "ok": True,
-                "label": _behavior_next_label,
-                "reason": f"phase:{_behavior_mode}",
+                "label": "GO_BACK",
+                "reason": "phase:BACK_HOLD",
                 "ts": now,
                 "dist": dist_pack,
                 "threshold": thresh_pack,
+                "corridor": corridor_info,
             }
+
+    # 1) STOP->TURN chain: if in TURN window, return turn label
+    turn_lbl = _check_stop_then_turn(now)
+    if turn_lbl:
+        # if suddenly front becomes super clear, cancel turning
+        if clear0 > block_th * 1.25:
+            _clear_stop_then_turn()
         else:
-            _behavior_mode = "NORMAL"
-            _behavior_until = 0.0
-            _behavior_next_label = "STOP"
+            return {
+                "ok": True,
+                "label": turn_lbl,
+                "reason": "stop_then_turn:TURN",
+                "ts": now,
+                "dist": dist_pack,
+                "threshold": thresh_pack,
+                "corridor": corridor_info,
+            }
 
-    # ===== Corridor-based best heading (gap check by robot width) =====
-    corridor_info = _pick_best_heading_by_corridor(pts)
-    clear0 = corridor_info["clear0_m"]
-    best_h = corridor_info["best_heading_deg"]
-    best_clear = corridor_info["best_clearance_m"]
-
-    # If front is clearly safe -> go straight
+    # 2) If front corridor is clearly safe => GO_STRAIGHT
     if clear0 > block_th * 1.10:
+        _clear_stop_then_turn()
         return {
             "ok": True,
             "label": "GO_STRAIGHT",
@@ -407,244 +448,23 @@ def _compute_decision_snapshot() -> Dict[str, Any]:
             "corridor": corridor_info,
         }
 
-    # If obstacle is VERY near -> STOP then TURN (not BACK spam)
-    if clear0 <= STOP_NEAR_M:
-        # decide turn direction from best heading (excluding near-zero)
-        if abs(best_h) < 1e-6:
-            # fallback: pick side by sector distances
-            if d_left_wide >= d_right_wide:
-                turn_lbl = "TURN_LEFT"
-            else:
-                turn_lbl = "TURN_RIGHT"
-        else:
-            turn_lbl = "TURN_LEFT" if best_h > 0 else "TURN_RIGHT"
-
-        # if best corridor is also bad (no pass), then consider BACK but with cooldown
-        boxed_side = (max(d_left_wide, d_diag_l) <= block_th) and (max(d_right_wide, d_diag_r) <= block_th)
-        back_ok = d_back_wide > block_th
-
-        with behavior_lock:
-            if boxed_side and back_ok and (now - _last_back_ts) >= BACK_COOLDOWN_SEC:
-                _behavior_mode = "BACK"
-                _behavior_next_label = "GO_BACK"
-                _behavior_until = now + BACK_HOLD_SEC
-                _last_back_ts = now
-                return {
-                    "ok": True,
-                    "label": "GO_BACK",
-                    "reason": "very_near_boxed_back_once",
-                    "ts": now,
-                    "dist": dist_pack,
-                    "threshold": thresh_pack,
-                    "corridor": corridor_info,
-                }
-
-            # Normal desired: STOP hold -> TURN hold
-            _behavior_mode = "AVOID_STOP"
-            _behavior_next_label = "STOP"
-            _behavior_until = now + STOP_HOLD_SEC
-
-            # schedule next turn phase by chaining: after STOP_HOLD_SEC, decision_worker will run again,
-            # but we want it to go TURN for TURN_HOLD_SEC; easiest: set a short timer marker here:
-            # We'll use a trick: store next label in behavior vars after STOP completes.
-            # Do it by setting another mode quickly on next cycle: if NORMAL triggers again with still blocked,
-            # it will create STOP again. To avoid that, we set "AVOID_TURN" immediately after STOP ends:
-            # We'll store an extra "pending turn" in _behavior_next_label? simplest: encode "AVOID_STOP" now,
-            # and also save a global to apply next phase. We'll do this by overwriting mode when STOP phase ends
-            # inside next decision computation. But that needs more state. Instead, do 2-step in one shot:
-            pass
-
-        # Implementation: use two-step state with one extra global variable (reuse _behavior_next_label)
-        # We'll set mode=AVOID_STOP now. When the phase expires, we will re-enter NORMAL and recompute,
-        # but to ensure we TURN immediately after STOP, we can stash "turn_lbl" into a temp global and
-        # use a short "turn_if_still_blocked" check at the top. We'll implement via globals below.
-
-    # If front blocked but not super near -> choose best corridor heading and TURN
-    # Determine if best corridor is actually passable
-    passable = (best_clear > block_th)
-
-    if passable and abs(best_h) <= 12.0:
-        # small steering -> just go straight (autopilot will keep moving and re-check)
-        return {
-            "ok": True,
-            "label": "GO_STRAIGHT",
-            "reason": "best_heading_small_keep_forward",
-            "ts": now,
-            "dist": dist_pack,
-            "threshold": thresh_pack,
-            "corridor": corridor_info,
-        }
-
-    if passable:
-        label = "TURN_LEFT" if best_h > 0 else "TURN_RIGHT"
-        with behavior_lock:
-            _behavior_mode = "AVOID_TURN"
-            _behavior_next_label = label
-            _behavior_until = now + TURN_HOLD_SEC
-        return {
-            "ok": True,
-            "label": label,
-            "reason": "front_blocked_turn_to_best_corridor",
-            "ts": now,
-            "dist": dist_pack,
-            "threshold": thresh_pack,
-            "corridor": corridor_info,
-        }
-
-    # No passable corridor: STOP (only consider back if boxed & cooldown ok)
-    boxed = (max(d_left_wide, d_diag_l) <= block_th) and (max(d_right_wide, d_diag_r) <= block_th)
+    # Helpers for boxed/back logic
+    boxed_side = (max(d_left_wide, d_diag_l) <= block_th) and (max(d_right_wide, d_diag_r) <= block_th)
     back_ok = d_back_wide > block_th
 
-    if boxed and back_ok:
-        with behavior_lock:
-            if (now - _last_back_ts) >= BACK_COOLDOWN_SEC:
-                _behavior_mode = "BACK"
-                _behavior_next_label = "GO_BACK"
-                _behavior_until = now + BACK_HOLD_SEC
-                _last_back_ts = now
-                return {
-                    "ok": True,
-                    "label": "GO_BACK",
-                    "reason": "boxed_in_back_with_cooldown",
-                    "ts": now,
-                    "dist": dist_pack,
-                    "threshold": thresh_pack,
-                    "corridor": corridor_info,
-                }
-
-    return {
-        "ok": True,
-        "label": "STOP",
-        "reason": "no_passable_corridor",
-        "ts": now,
-        "dist": dist_pack,
-        "threshold": thresh_pack,
-        "corridor": corridor_info,
-    }
-
-# ===== Patch: stop-then-turn chain state (minimal changes) =====
-# We'll implement by adding 2 globals:
-_stop_then_turn_lock = threading.Lock()
-_stop_then_turn_until = 0.0
-_stop_then_turn_label = ""
-
-def _maybe_apply_stop_then_turn(now: float, clear0_m: float, block_th_m: float, best_heading_deg: float,
-                               d_left: float, d_right: float) -> Optional[Tuple[str, str, float]]:
-    """
-    If we are within "stop-then-turn" chain, return label/reason/until.
-    else return None
-    """
-    global _stop_then_turn_until, _stop_then_turn_label
-
-    with _stop_then_turn_lock:
-        if _stop_then_turn_label and now < _stop_then_turn_until:
-            return (_stop_then_turn_label, "stop_then_turn:TURN", _stop_then_turn_until)
-        # no active TURN phase
-
-    return None
-
-def _arm_stop_then_turn(now: float, turn_label: str):
-    global _stop_then_turn_until, _stop_then_turn_label
-    with _stop_then_turn_lock:
-        _stop_then_turn_label = turn_label
-        _stop_then_turn_until = now + TURN_HOLD_SEC
-
-# Monkey patch: wrap decision to insert stop->turn properly
-_old_compute = _compute_decision_snapshot
-
-def _compute_decision_snapshot():
-    with lock:
-        pts = list(latest_points)
-        last_ts = latest_ts
-
-    now = time.time()
-    if not pts or (now - last_ts) > 2.0:
-        with behavior_lock:
-            global _behavior_mode, _behavior_until, _behavior_next_label
-            _behavior_mode = "NORMAL"
-            _behavior_until = 0.0
-            _behavior_next_label = "STOP"
-        return {"ok": False, "label": "STOP", "reason": "no_recent_lidar", "ts": now}
-
-    # corridor info needed to decide stop_then_turn
-    corridor_info = _pick_best_heading_by_corridor(pts)
-    clear0 = corridor_info["clear0_m"]
-    best_h = corridor_info["best_heading_deg"]
-    best_clear = corridor_info["best_clearance_m"]
-
-    predict_dist = (ROBOT_SPEED_MPS * PREDICT_T_SEC) + SAFETY_MARGIN_M
-    block_th = max(STOP_NEAR_M, predict_dist)
-
-    # Debug sector distances for returning
-    front = _wrap_deg(FRONT_CENTER_DEG)
-    left  = _wrap_deg(front + 90.0)
-    right = _wrap_deg(front - 90.0)
-    back  = _wrap_deg(front + 180.0)
-    diag_l = _wrap_deg(front + 45.0)
-    diag_r = _wrap_deg(front - 45.0)
-
-    d_front_narrow = _min_dist_in_sector(pts, front, FRONT_WIDTH_DEG)
-    d_front_wide   = _min_dist_in_sector(pts, front, WIDE_WIDTH_DEG)
-    d_left_wide    = _min_dist_in_sector(pts, left,  WIDE_WIDTH_DEG)
-    d_right_wide   = _min_dist_in_sector(pts, right, WIDE_WIDTH_DEG)
-    d_back_wide    = _min_dist_in_sector(pts, back,  WIDE_WIDTH_DEG)
-    d_diag_l       = _min_dist_in_sector(pts, diag_l, 35.0)
-    d_diag_r       = _min_dist_in_sector(pts, diag_r, 35.0)
-
-    dist_pack = {
-        "front_narrow": d_front_narrow,
-        "front_wide": d_front_wide,
-        "left": d_left_wide,
-        "right": d_right_wide,
-        "back": d_back_wide,
-        "diag_left": d_diag_l,
-        "diag_right": d_diag_r,
-    }
-
-    thresh_pack = {
-        "stop_near_m": STOP_NEAR_M,
-        "predict_dist_m": predict_dist,
-        "predict_t_sec": PREDICT_T_SEC,
-        "robot_speed_mps": ROBOT_SPEED_MPS,
-        "safety_margin_m": SAFETY_MARGIN_M,
-        "block_th_m": block_th,
-        "robot_width_m": ROBOT_WIDTH_M,
-        "clearance_margin_m": CLEARANCE_MARGIN_M,
-        "stop_hold_sec": STOP_HOLD_SEC,
-        "turn_hold_sec": TURN_HOLD_SEC,
-        "back_hold_sec": BACK_HOLD_SEC,
-        "back_cooldown_sec": BACK_COOLDOWN_SEC,
-    }
-
-    # 1) if we are in TURN phase after stop, return TURN
-    maybe = _maybe_apply_stop_then_turn(now, clear0, block_th, best_h, d_left_wide, d_right_wide)
-    if maybe:
-        lbl, rs, until = maybe
-        return {
-            "ok": True,
-            "label": lbl,
-            "reason": rs,
-            "ts": now,
-            "dist": dist_pack,
-            "threshold": thresh_pack,
-            "corridor": corridor_info,
-        }
-
-    # 2) if front very near -> STOP, and ARM next TURN
+    # 3) Very near => prefer STOP then TURN (stable, tránh té)
     if clear0 <= STOP_NEAR_M:
         if abs(best_h) < 1e-6:
-            turn_lbl = "TURN_LEFT" if d_left_wide >= d_right_wide else "TURN_RIGHT"
+            next_turn = "TURN_LEFT" if d_left_wide >= d_right_wide else "TURN_RIGHT"
         else:
-            turn_lbl = "TURN_LEFT" if best_h > 0 else "TURN_RIGHT"
+            next_turn = "TURN_LEFT" if best_h > 0 else "TURN_RIGHT"
 
-        boxed_side = (max(d_left_wide, d_diag_l) <= block_th) and (max(d_right_wide, d_diag_r) <= block_th)
-        back_ok = d_back_wide > block_th
-
-        with behavior_lock:
-            global _last_back_ts
+        # only BACK if boxed and cooldown passed
+        with _behavior_lock:
             if boxed_side and back_ok and (now - _last_back_ts) >= BACK_COOLDOWN_SEC:
                 _last_back_ts = now
-                # back short
+                _back_until = now + BACK_HOLD_SEC
+                _clear_stop_then_turn()
                 return {
                     "ok": True,
                     "label": "GO_BACK",
@@ -655,9 +475,8 @@ def _compute_decision_snapshot():
                     "corridor": corridor_info,
                 }
 
-        # arm TURN phase after this STOP
-        _arm_stop_then_turn(now + STOP_HOLD_SEC, turn_lbl)
-
+        # schedule TURN after STOP
+        _arm_stop_then_turn(now, next_turn)
         return {
             "ok": True,
             "label": "STOP",
@@ -668,22 +487,11 @@ def _compute_decision_snapshot():
             "corridor": corridor_info,
         }
 
-    # 3) otherwise use normal corridor choice (turn to best corridor / straight / stop)
-    # best clear indicates if there is a passable corridor (gap wide enough for robot)
-    if clear0 > block_th * 1.10:
-        return {
-            "ok": True,
-            "label": "GO_STRAIGHT",
-            "reason": "front_corridor_clear",
-            "ts": now,
-            "dist": dist_pack,
-            "threshold": thresh_pack,
-            "corridor": corridor_info,
-        }
-
+    # 4) Not very near: if best corridor is passable, turn toward it (or keep forward if small)
     passable = (best_clear > block_th)
     if passable:
         if abs(best_h) <= 12.0:
+            _clear_stop_then_turn()
             return {
                 "ok": True,
                 "label": "GO_STRAIGHT",
@@ -694,6 +502,7 @@ def _compute_decision_snapshot():
                 "corridor": corridor_info,
             }
         lbl = "TURN_LEFT" if best_h > 0 else "TURN_RIGHT"
+        _clear_stop_then_turn()
         return {
             "ok": True,
             "label": lbl,
@@ -704,13 +513,12 @@ def _compute_decision_snapshot():
             "corridor": corridor_info,
         }
 
-    # no passable corridor -> STOP (back only if boxed + cooldown)
-    boxed = (max(d_left_wide, d_diag_l) <= block_th) and (max(d_right_wide, d_diag_r) <= block_th)
-    back_ok = d_back_wide > block_th
-    with behavior_lock:
-        global _last_back_ts
-        if boxed and back_ok and (now - _last_back_ts) >= BACK_COOLDOWN_SEC:
+    # 5) No passable corridor: STOP, but allow BACK with cooldown if boxed
+    with _behavior_lock:
+        if boxed_side and back_ok and (now - _last_back_ts) >= BACK_COOLDOWN_SEC:
             _last_back_ts = now
+            _back_until = now + BACK_HOLD_SEC
+            _clear_stop_then_turn()
             return {
                 "ok": True,
                 "label": "GO_BACK",
@@ -721,6 +529,7 @@ def _compute_decision_snapshot():
                 "corridor": corridor_info,
             }
 
+    _clear_stop_then_turn()
     return {
         "ok": True,
         "label": "STOP",
@@ -746,7 +555,7 @@ def _build_points_payload(limit: int = 1600) -> Dict[str, Any]:
             "theta": theta,
             "dist_m": dist_m,
 
-            # compatibility for your autopilot/map:
+            # compatibility:
             "angle": theta,
             "dist_cm": dist_m * 100.0,
 
@@ -805,6 +614,12 @@ def api_status():
     with decision_state_lock:
         lbl = latest_decision_label
 
+    with _stop_turn_lock:
+        st = {"label": _stop_turn_label, "start": _stop_turn_start, "end": _stop_turn_end}
+
+    with _behavior_lock:
+        bh = {"last_back_ts": _last_back_ts, "back_until": _back_until}
+
     return jsonify({
         "running": status["running"],
         "port": status["port"],
@@ -818,8 +633,10 @@ def api_status():
         "throttle_ms": THROTTLE_MS,
         "latest_label": lbl,
         "robot_width_m": ROBOT_WIDTH_M,
-        "corridor_half_w_m": (ROBOT_WIDTH_M/2.0 + CLEARANCE_MARGIN_M),
+        "corridor_half_w_m": (ROBOT_WIDTH_M / 2.0 + CLEARANCE_MARGIN_M),
         "lookahead_m": LOOKAHEAD_M,
+        "stop_then_turn": st,
+        "back_state": bh,
     })
 
 @app.get("/take_lidar_data")
