@@ -8,7 +8,7 @@ import threading
 import subprocess
 import socket
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, List, Tuple
 
 import requests
 from flask import Flask, jsonify, Response
@@ -22,13 +22,13 @@ POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
 
 # Lidar server (localhost:9399)
 LIDAR_BASE = "http://127.0.0.1:9399"
-URL_LIDAR_STATUS = f"{LIDAR_BASE}/api/status"
+URL_LIDAR_STATUS   = f"{LIDAR_BASE}/api/status"
 URL_LIDAR_DECISION = f"{LIDAR_BASE}/api/decision_label"
-URL_LIDAR_DATA = f"{LIDAR_BASE}/take_lidar_data"
+URL_LIDAR_DATA     = f"{LIDAR_BASE}/take_lidar_data"
 
 # Gesture + camera decision (localhost:8000)
 GEST_BASE = "http://127.0.0.1:8000"
-URL_GESTURE = f"{GEST_BASE}/take_gesture_meaning"
+URL_GESTURE         = f"{GEST_BASE}/take_gesture_meaning"
 URL_CAMERA_DECISION = f"{GEST_BASE}/take_camera_decision"
 
 # Map web
@@ -38,26 +38,13 @@ MAP_PORT = 5000
 LOOP_HZ = 20.0
 HTTP_TIMEOUT = 0.6
 
+# Command refresh (reduce jitter)
+CMD_REFRESH_SEC = 0.35  # resend same cmd at most every 0.35s
+
 # Safety distances (cm)
 SAFE_FORWARD_CM = 65.0
 SAFE_TURN_CM = 45.0
 EMERGENCY_STOP_CM = 18.0
-
-# =========================
-# REST SCHEDULE (as you requested)
-# =========================
-# Random time until next rest: 8..15 minutes
-REST_INTERVAL_MIN_MINUTES = 8
-REST_INTERVAL_MAX_MINUTES = 15
-
-# At rest time: SIT and hold random 9..15 minutes
-REST_HOLD_MIN = 9
-REST_HOLD_MAX = 15
-REST_HOLD_UNIT = "min"  # keep "min" as your latest requirement
-# If you want 9..15 seconds instead, set:
-# REST_HOLD_MIN = 9
-# REST_HOLD_MAX = 15
-# REST_HOLD_UNIT = "sec"
 
 # Gesture TTL
 GESTURE_TTL_SEC = 1.2
@@ -78,15 +65,6 @@ def set_face(emo: str):
 # =========================
 # Utils
 # =========================
-def run(cmd: List[str]):
-    return subprocess.run(cmd, check=False)
-
-def set_volumes():
-    run(["amixer", "-q", "sset", "robot-hat speaker", "100%"])
-    run(["amixer", "-q", "sset", "robot-hat speaker Playback Volume", "100%"])
-    run(["amixer", "-q", "sset", "robot-hat mic", "100%"])
-    run(["amixer", "-q", "sset", "robot-hat mic Capture Volume", "100%"])
-
 def http_get_json(url: str, timeout: float = HTTP_TIMEOUT) -> Optional[dict]:
     try:
         r = requests.get(url, timeout=timeout)
@@ -96,21 +74,12 @@ def http_get_json(url: str, timeout: float = HTTP_TIMEOUT) -> Optional[dict]:
     except Exception:
         return None
 
-def seconds_from_hold_value(v: float) -> float:
-    if REST_HOLD_UNIT == "sec":
-        return float(v)
-    # default minutes
-    return float(v) * 60.0
-
 # =========================
 # Robot Status Manager
 # =========================
 class RobotState:
-    """
-    Lưu trạng thái để theo dõi SIT/...
-    """
     def __init__(self):
-        self.mode = "BOOT"   # BOOT / STAND / SIT / MOVE / TURN / BACK / STOP
+        self.mode = "BOOT"   # BOOT / STAND / MOVE / TURN / BACK / STOP
         self.detail = ""
         self.ts = time.time()
 
@@ -119,21 +88,18 @@ class RobotState:
         self.detail = detail
         self.ts = time.time()
 
-    def is_sitting(self) -> bool:
-        return self.mode == "SIT"
-
     def __repr__(self):
         return f"{self.mode}:{self.detail}" if self.detail else self.mode
 
 # =========================
-# Motion wrapper
+# Motion wrapper (NO pose apply, NO sit)
 # =========================
 class RobotMotion:
     """
-    IMPORTANT RULES (per your request):
-    - boot() does NOT apply pose config outside (MotionController.boot already did)
-    - ONLY do support_stand when transitioning SIT -> STAND
-    - NO pose/stabilize for FORWARD/TURN/BACK
+    Rules:
+    - boot(): do NOT apply pose outside (MotionController.boot already handled)
+    - NO SIT logic at all
+    - We only execute movement commands
     """
     def __init__(self, motion: MotionController, state: RobotState):
         self.motion = motion
@@ -148,12 +114,9 @@ class RobotMotion:
             pass
 
     def boot_stand(self):
-        """
-        boot() only. NO apply pose here.
-        """
         self.state.set("BOOT")
-        self.motion.boot()
-        set_volumes()
+        self.motion.boot()  # inside boot it already loads pose
+        # audio: default (NO amixer)
         try:
             self.motion.execute("STOP")
         except Exception:
@@ -169,66 +132,6 @@ class RobotMotion:
         self.set_led("red", bps=0.4)
         self.state.set("STOP")
 
-    def support_stand_from_sit(self):
-        """
-        ONLY used when SIT -> STAND.
-        """
-        t0 = time.time()
-        while time.time() - t0 < 0.8:
-            try:
-                self.motion.execute("STANDUP")
-            except Exception:
-                try:
-                    self.motion.execute("STOP")
-                except Exception:
-                    pass
-            time.sleep(0.02)
-
-    def sit_down_and_hold(self, hold_seconds: float):
-        """
-        Stop -> SIT -> hold (no stabilize except when standing up again)
-        """
-        try:
-            self.motion.execute("STOP")
-        except Exception:
-            pass
-        time.sleep(0.1)
-
-        # SIT
-        t0 = time.time()
-        while time.time() - t0 < 0.9:
-            try:
-                self.motion.execute("SIT")
-            except Exception:
-                pass
-            time.sleep(0.02)
-
-        self.state.set("SIT")
-        self.set_led("red", bps=0.35)
-        set_face("sleep")
-
-        # hold
-        t_end = time.time() + float(hold_seconds)
-        while time.time() < t_end:
-            time.sleep(0.2)
-
-    def stand_from_sit_only(self):
-        """
-        EXACT requirement:
-        - ONLY stabilize/support stand when SIT -> STAND
-        """
-        if not self.state.is_sitting():
-            return
-        set_face("what_is_it")
-        self.support_stand_from_sit()
-        try:
-            self.motion.execute("STOP")
-        except Exception:
-            pass
-        self.set_led("white", bps=0.35)
-        self.state.set("STAND")
-
-    # Movement commands (NO stabilize inside)
     def forward(self):
         self.set_led("blue", bps=0.6)
         self.state.set("MOVE", "FORWARD")
@@ -272,7 +175,6 @@ class GesturePoller:
         self.lock = threading.Lock()
         self.latest_label = ""
         self.latest_ts = 0.0
-
         self._stop = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
 
@@ -310,6 +212,7 @@ def _extract_points(scan_json: dict) -> List[Tuple[float, float]]:
     if not isinstance(scan_json, dict):
         return []
     pts: List[Tuple[float, float]] = []
+
     for key in ("points", "scan", "data"):
         arr = scan_json.get(key, None)
         if isinstance(arr, list) and arr:
@@ -370,9 +273,9 @@ def lidar_clearance(points: List[Tuple[float, float]]) -> Dict[str, float]:
 
 def pick_direction_by_clearance(clr: Dict[str, float], prefer: str = "FRONT") -> str:
     front = clr.get("FRONT", 0.0)
-    left = clr.get("LEFT", 0.0)
+    left  = clr.get("LEFT", 0.0)
     right = clr.get("RIGHT", 0.0)
-    back = clr.get("BACK", 0.0)
+    back  = clr.get("BACK", 0.0)
 
     if min(front, left, right) < EMERGENCY_STOP_CM:
         if back > SAFE_TURN_CM:
@@ -438,7 +341,7 @@ def lidar_scan_points() -> List[Tuple[float, float]]:
     return _extract_points(js)
 
 # =========================
-# Map Web (fake 3D)
+# Map Web
 # =========================
 class MapServer:
     def __init__(self):
@@ -499,9 +402,7 @@ class MapServer:
       <div class="kv"><span class="k">BACK:</span> <span id="b">-</span> cm</div>
       <div class="kv"><span class="k">TS:</span> <span id="ts">-</span></div>
       <hr style="border:0;border-top:1px solid #223;margin:10px 0;">
-      <div style="font-size:13px; color:#aab;">
-        Tip: điểm càng sáng = càng gần robot.
-      </div>
+      <div style="font-size:13px; color:#aab;">Tip: điểm càng sáng = càng gần robot.</div>
     </div>
   </div>
 
@@ -581,11 +482,63 @@ tick();
             self.robot_state = robot_state
             self.ts = time.time()
 
-    def run_bg(self):
-        threading.Thread(
-            target=lambda: self.app.run(host="0.0.0.0", port=MAP_PORT, debug=False, use_reloader=False),
-            daemon=True
-        ).start()
+    def _port_available(self, port: int) -> bool:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", port))
+            s.close()
+            return True
+        except Exception:
+            return False
+
+    def run_bg(self, port: int):
+        if not self._port_available(port):
+            print(f"[MAP] ERROR: port {port} is already in use. Web map will NOT start.", flush=True)
+            return
+
+        def _serve():
+            try:
+                self.app.run(
+                    host="0.0.0.0",
+                    port=port,
+                    debug=False,
+                    use_reloader=False,
+                    threaded=True
+                )
+            except Exception as e:
+                print(f"[MAP] ERROR: failed to start Flask on port {port}: {e}", flush=True)
+
+        threading.Thread(target=_serve, daemon=True).start()
+        print(f"[MAP] started on 0.0.0.0:{port}", flush=True)
+
+# =========================
+# Cmd sender (reduce jitter)
+# =========================
+def send_cmd_rate_limited(rm: RobotMotion, cmd: str, last_sent_cmd: str, last_sent_ts: float) -> Tuple[str, float]:
+    """
+    Only send:
+    - if cmd changed, OR
+    - if same cmd but refresh time passed
+    """
+    now = time.time()
+    need_send = (cmd != last_sent_cmd) or ((now - last_sent_ts) >= CMD_REFRESH_SEC)
+
+    if not need_send:
+        return last_sent_cmd, last_sent_ts
+
+    if cmd == "FORWARD":
+        rm.forward()
+    elif cmd == "TURN_LEFT":
+        rm.turn_left()
+    elif cmd == "TURN_RIGHT":
+        rm.turn_right()
+    elif cmd == "BACK":
+        rm.back()
+    else:
+        rm.stop()
+
+    return cmd, now
 
 # =========================
 # Main autopilot
@@ -600,12 +553,11 @@ def main():
     rm = RobotMotion(motion=motion, state=state)
 
     map_server = MapServer()
-    map_server.run_bg()
+    map_server.run_bg(MAP_PORT)
 
     gp = GesturePoller()
     gp.start()
 
-    # BOOT only (NO apply pose outside)
     rm.boot_stand()
     set_face("what_is_it")
 
@@ -620,127 +572,74 @@ def main():
             break
         time.sleep(0.25)
 
-    # next rest time: random 8..15 minutes
-    next_rest_ts = time.time() + random.randint(REST_INTERVAL_MIN_MINUTES * 60, REST_INTERVAL_MAX_MINUTES * 60)
-
     dt = 1.0 / LOOP_HZ
+
+    # for map + rate limiting
     last_cmd = "STOP"
+    last_sent_cmd = "STOP"
+    last_sent_ts = 0.0
 
     print(f"[DEMO] map web: http://<pi_ip>:{MAP_PORT}/", flush=True)
 
     try:
         while True:
-            now = time.time()
-
-            # ===== periodic rest =====
-            if now >= next_rest_ts:
-                # sit hold random 9..15 minutes (or seconds if you change REST_HOLD_UNIT)
-                hold_val = random.randint(REST_HOLD_MIN, REST_HOLD_MAX)
-                hold_seconds = seconds_from_hold_value(hold_val)
-                print(f"[REST] sit hold = {hold_val}{REST_HOLD_UNIT}", flush=True)
-
-                rm.sit_down_and_hold(hold_seconds=hold_seconds)
-
-                # IMPORTANT: only stabilize when SIT -> STAND
-                rm.stand_from_sit_only()
-
-                # schedule next rest: random 8..15 minutes
-                next_rest_ts = time.time() + random.randint(REST_INTERVAL_MIN_MINUTES * 60, REST_INTERVAL_MAX_MINUTES * 60)
-
-            # get lidar scan
+            # lidar scan
             pts = lidar_scan_points()
             clr = lidar_clearance(pts)
-
-            # update map (state + last_cmd)
-            map_server.update(points=pts, clearance=clr, cmd=last_cmd, robot_state=str(state))
 
             # ===== 1) Gesture priority =====
             g = gp.get_active()
             if g:
                 g = g.upper().strip()
 
-                if g in ("STOP", "STOPMUSIC"):
-                    rm.stop()
+                # NOTE: SIT removed -> treat as STOP
+                if g in ("STOP", "STOPMUSIC", "SIT"):
                     last_cmd = "STOP"
-
-                elif g == "SIT":
-                    # gesture SIT: hold random 9..15 minutes
-                    hold_val = random.randint(REST_HOLD_MIN, REST_HOLD_MAX)
-                    hold_seconds = seconds_from_hold_value(hold_val)
-                    print(f"[GESTURE] SIT hold = {hold_val}{REST_HOLD_UNIT}", flush=True)
-
-                    rm.sit_down_and_hold(hold_seconds=hold_seconds)
-                    rm.stand_from_sit_only()
-                    last_cmd = "STOP"
-
                 elif g == "STANDUP":
-                    # Only do support stand if currently sitting
-                    rm.stand_from_sit_only()
                     last_cmd = "STOP"
-
                 elif g in ("MOVELEFT", "TURNLEFT"):
-                    rm.turn_left()
                     last_cmd = "TURN_LEFT"
-
                 elif g in ("MOVERIGHT", "TURNRIGHT"):
-                    rm.turn_right()
                     last_cmd = "TURN_RIGHT"
-
                 elif g in ("BACK", "BACKWARD"):
-                    rm.back()
                     last_cmd = "BACK"
-
                 else:
-                    rm.stop()
                     last_cmd = "STOP"
 
-                map_server.update(points=pts, clearance=clr, cmd=last_cmd, robot_state=str(state))
-                time.sleep(dt)
-                continue
-
-            # ===== 2) Auto move by lidar + camera =====
-            lidar_dec = lidar_decision_label() or "FORWARD"
-            lidar_dec = lidar_dec.upper().strip()
-            if lidar_dec == "BACKWARD":
-                lidar_dec = "BACK"
-
-            if clr.get("FRONT", 9999.0) < EMERGENCY_STOP_CM:
-                rm.stop()
-                last_cmd = "STOP"
-                map_server.update(points=pts, clearance=clr, cmd=last_cmd, robot_state=str(state))
-                time.sleep(dt)
-                continue
-
-            prefer_forward = ("FORWARD" in lidar_dec or lidar_dec == "FORWARD")
-
-            if prefer_forward and clr.get("FRONT", 0.0) >= SAFE_FORWARD_CM:
-                if camera_is_clear():
-                    cmd = "FORWARD"
-                else:
-                    cmd = pick_direction_by_clearance(clr, prefer="LEFT")
             else:
-                if lidar_dec in ("TURN_LEFT", "TURN_RIGHT", "BACK", "STOP"):
-                    cmd = lidar_dec
+                # ===== 2) Auto move by lidar + camera =====
+                lidar_dec = (lidar_decision_label() or "FORWARD").upper().strip()
+                if lidar_dec == "BACKWARD":
+                    lidar_dec = "BACK"
+
+                # emergency stop
+                if clr.get("FRONT", 9999.0) < EMERGENCY_STOP_CM:
+                    last_cmd = "STOP"
                 else:
-                    cmd = pick_direction_by_clearance(clr, prefer="FRONT")
+                    prefer_forward = ("FORWARD" in lidar_dec or lidar_dec == "FORWARD")
 
-            if not cmd:
-                cmd = "STOP"
+                    if prefer_forward and clr.get("FRONT", 0.0) >= SAFE_FORWARD_CM:
+                        if camera_is_clear():
+                            last_cmd = "FORWARD"
+                        else:
+                            last_cmd = pick_direction_by_clearance(clr, prefer="LEFT")
+                    else:
+                        if lidar_dec in ("TURN_LEFT", "TURN_RIGHT", "BACK", "STOP"):
+                            last_cmd = lidar_dec
+                        else:
+                            last_cmd = pick_direction_by_clearance(clr, prefer="FRONT")
 
-            # IMPORTANT: NO stabilize for FORWARD/TURN/BACK
-            if cmd == "FORWARD":
-                rm.forward()
-            elif cmd == "TURN_LEFT":
-                rm.turn_left()
-            elif cmd == "TURN_RIGHT":
-                rm.turn_right()
-            elif cmd == "BACK":
-                rm.back()
-            else:
-                rm.stop()
+            # send movement rate-limited to avoid jitter
+            last_sent_cmd, last_sent_ts = send_cmd_rate_limited(
+                rm=rm,
+                cmd=last_cmd,
+                last_sent_cmd=last_sent_cmd,
+                last_sent_ts=last_sent_ts
+            )
 
-            last_cmd = cmd
+            # update map (show desired cmd)
             map_server.update(points=pts, clearance=clr, cmd=last_cmd, robot_state=str(state))
+
             time.sleep(dt)
 
     except KeyboardInterrupt:
