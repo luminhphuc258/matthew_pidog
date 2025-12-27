@@ -32,7 +32,7 @@ class MotionController:
         p3_target=-68,
         p1_invert=True,
         # ===== head controller =====
-        head_p8_fixed=50,
+        head_p8_idle=50,        # idle/stop angle for P8
         head_p9_fixed=-60,
         head_p10_a=90,
         head_p10_b=90,
@@ -59,18 +59,25 @@ class MotionController:
         self.P3_TARGET = p3_target
 
         self.P1_INVERT = bool(p1_invert)
-
         self.DELAY = 0.05
 
         # head controller params
-        self.head_p8_fixed = head_p8_fixed
+        self.head_p8_idle = head_p8_idle
         self.head_p9_fixed = head_p9_fixed
         self.head_p10_a = head_p10_a
         self.head_p10_b = head_p10_b
 
         self._dog = None
+
+        # head thread control
         self._head_stop_evt: Optional[threading.Event] = None
         self._head_thread: Optional[threading.Thread] = None
+        self._head_lock = threading.Lock()
+        self._head_mode = "IDLE"   # IDLE / MOVE
+        self._s8 = None
+        self._s9 = None
+        self._s10 = None
+
         self._lock = threading.Lock()
 
         # tránh spam stand/stop liên tục
@@ -216,30 +223,101 @@ class MotionController:
 
         time.sleep(0.3)
 
-    def start_head_controller(self, write_interval=0.08, hold_range=(0.6, 1.6)):
+    # =========================
+    # HEAD CONTROLLER (P8 sweep when moving)
+    # =========================
+    def _set_head_mode(self, mode: str):
+        with self._head_lock:
+            self._head_mode = str(mode or "IDLE").upper()
+
+    def start_head_controller(self):
+        """
+        P8: sweep smoothly between 10..60 deg ONLY when moving (FORWARD / TURN_LEFT / TURN_RIGHT)
+        P9: fixed
+        P10: toggle a/b as old behavior (optional)
+        """
         stop_evt = threading.Event()
+
         try:
-            s8 = Servo("P8")
-            s9 = Servo("P9")
-            s10 = Servo("P10")
+            self._s8 = Servo("P8")
+            self._s9 = Servo("P9")
+            self._s10 = Servo("P10")
         except Exception:
+            self._s8 = self._s9 = self._s10 = None
             return stop_evt, None
 
+        # configurable by ENV
+        sweep_min = float(__import__("os").environ.get("HEAD_SWEEP_MIN", "10.0"))
+        sweep_max = float(__import__("os").environ.get("HEAD_SWEEP_MAX", "60.0"))
+        speed_dps = float(__import__("os").environ.get("HEAD_SWEEP_SPEED_DPS", "55.0"))  # deg/sec
+        tick_sec  = float(__import__("os").environ.get("HEAD_TICK_SEC", "0.03"))         # 30ms
+        idle_p8   = float(__import__("os").environ.get("HEAD_P8_IDLE", str(self.head_p8_idle)))
+
+        # clamp sweep range
+        sweep_min = float(self.clamp(sweep_min))
+        sweep_max = float(self.clamp(sweep_max))
+        if sweep_max < sweep_min:
+            sweep_min, sweep_max = sweep_max, sweep_min
+
+        # init position near idle
+        pos = float(self.clamp(idle_p8))
+        direction = +1.0
+
+        # p10 toggle like old
+        target_p10 = self.head_p10_b
+        next_flip = time.time() + random.uniform(0.6, 1.6)
+
         def worker():
-            target = self.head_p10_b
-            next_flip = time.time() + random.uniform(*hold_range)
+            nonlocal pos, direction, target_p10, next_flip
             while not stop_evt.is_set():
-                now = time.time()
-                if now >= next_flip:
-                    target = self.head_p10_a if target == self.head_p10_b else self.head_p10_b
-                    next_flip = now + random.uniform(*hold_range)
+                # read mode
+                with self._head_lock:
+                    mode = self._head_mode
+
+                # always keep P9 fixed
                 try:
-                    s8.angle(self.clamp(self.head_p8_fixed))
-                    s9.angle(self.clamp(self.head_p9_fixed))
-                    s10.angle(self.clamp(target))
+                    if self._s9:
+                        self._s9.angle(self.clamp(self.head_p9_fixed))
                 except Exception:
                     pass
-                time.sleep(write_interval)
+
+                # P10 optional toggle (kept as your old)
+                try:
+                    now = time.time()
+                    if now >= next_flip:
+                        target_p10 = self.head_p10_a if target_p10 == self.head_p10_b else self.head_p10_b
+                        next_flip = now + random.uniform(0.6, 1.6)
+                    if self._s10:
+                        self._s10.angle(self.clamp(target_p10))
+                except Exception:
+                    pass
+
+                # P8 behavior
+                try:
+                    if self._s8:
+                        if mode == "MOVE":
+                            # smooth sweep: step = speed * dt
+                            step = max(0.2, speed_dps * tick_sec)  # 최소 step nhỏ để không bị đứng
+                            pos += direction * step
+                            if pos >= sweep_max:
+                                pos = sweep_max
+                                direction = -1.0
+                            elif pos <= sweep_min:
+                                pos = sweep_min
+                                direction = +1.0
+                            self._s8.angle(self.clamp(pos))
+                        else:
+                            # idle: gently return to idle angle (no jerk)
+                            step = max(0.2, speed_dps * tick_sec)
+                            if abs(pos - idle_p8) <= step:
+                                pos = idle_p8
+                            else:
+                                pos += step if (idle_p8 > pos) else -step
+                            self._s8.angle(self.clamp(pos))
+                except Exception:
+                    pass
+
+                time.sleep(max(0.01, tick_sec))
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
@@ -250,7 +328,7 @@ class MotionController:
         A) pre-move 4 legs (rear+front) with lock P4/P6
         B) apply pose from cfg (all servos)
         C) boot MatthewPidogBootClass -> stand
-        D) start head controller
+        D) start head controller (P8 sweep on MOVE)
         """
         self._pre_move_legs_before_pose()
         cfg = self.load_pose_config()
@@ -268,6 +346,8 @@ class MotionController:
         except Exception:
             pass
 
+        # start head controller thread
+        self._set_head_mode("IDLE")
         self._head_stop_evt, self._head_thread = self.start_head_controller()
 
     def close(self):
@@ -294,7 +374,6 @@ class MotionController:
     def sit(self, speed=20):
         if self._dog is None:
             return
-        # nhiều lib có "sit", nếu không có thì fallback stand
         try:
             self._dog.do_action("sit", speed=speed)
             self._dog.wait_all_done()
@@ -309,7 +388,6 @@ class MotionController:
         try:
             push_up(self._dog)
         except Exception:
-            # fallback: đứng
             self.stand(speed=10)
 
     def do_bark(self):
@@ -338,8 +416,16 @@ class MotionController:
         if d == "RIGHT":
             d = "TURN_RIGHT"
 
+        moving_cmds = {"FORWARD", "TURN_LEFT", "TURN_RIGHT"}
+
         with self._lock:
             try:
+                # ---- set head mode before movement ----
+                if d in moving_cmds:
+                    self._set_head_mode("MOVE")
+                else:
+                    self._set_head_mode("IDLE")
+
                 if d == "FORWARD":
                     self._dog.do_action("forward", speed=250)
                     self._dog.wait_all_done()
@@ -357,20 +443,29 @@ class MotionController:
                     self._dog.wait_all_done()
 
                 elif d == "SIT":
+                    self._set_head_mode("IDLE")
                     self.sit(speed=20)
 
                 elif d == "STAND":
+                    self._set_head_mode("IDLE")
                     self.stand(speed=10, force=True)
 
                 elif d == "PUSH_UP":
+                    self._set_head_mode("IDLE")
                     self.do_push_up()
 
                 elif d == "BARK":
+                    self._set_head_mode("IDLE")
                     self.do_bark()
 
                 else:
                     # STOP: chỉ giữ stand nhẹ thôi, không spam
+                    self._set_head_mode("IDLE")
                     self.stand(speed=5, force=False)
 
             except Exception:
                 pass
+            finally:
+                # after movement ends, return head to idle smoothly
+                if d in moving_cmds:
+                    self._set_head_mode("IDLE")

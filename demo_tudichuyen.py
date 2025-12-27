@@ -45,13 +45,13 @@ CMD_REFRESH_SEC = 0.35  # resend same cmd at most every 0.35s
 # SAFETY + PREDICTION
 # -------------------------
 # Rule 1: if FRONT < 30cm => MUST turn immediately (no forward)
-FRONT_IMMEDIATE_TURN_CM = float(os.environ.get("FRONT_IMMEDIATE_TURN_CM", "30.0"))
+FRONT_IMMEDIATE_TURN_CM = float(os.environ.get("FRONT_IMMEDIATE_TURN_CM", "50.0"))
 
 # Emergency stop (hard)
-EMERGENCY_STOP_CM = float(os.environ.get("EMERGENCY_STOP_CM", "18.0"))
+EMERGENCY_STOP_CM = float(os.environ.get("EMERGENCY_STOP_CM", "30.0"))
 
 # Robot size (updated): width ~ 10cm (to pass narrow corridors)
-ROBOT_WIDTH_CM = float(os.environ.get("ROBOT_WIDTH_CM", "10.0"))
+ROBOT_WIDTH_CM = float(os.environ.get("ROBOT_WIDTH_CM", "12.0"))
 CORRIDOR_MARGIN_CM = float(os.environ.get("CORRIDOR_MARGIN_CM", "2.0"))
 LOOKAHEAD_CM = float(os.environ.get("LOOKAHEAD_CM", "120.0"))
 
