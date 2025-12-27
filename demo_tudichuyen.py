@@ -23,7 +23,6 @@ LIDAR_BASE = "http://127.0.0.1:9399"
 URL_LIDAR_STATUS       = f"{LIDAR_BASE}/api/status"
 URL_LIDAR_DECISION_TXT = f"{LIDAR_BASE}/api/decision_label"   # (TEXT: STOP / GO_STRAIGHT / TURN_LEFT...)
 URL_LIDAR_DATA         = f"{LIDAR_BASE}/take_lidar_data"      # (JSON with points)
-# (optional) nếu server bạn có endpoint này (bạn test bằng browser thấy)
 URL_LIDAR_DECISION_FULL = f"{LIDAR_BASE}/ask_lidar_decision"  # (JSON full)
 
 # Gesture + camera decision (localhost:8000)
@@ -133,8 +132,7 @@ class RobotMotion:
 
     def boot_stand(self):
         self.state.set("BOOT")
-        self.motion.boot()  # inside boot it already loads pose
-        # audio: default (NO amixer)
+        self.motion.boot()
         try:
             self.motion.execute("STOP")
         except Exception:
@@ -227,12 +225,6 @@ class GesturePoller:
 # Lidar parsing helpers (tolerant)
 # =========================
 def _to_cm(dist_any: Any) -> Optional[float]:
-    """
-    Heuristic convert m / mm / cm -> cm.
-    - if 0 < d < 20: likely meters -> *100
-    - if d > 1000: likely mm -> /10
-    - else: cm
-    """
     try:
         d = float(dist_any)
     except Exception:
@@ -246,17 +238,9 @@ def _to_cm(dist_any: Any) -> Optional[float]:
     return d
 
 def _extract_points(scan_json: dict) -> List[Tuple[float, float]]:
-    """
-    Return list of (angle_deg, dist_cm)
-    Supports:
-    - points: [ {angle:.., dist_cm:..}, ... ]
-    - points: [ [angle, dist], ... ]  or (angle, dist)
-    - arrays: angles + dists_cm / distances_cm / dists / distances
-    """
     if not isinstance(scan_json, dict):
         return []
 
-    # pick array key
     arr = None
     for key in ("points", "scan", "data"):
         if isinstance(scan_json.get(key, None), list):
@@ -267,7 +251,6 @@ def _extract_points(scan_json: dict) -> List[Tuple[float, float]]:
 
     if isinstance(arr, list) and arr:
         for it in arr:
-            # case 1: dict
             if isinstance(it, dict):
                 a = it.get("angle", it.get("deg", it.get("theta", it.get("a", None))))
                 d = it.get("dist_cm", it.get("distance_cm", it.get("dist", it.get("r", it.get("d", None)))))
@@ -283,7 +266,6 @@ def _extract_points(scan_json: dict) -> List[Tuple[float, float]]:
                 pts.append((ang, dcm))
                 continue
 
-            # case 2: list/tuple [angle, dist]
             if isinstance(it, (list, tuple)) and len(it) >= 2:
                 a, d = it[0], it[1]
                 try:
@@ -299,7 +281,6 @@ def _extract_points(scan_json: dict) -> List[Tuple[float, float]]:
         if pts:
             return pts
 
-    # arrays style
     ang = scan_json.get("angles", None)
     dist = (
         scan_json.get("dists_cm", None)
@@ -387,20 +368,14 @@ def camera_decision_raw() -> Optional[dict]:
 
 def camera_is_clear(js: Optional[dict]) -> bool:
     if not js:
-        return True  # fail-open
+        return True
     if js.get("ok") is False:
         return True
     label = str(js.get("label", "") or "").lower().strip()
-
-    # your service examples:
-    # "no obstacle"
-    # "yes have obstacle"
     if "no obstacle" in label:
         return True
     if ("yes" in label and "obstacle" in label) or ("have obstacle" in label):
         return False
-
-    # fallback
     return True
 
 # =========================
@@ -421,7 +396,6 @@ def lidar_ready() -> bool:
 
 def normalize_lidar_label(s: str) -> str:
     t = (s or "").strip().upper()
-    # your server returns GO_STRAIGHT
     if t in ("GO_STRAIGHT", "STRAIGHT", "FORWARD"):
         return "FORWARD"
     if t in ("TURNLEFT",):
@@ -433,18 +407,13 @@ def normalize_lidar_label(s: str) -> str:
     return t
 
 def lidar_decision_label_text() -> Tuple[Optional[str], Optional[str]]:
-    """
-    Returns (raw_text, normalized_cmd)
-    """
     raw = http_get_text(URL_LIDAR_DECISION_TXT, timeout=0.55)
     if not raw:
         return None, None
     return raw, normalize_lidar_label(raw)
 
 def lidar_decision_full_json() -> Optional[dict]:
-    # optional, just for debug (if endpoint exists)
-    js = http_get_json(URL_LIDAR_DECISION_FULL, timeout=0.55)
-    return js
+    return http_get_json(URL_LIDAR_DECISION_FULL, timeout=0.55)
 
 def lidar_scan_points() -> Tuple[List[Tuple[float, float]], Optional[dict]]:
     js = http_get_json(URL_LIDAR_DATA, timeout=0.75)
@@ -454,7 +423,7 @@ def lidar_scan_points() -> Tuple[List[Tuple[float, float]], Optional[dict]]:
     return pts, js
 
 # =========================
-# Map Web (2D top-down)
+# Map Web (2D top-down)  ✅ UPDATED
 # =========================
 class MapServer:
     def __init__(self):
@@ -467,7 +436,6 @@ class MapServer:
         self.last_cmd: str = "STOP"
         self.robot_state: str = "BOOT"
 
-        # debug
         self.last_lidar_dec_raw: str = ""
         self.last_lidar_dec_norm: str = ""
         self.last_cam_label: str = ""
@@ -496,7 +464,6 @@ class MapServer:
             return Response(self._html(), mimetype="text/html")
 
     def _html(self) -> str:
-        # IMPORTANT: no f-string conflicts with JS braces
         html = r"""
 <!doctype html>
 <html>
@@ -539,8 +506,8 @@ class MapServer:
       <div class="kv"><span class="k">TS:</span> <span id="ts">-</span></div>
 
       <div class="small" style="margin-top:10px;">
-        Tip: Bản đồ 2D top-down. Robot ở giữa, hướng tiến lên là phía trên.<br/>
-        Vòng tròn: 50cm / vòng.
+        Tip: Bản đồ 2D top-down. Robot ở giữa (center), hướng tiến lên là phía trên.<br/>
+        Vòng tròn: 50cm / vòng. Màu đỏ = vật cản gần.
       </div>
     </div>
   </div>
@@ -549,18 +516,25 @@ class MapServer:
 const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d');
 
-function drawGrid(ox, oy, pxPerCm) {
-  ctx.strokeStyle = '#142033';
+function computeScalePxPerCm(maxCm) {
+  const margin = 28;
+  const radiusPx = Math.min(cv.width, cv.height) * 0.5 - margin;
+  return radiusPx / maxCm;
+}
+
+function drawGrid(ox, oy, pxPerCm, maxCm) {
   ctx.lineWidth = 1;
 
   // circles each 50cm
-  for (let cm=50; cm<=300; cm+=50) {
+  ctx.strokeStyle = '#142033';
+  ctx.fillStyle = '#334155';
+  ctx.font = '12px Arial';
+
+  for (let cm=50; cm<=maxCm; cm+=50) {
     const r = cm * pxPerCm;
     ctx.beginPath();
     ctx.arc(ox, oy, r, 0, Math.PI*2);
     ctx.stroke();
-
-    ctx.fillStyle = '#334155';
     ctx.fillText(cm + "cm", ox + r + 6, oy + 4);
   }
 
@@ -570,7 +544,7 @@ function drawGrid(ox, oy, pxPerCm) {
   ctx.beginPath(); ctx.moveTo(10, oy); ctx.lineTo(cv.width-10, oy); ctx.stroke();
 }
 
-function drawRobot(ox, oy) {
+function drawRobotCenter(ox, oy) {
   // robot dot + heading arrow (up)
   ctx.fillStyle = '#60a5fa';
   ctx.beginPath(); ctx.arc(ox, oy, 6, 0, Math.PI*2); ctx.fill();
@@ -579,28 +553,36 @@ function drawRobot(ox, oy) {
   ctx.lineWidth = 2;
   ctx.beginPath();
   ctx.moveTo(ox, oy);
-  ctx.lineTo(ox, oy - 22);
+  ctx.lineTo(ox, oy - 26);
   ctx.stroke();
 }
 
-function drawPoints(data, ox, oy, pxPerCm) {
+function pointColorByDistance(d) {
+  // red for near obstacles
+  if (d <= 120) return 'rgb(239,68,68)';   // ~ <1.2m
+  if (d <= 200) return 'rgb(248,113,113)'; // light red
+  // grayscale for far points
+  const b = Math.max(70, Math.min(210, 260 - d));
+  return `rgb(${b},${b},${b})`;
+}
+
+function drawPoints(data, ox, oy, pxPerCm, maxCm) {
   const pts = data.points || [];
   for (const p of pts) {
     const ang = (p.angle || 0) * Math.PI/180.0;
     const d = (p.dist_cm || 0);
     if (!d || d <= 0) continue;
+    if (d > maxCm) continue;
 
-    // polar -> x,y (cm)
-    const x = Math.sin(ang) * d;
-    const y = Math.cos(ang) * d;
+    // polar -> x,y (cm): define 0deg = forward (up)
+    const x = Math.sin(ang) * d;   // left/right
+    const y = Math.cos(ang) * d;   // forward
 
-    // top-down
+    // map: robot center at (ox,oy), forward is up => y decreases
     const sx = ox + x * pxPerCm;
     const sy = oy - y * pxPerCm;
 
-    // brightness near = brighter
-    const b = Math.max(60, Math.min(255, 280 - d));
-    ctx.fillStyle = `rgb(${b},${b},${b})`;
+    ctx.fillStyle = pointColorByDistance(d);
     ctx.fillRect(sx, sy, 2, 2);
   }
 }
@@ -608,16 +590,19 @@ function drawPoints(data, ox, oy, pxPerCm) {
 function draw(data) {
   ctx.clearRect(0,0,cv.width,cv.height);
 
-  const ox = cv.width * 0.5;
-  const oy = cv.height * 0.62;
-  const pxPerCm = 0.85; // 1cm ~ 0.85px (tùy bạn chỉnh)
+  const ox = cv.width * 0.5;      // ✅ robot center in middle
+  const oy = cv.height * 0.5;     // ✅ robot center in middle
+  const maxCm = 300;              // show 0..300cm
+  const pxPerCm = computeScalePxPerCm(maxCm);
 
-  ctx.fillStyle = '#cbd5e1';
-  ctx.font = '12px Arial';
+  // grid
+  drawGrid(ox, oy, pxPerCm, maxCm);
 
-  drawGrid(ox, oy, pxPerCm);
-  drawRobot(ox, oy);
-  drawPoints(data, ox, oy, pxPerCm);
+  // points
+  drawPoints(data, ox, oy, pxPerCm, maxCm);
+
+  // robot on top
+  drawRobotCenter(ox, oy);
 
   // UI text
   document.getElementById('st').textContent = data.robot_state || '-';
@@ -713,11 +698,6 @@ def send_cmd_rate_limited(
     last_sent_cmd: str,
     last_sent_ts: float
 ) -> Tuple[str, float]:
-    """
-    Only send:
-    - if cmd changed, OR
-    - if same cmd but refresh time passed
-    """
     now = time.time()
     need_send = (cmd != last_sent_cmd) or ((now - last_sent_ts) >= CMD_REFRESH_SEC)
     if not need_send:
@@ -770,39 +750,28 @@ def main():
 
     dt = 1.0 / LOOP_HZ
 
-    # for map + rate limiting
     last_cmd = "STOP"
     last_sent_cmd = "STOP"
     last_sent_ts = 0.0
 
-    # debug timers
     last_dbg_ts = 0.0
 
     print(f"[DEMO] map web: http://<pi_ip>:{MAP_PORT}/", flush=True)
 
     try:
         while True:
-            # ---- read lidar scan ----
             pts, scan_js = lidar_scan_points()
             clr = lidar_clearance(pts)
 
-            # ---- lidar decision (TEXT) ----
             lidar_dec_raw, lidar_dec_norm = lidar_decision_label_text()
 
-            # optional full json decision (for debug only)
-            # full_js = lidar_decision_full_json()
-
-            # ---- camera decision ----
             cam_js = camera_decision_raw()
             cam_label = str((cam_js or {}).get("label", "") or "")
             cam_clear = camera_is_clear(cam_js)
 
-            # ===== 1) Gesture priority =====
             g = gp.get_active()
             if g:
                 g = g.upper().strip()
-
-                # SIT removed -> treat as STOP
                 if g in ("STOP", "STOPMUSIC", "SIT"):
                     last_cmd = "STOP"
                 elif g == "STANDUP":
@@ -815,29 +784,22 @@ def main():
                     last_cmd = "BACK"
                 else:
                     last_cmd = "STOP"
-
             else:
-                # ===== 2) Auto move by lidar + camera =====
-                # IMPORTANT: decision_label của bạn là TEXT, mình đã normalize ở trên
                 dec = lidar_dec_norm or "FORWARD"
                 if dec == "BACKWARD":
                     dec = "BACK"
 
-                # emergency stop if too close by our own clearance
                 if clr.get("FRONT", 9999.0) < EMERGENCY_STOP_CM:
                     last_cmd = "STOP"
                 else:
-                    # nếu lidar bảo STOP thì obey
                     if dec == "STOP":
                         last_cmd = "STOP"
                     else:
                         prefer_forward = (dec == "FORWARD")
-
                         if prefer_forward and clr.get("FRONT", 0.0) >= SAFE_FORWARD_CM:
                             if cam_clear:
                                 last_cmd = "FORWARD"
                             else:
-                                # camera thấy obstacle -> né theo scan
                                 last_cmd = pick_direction_by_clearance(clr, prefer="LEFT")
                         else:
                             if dec in ("TURN_LEFT", "TURN_RIGHT", "BACK"):
@@ -845,7 +807,6 @@ def main():
                             else:
                                 last_cmd = pick_direction_by_clearance(clr, prefer="FRONT")
 
-            # send movement rate-limited to avoid jitter
             last_sent_cmd, last_sent_ts = send_cmd_rate_limited(
                 rm=rm,
                 cmd=last_cmd,
@@ -853,7 +814,6 @@ def main():
                 last_sent_ts=last_sent_ts
             )
 
-            # update map
             map_server.update(
                 points=pts,
                 clearance=clr,
@@ -864,12 +824,9 @@ def main():
                 cam_label=cam_label
             )
 
-            # ===== DEBUG PRINT =====
             now = time.time()
             if (now - last_dbg_ts) >= DBG_PRINT_EVERY_SEC:
                 last_dbg_ts = now
-
-                # scan format info when pts=0
                 scan_keys = list(scan_js.keys()) if isinstance(scan_js, dict) else []
                 first_pt_type = ""
                 if isinstance(scan_js, dict) and isinstance(scan_js.get("points", None), list) and scan_js["points"]:
