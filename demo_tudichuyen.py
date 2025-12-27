@@ -20,10 +20,10 @@ POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
 
 # Lidar server (localhost:9399)
 LIDAR_BASE = "http://127.0.0.1:9399"
-URL_LIDAR_STATUS       = f"{LIDAR_BASE}/api/status"
-URL_LIDAR_DECISION_TXT = f"{LIDAR_BASE}/api/decision_label"   # (TEXT: STOP / GO_STRAIGHT / TURN_LEFT...)
-URL_LIDAR_DATA         = f"{LIDAR_BASE}/take_lidar_data"      # (JSON with points)
-URL_LIDAR_DECISION_FULL = f"{LIDAR_BASE}/ask_lidar_decision"  # (JSON full)
+URL_LIDAR_STATUS        = f"{LIDAR_BASE}/api/status"
+URL_LIDAR_DECISION_TXT  = f"{LIDAR_BASE}/api/decision_label"   # TEXT: STOP / GO_STRAIGHT / TURN_LEFT / TURN_RIGHT
+URL_LIDAR_DATA          = f"{LIDAR_BASE}/take_lidar_data"      # JSON with points
+URL_LIDAR_DECISION_FULL = f"{LIDAR_BASE}/ask_lidar_decision"   # JSON full (optional)
 
 # Gesture + camera decision (localhost:8000)
 GEST_BASE = "http://127.0.0.1:8000"
@@ -49,7 +49,10 @@ EMERGENCY_STOP_CM = 18.0
 GESTURE_TTL_SEC = 1.2
 
 # Debug
-DBG_PRINT_EVERY_SEC = 1.0  # in log mỗi 1s
+DBG_PRINT_EVERY_SEC = 1.0
+
+# ===== TURN HOLD (force 2 seconds) =====
+TURN_HOLD_SEC = 2.0
 
 # =========================
 # FACE UDP (optional)
@@ -96,7 +99,7 @@ def http_get_text(url: str, timeout: float = HTTP_TIMEOUT) -> Optional[str]:
 # =========================
 class RobotState:
     def __init__(self):
-        self.mode = "BOOT"   # BOOT / STAND / MOVE / TURN / BACK / STOP
+        self.mode = "BOOT"   # BOOT / STAND / MOVE / TURN / STOP
         self.detail = ""
         self.ts = time.time()
 
@@ -109,14 +112,12 @@ class RobotState:
         return f"{self.mode}:{self.detail}" if self.detail else self.mode
 
 # =========================
-# Motion wrapper (NO pose apply, NO sit)
+# Motion wrapper (NO BACK)
 # =========================
 class RobotMotion:
     """
-    Rules:
-    - boot(): do NOT apply pose outside (MotionController.boot already handled)
-    - NO SIT logic
-    - Only execute movement commands
+    NO BACK movement:
+      - Only STOP / FORWARD / TURN_LEFT / TURN_RIGHT
     """
     def __init__(self, motion: MotionController, state: RobotState):
         self.motion = motion
@@ -155,17 +156,6 @@ class RobotMotion:
             self.motion.execute("FORWARD")
         except Exception:
             pass
-
-    def back(self):
-        self.set_led("red", bps=0.55)
-        self.state.set("BACK", "BACK")
-        try:
-            self.motion.execute("BACK")
-        except Exception:
-            try:
-                self.motion.execute("BACKWARD")
-            except Exception:
-                pass
 
     def turn_left(self):
         self.set_led("red", bps=0.55)
@@ -231,6 +221,9 @@ def _to_cm(dist_any: Any) -> Optional[float]:
         return None
     if d <= 0:
         return None
+    # heuristic:
+    #  - if <20 => meters
+    #  - if >1000 => mm-ish (or weird) -> /10 as previous
     if d < 20.0:
         return d * 100.0
     if d > 1000.0:
@@ -333,21 +326,24 @@ def lidar_clearance(points: List[Tuple[float, float]]) -> Dict[str, float]:
         "BACK":  min(_sector_min_distance(points, 140, 180), _sector_min_distance(points, -180, -140)),
     }
 
-def pick_direction_by_clearance(clr: Dict[str, float], prefer: str = "FRONT") -> str:
-    front = clr.get("FRONT", 0.0)
-    left  = clr.get("LEFT", 0.0)
-    right = clr.get("RIGHT", 0.0)
-    back  = clr.get("BACK", 0.0)
+# =========================
+# Direction picker (NO BACK)
+# =========================
+def pick_direction_no_back(clr: Dict[str, float], prefer: str = "FRONT") -> str:
+    front = float(clr.get("FRONT", 0.0) or 0.0)
+    left  = float(clr.get("LEFT", 0.0) or 0.0)
+    right = float(clr.get("RIGHT", 0.0) or 0.0)
 
+    # emergency: too close -> stop
     if min(front, left, right) < EMERGENCY_STOP_CM:
-        if back > SAFE_TURN_CM:
-            return "BACK"
         return "STOP"
 
+    # prefer forward if safe
     if prefer == "FRONT" and front >= SAFE_FORWARD_CM:
         return "FORWARD"
 
-    candidates = [("FORWARD", front), ("TURN_LEFT", left), ("TURN_RIGHT", right), ("BACK", back)]
+    # pick best among forward/left/right only
+    candidates = [("FORWARD", front), ("TURN_LEFT", left), ("TURN_RIGHT", right)]
     candidates.sort(key=lambda x: x[1], reverse=True)
     best_cmd, best_val = candidates[0]
 
@@ -355,9 +351,8 @@ def pick_direction_by_clearance(clr: Dict[str, float], prefer: str = "FRONT") ->
         return "FORWARD"
     if best_cmd in ("TURN_LEFT", "TURN_RIGHT") and best_val >= SAFE_TURN_CM:
         return best_cmd
-    if best_cmd == "BACK" and best_val >= SAFE_TURN_CM:
-        return "BACK"
 
+    # if none are safe enough
     return "STOP"
 
 # =========================
@@ -395,6 +390,10 @@ def lidar_ready() -> bool:
     return ("ready" in st) or ("running" in st)
 
 def normalize_lidar_label(s: str) -> str:
+    """
+    Normalize label from lidarhub.
+    We explicitly DISALLOW BACK.
+    """
     t = (s or "").strip().upper()
     if t in ("GO_STRAIGHT", "STRAIGHT", "FORWARD"):
         return "FORWARD"
@@ -402,8 +401,11 @@ def normalize_lidar_label(s: str) -> str:
         return "TURN_LEFT"
     if t in ("TURNRIGHT",):
         return "TURN_RIGHT"
-    if t in ("BACKWARD",):
-        return "BACK"
+    if t in ("BACK", "BACKWARD", "GO_BACK"):
+        return "STOP"
+    if t not in ("STOP", "FORWARD", "TURN_LEFT", "TURN_RIGHT"):
+        # unknown -> STOP (safe)
+        return "STOP"
     return t
 
 def lidar_decision_label_text() -> Tuple[Optional[str], Optional[str]]:
@@ -423,7 +425,7 @@ def lidar_scan_points() -> Tuple[List[Tuple[float, float]], Optional[dict]]:
     return pts, js
 
 # =========================
-# Map Web (2D top-down)  ✅ UPDATED
+# Map Web (2D top-down)
 # =========================
 class MapServer:
     def __init__(self):
@@ -524,8 +526,6 @@ function computeScalePxPerCm(maxCm) {
 
 function drawGrid(ox, oy, pxPerCm, maxCm) {
   ctx.lineWidth = 1;
-
-  // circles each 50cm
   ctx.strokeStyle = '#142033';
   ctx.fillStyle = '#334155';
   ctx.font = '12px Arial';
@@ -538,14 +538,12 @@ function drawGrid(ox, oy, pxPerCm, maxCm) {
     ctx.fillText(cm + "cm", ox + r + 6, oy + 4);
   }
 
-  // axis
   ctx.strokeStyle = '#0f2a4a';
   ctx.beginPath(); ctx.moveTo(ox, 10); ctx.lineTo(ox, cv.height-10); ctx.stroke();
   ctx.beginPath(); ctx.moveTo(10, oy); ctx.lineTo(cv.width-10, oy); ctx.stroke();
 }
 
 function drawRobotCenter(ox, oy) {
-  // robot dot + heading arrow (up)
   ctx.fillStyle = '#60a5fa';
   ctx.beginPath(); ctx.arc(ox, oy, 6, 0, Math.PI*2); ctx.fill();
 
@@ -558,10 +556,8 @@ function drawRobotCenter(ox, oy) {
 }
 
 function pointColorByDistance(d) {
-  // red for near obstacles
-  if (d <= 120) return 'rgb(239,68,68)';   // ~ <1.2m
-  if (d <= 200) return 'rgb(248,113,113)'; // light red
-  // grayscale for far points
+  if (d <= 120) return 'rgb(239,68,68)';
+  if (d <= 200) return 'rgb(248,113,113)';
   const b = Math.max(70, Math.min(210, 260 - d));
   return `rgb(${b},${b},${b})`;
 }
@@ -574,11 +570,9 @@ function drawPoints(data, ox, oy, pxPerCm, maxCm) {
     if (!d || d <= 0) continue;
     if (d > maxCm) continue;
 
-    // polar -> x,y (cm): define 0deg = forward (up)
-    const x = Math.sin(ang) * d;   // left/right
-    const y = Math.cos(ang) * d;   // forward
+    const x = Math.sin(ang) * d;
+    const y = Math.cos(ang) * d;
 
-    // map: robot center at (ox,oy), forward is up => y decreases
     const sx = ox + x * pxPerCm;
     const sy = oy - y * pxPerCm;
 
@@ -590,21 +584,15 @@ function drawPoints(data, ox, oy, pxPerCm, maxCm) {
 function draw(data) {
   ctx.clearRect(0,0,cv.width,cv.height);
 
-  const ox = cv.width * 0.5;      // ✅ robot center in middle
-  const oy = cv.height * 0.5;     // ✅ robot center in middle
-  const maxCm = 300;              // show 0..300cm
+  const ox = cv.width * 0.5;
+  const oy = cv.height * 0.5;
+  const maxCm = 300;
   const pxPerCm = computeScalePxPerCm(maxCm);
 
-  // grid
   drawGrid(ox, oy, pxPerCm, maxCm);
-
-  // points
   drawPoints(data, ox, oy, pxPerCm, maxCm);
-
-  // robot on top
   drawRobotCenter(ox, oy);
 
-  // UI text
   document.getElementById('st').textContent = data.robot_state || '-';
   document.getElementById('cmd').textContent = data.cmd || '-';
   document.getElementById('ts').textContent = String(data.ts || '-');
@@ -654,9 +642,9 @@ tick();
             self.last_clearance = clearance
             self.last_cmd = cmd
             self.robot_state = robot_state
-            self.last_lidar_dec_raw = lidar_dec_raw
-            self.last_lidar_dec_norm = lidar_dec_norm
-            self.last_cam_label = cam_label
+            self.last_lidar_dec_raw = lidar_dec_raw or ""
+            self.last_lidar_dec_norm = lidar_dec_norm or ""
+            self.last_cam_label = cam_label or ""
             self.ts = time.time()
 
     def _port_available(self, port: int) -> bool:
@@ -690,7 +678,7 @@ tick();
         print(f"[MAP] started on 0.0.0.0:{port}", flush=True)
 
 # =========================
-# Cmd sender (reduce jitter)
+# Cmd sender (rate limited)
 # =========================
 def send_cmd_rate_limited(
     rm: RobotMotion,
@@ -709,15 +697,48 @@ def send_cmd_rate_limited(
         rm.turn_left()
     elif cmd == "TURN_RIGHT":
         rm.turn_right()
-    elif cmd == "BACK":
-        rm.back()
     else:
         rm.stop()
 
     return cmd, now
 
 # =========================
-# Main autopilot
+# TURN HOLD MANAGER (force 2s)
+# =========================
+class TurnHold:
+    def __init__(self, hold_sec: float = 2.0):
+        self.lock = threading.Lock()
+        self.hold_sec = float(hold_sec)
+        self.active_cmd: str = ""   # TURN_LEFT / TURN_RIGHT
+        self.until_ts: float = 0.0
+
+    def arm(self, cmd: str):
+        if cmd not in ("TURN_LEFT", "TURN_RIGHT"):
+            return
+        now = time.time()
+        with self.lock:
+            self.active_cmd = cmd
+            self.until_ts = now + self.hold_sec
+
+    def get(self) -> Optional[str]:
+        now = time.time()
+        with self.lock:
+            if not self.active_cmd:
+                return None
+            if now <= self.until_ts:
+                return self.active_cmd
+            # expired
+            self.active_cmd = ""
+            self.until_ts = 0.0
+            return None
+
+    def clear(self):
+        with self.lock:
+            self.active_cmd = ""
+            self.until_ts = 0.0
+
+# =========================
+# Main autopilot (NO BACK)
 # =========================
 def main():
     os.environ.setdefault("SDL_AUDIODRIVER", "alsa")
@@ -733,6 +754,8 @@ def main():
 
     gp = GesturePoller()
     gp.start()
+
+    turn_hold = TurnHold(hold_sec=TURN_HOLD_SEC)
 
     rm.boot_stand()
     set_face("what_is_it")
@@ -753,13 +776,15 @@ def main():
     last_cmd = "STOP"
     last_sent_cmd = "STOP"
     last_sent_ts = 0.0
-
     last_dbg_ts = 0.0
 
     print(f"[DEMO] map web: http://<pi_ip>:{MAP_PORT}/", flush=True)
 
     try:
         while True:
+            # --- If we are holding a TURN, keep it for 2 seconds ---
+            holding = turn_hold.get()
+
             pts, scan_js = lidar_scan_points()
             clr = lidar_clearance(pts)
 
@@ -769,44 +794,60 @@ def main():
             cam_label = str((cam_js or {}).get("label", "") or "")
             cam_clear = camera_is_clear(cam_js)
 
-            g = gp.get_active()
-            if g:
-                g = g.upper().strip()
-                if g in ("STOP", "STOPMUSIC", "SIT"):
-                    last_cmd = "STOP"
-                elif g == "STANDUP":
-                    last_cmd = "STOP"
-                elif g in ("MOVELEFT", "TURNLEFT"):
-                    last_cmd = "TURN_LEFT"
-                elif g in ("MOVERIGHT", "TURNRIGHT"):
-                    last_cmd = "TURN_RIGHT"
-                elif g in ("BACK", "BACKWARD"):
-                    last_cmd = "BACK"
-                else:
-                    last_cmd = "STOP"
+            # --- Emergency stop always overrides everything ---
+            if clr.get("FRONT", 9999.0) < EMERGENCY_STOP_CM:
+                turn_hold.clear()
+                last_cmd = "STOP"
             else:
-                dec = lidar_dec_norm or "FORWARD"
-                if dec == "BACKWARD":
-                    dec = "BACK"
-
-                if clr.get("FRONT", 9999.0) < EMERGENCY_STOP_CM:
-                    last_cmd = "STOP"
+                # 1) if currently holding TURN -> obey it (do not recalc)
+                if holding:
+                    last_cmd = holding
                 else:
-                    if dec == "STOP":
-                        last_cmd = "STOP"
+                    # 2) gesture override (NO BACK)
+                    g = gp.get_active()
+                    if g:
+                        g = g.upper().strip()
+                        if g in ("STOP", "STOPMUSIC", "SIT", "STANDUP"):
+                            last_cmd = "STOP"
+                        elif g in ("MOVELEFT", "TURNLEFT"):
+                            last_cmd = "TURN_LEFT"
+                            turn_hold.arm("TURN_LEFT")
+                        elif g in ("MOVERIGHT", "TURNRIGHT"):
+                            last_cmd = "TURN_RIGHT"
+                            turn_hold.arm("TURN_RIGHT")
+                        elif g in ("BACK", "BACKWARD"):
+                            # disallow
+                            last_cmd = "STOP"
+                        else:
+                            last_cmd = "STOP"
                     else:
-                        prefer_forward = (dec == "FORWARD")
-                        if prefer_forward and clr.get("FRONT", 0.0) >= SAFE_FORWARD_CM:
-                            if cam_clear:
+                        # 3) lidarhub decision as primary (NO BACK)
+                        dec = (lidar_dec_norm or "FORWARD").strip().upper()
+                        if dec not in ("STOP", "FORWARD", "TURN_LEFT", "TURN_RIGHT"):
+                            dec = "STOP"
+
+                        if dec == "FORWARD":
+                            # if camera says obstacle -> choose turn by clearance (no back)
+                            if cam_clear and clr.get("FRONT", 0.0) >= SAFE_FORWARD_CM:
                                 last_cmd = "FORWARD"
                             else:
-                                last_cmd = pick_direction_by_clearance(clr, prefer="LEFT")
-                        else:
-                            if dec in ("TURN_LEFT", "TURN_RIGHT", "BACK"):
-                                last_cmd = dec
-                            else:
-                                last_cmd = pick_direction_by_clearance(clr, prefer="FRONT")
+                                # if forward not ok -> pick left/right/stop only
+                                # prefer LEFT here when camera blocks forward (you can change)
+                                last_cmd = pick_direction_no_back(clr, prefer="LEFT")
+                                if last_cmd in ("TURN_LEFT", "TURN_RIGHT"):
+                                    turn_hold.arm(last_cmd)
 
+                        elif dec in ("TURN_LEFT", "TURN_RIGHT"):
+                            last_cmd = dec
+                            turn_hold.arm(dec)
+
+                        else:  # STOP
+                            # try to find a safer direction (no back)
+                            last_cmd = pick_direction_no_back(clr, prefer="FRONT")
+                            if last_cmd in ("TURN_LEFT", "TURN_RIGHT"):
+                                turn_hold.arm(last_cmd)
+
+            # send cmd (rate-limited)
             last_sent_cmd, last_sent_ts = send_cmd_rate_limited(
                 rm=rm,
                 cmd=last_cmd,
@@ -814,6 +855,7 @@ def main():
                 last_sent_ts=last_sent_ts
             )
 
+            # update map
             map_server.update(
                 points=pts,
                 clearance=clr,
@@ -828,13 +870,10 @@ def main():
             if (now - last_dbg_ts) >= DBG_PRINT_EVERY_SEC:
                 last_dbg_ts = now
                 scan_keys = list(scan_js.keys()) if isinstance(scan_js, dict) else []
-                first_pt_type = ""
-                if isinstance(scan_js, dict) and isinstance(scan_js.get("points", None), list) and scan_js["points"]:
-                    first_pt_type = str(type(scan_js["points"][0]))
-
+                hold_info = holding if holding else "-"
                 print(
-                    f"[DBG] pts={len(pts)} first_pt_type={first_pt_type} "
-                    f"front={clr.get('FRONT', 9999.0):.1f} left={clr.get('LEFT', 9999.0):.1f} right={clr.get('RIGHT', 9999.0):.1f} "
+                    f"[DBG] hold={hold_info} pts={len(pts)} "
+                    f"front={clr.get('FRONT', 9999.0):.1f} left={clr.get('LEFT', 9999.0):.1f} right={clr.get('RIGHT', 9999.0):.1f} back={clr.get('BACK', 9999.0):.1f} "
                     f"lidar_dec_raw={lidar_dec_raw} lidar_dec_norm={lidar_dec_norm} "
                     f"cam_label={cam_label!r} cam_clear={cam_clear} -> cmd={last_cmd} "
                     f"| scan_keys={scan_keys}",
@@ -859,7 +898,6 @@ def main():
             motion.close()
         except Exception:
             pass
-
 
 if __name__ == "__main__":
     main()
