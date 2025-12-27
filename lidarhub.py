@@ -5,12 +5,11 @@ import os
 import re
 import time
 import math
-import json
 import threading
 import subprocess
 from typing import Dict, Any, List, Tuple, Optional
 
-from flask import Flask, jsonify, Response, request
+from flask import Flask, jsonify, Response
 
 # =======================
 # CONFIG (env overridable)
@@ -28,25 +27,28 @@ HTTP_PORT = int(os.environ.get("PORT", "9399"))
 MAX_RANGE_M = float(os.environ.get("MAX_RANGE_M", "12.0"))
 POINT_LIMIT = int(os.environ.get("POINT_LIMIT", "2500"))
 
-# Throttle endpoints to save energy (300ms default)
-THROTTLE_MS = int(os.environ.get("THROTTLE_MS", "300"))
+# Endpoint caches (ms)
+THROTTLE_MS = int(os.environ.get("THROTTLE_MS", "250"))
 THROTTLE_S = THROTTLE_MS / 1000.0
 
-# Decision / Prediction settings
-STOP_NEAR_M = float(os.environ.get("STOP_NEAR_M", "0.30"))      # stop if obstacle very near
-PREDICT_T_SEC = float(os.environ.get("PREDICT_T_SEC", "1.0"))   # predict collision within next 1s
-ROBOT_SPEED_MPS = float(os.environ.get("ROBOT_SPEED_MPS", "0.35"))  # estimated forward speed (tune!)
+# Decision thresholds (meters)
+STOP_NEAR_M = float(os.environ.get("STOP_NEAR_M", "0.30"))           # "too close" band
+PREDICT_T_SEC = float(os.environ.get("PREDICT_T_SEC", "1.0"))
+ROBOT_SPEED_MPS = float(os.environ.get("ROBOT_SPEED_MPS", "0.35"))
 SAFETY_MARGIN_M = float(os.environ.get("SAFETY_MARGIN_M", "0.10"))
 
 # Angle calibration
-# FRONT_CENTER_DEG defines forward direction in LiDAR frame.
 FRONT_CENTER_DEG = float(os.environ.get("FRONT_CENTER_DEG", "0.0"))
 
-# Sector widths
-FRONT_WIDTH_DEG = float(os.environ.get("FRONT_WIDTH_DEG", "30.0"))   # narrow corridor
-WIDE_WIDTH_DEG  = float(os.environ.get("WIDE_WIDTH_DEG", "70.0"))    # wider for left/right/back
+# Sector widths (deg)
+FRONT_WIDTH_DEG = float(os.environ.get("FRONT_WIDTH_DEG", "30.0"))
+WIDE_WIDTH_DEG  = float(os.environ.get("WIDE_WIDTH_DEG", "70.0"))
 
-# Ultra_simple output sample:
+# Sticky decision to avoid "STOP then stuck"
+TURN_STICKY_SEC = float(os.environ.get("TURN_STICKY_SEC", "1.2"))   # keep TURN for this long once chosen
+BACK_STICKY_SEC = float(os.environ.get("BACK_STICKY_SEC", "0.9"))
+
+# ultra_simple output sample:
 # theta: 353.17 Dist: 02277.00 Q: 47
 LINE_RE = re.compile(r"theta:\s*([0-9.]+)\s+Dist:\s*([0-9.]+)\s+Q:\s*(\d+)")
 
@@ -72,16 +74,20 @@ status: Dict[str, Any] = {
 proc: Optional[subprocess.Popen] = None
 stop_flag = False
 
-# Cached payloads for throttling
+# Cached payloads
 cache_lock = threading.Lock()
 _points_cache: Dict[str, Any] = {"ts": 0.0, "payload": None}
 _decision_cache: Dict[str, Any] = {"ts": 0.0, "payload": None}
 
-# Latest "published locally" decision label (for other classes to pull)
+# Exposed decision state
 decision_state_lock = threading.Lock()
 latest_decision_label: str = "STOP"
-latest_decision_full: Dict[str, Any] = {"ok": False, "label": "STOP", "reason": "init"}
+latest_decision_full: Dict[str, Any] = {"ok": False, "label": "STOP", "reason": "init", "ts": 0.0}
 
+# Sticky turn/back behavior
+sticky_lock = threading.Lock()
+sticky_label: str = ""
+sticky_until_ts: float = 0.0
 
 # =======================
 # Helpers
@@ -92,19 +98,15 @@ def _wrap_deg(a: float) -> float:
         a += 360.0
     return a
 
-
 def _ang_dist_deg(a: float, b: float) -> float:
-    """Smallest absolute difference between angles (deg)."""
     d = abs(_wrap_deg(a) - _wrap_deg(b))
     return min(d, 360.0 - d)
-
 
 def polar_to_xy_m(theta_deg: float, dist_m: float) -> Tuple[float, float]:
     th = math.radians(theta_deg)
     x = dist_m * math.cos(th)
     y = dist_m * math.sin(th)
     return x, y
-
 
 def _spawn_ultra_simple() -> subprocess.Popen:
     cmd = [
@@ -122,7 +124,6 @@ def _spawn_ultra_simple() -> subprocess.Popen:
         bufsize=1,
         universal_newlines=True,
     )
-
 
 def _reader_loop():
     global proc, latest_ts, stop_flag
@@ -183,18 +184,12 @@ def _reader_loop():
         except Exception:
             pass
 
-
 def lidar_thread_main():
-    """Auto-restart ultra_simple if it exits."""
     while True:
         _reader_loop()
-
         if stop_flag:
             return
-
-        # crash -> wait then restart
         time.sleep(1.0)
-
 
 def _min_dist_in_sector(
     points: List[Tuple[float, float, int, float, float, float]],
@@ -202,10 +197,6 @@ def _min_dist_in_sector(
     width_deg: float,
     recent_sec: float = 0.7
 ) -> float:
-    """
-    Return minimum distance (m) among recent points within a sector.
-    If none found, return +inf.
-    """
     now = time.time()
     half = width_deg / 2.0
     best = float("inf")
@@ -219,23 +210,52 @@ def _min_dist_in_sector(
 
     return best
 
+def _set_sticky(label: str, sec: float):
+    global sticky_label, sticky_until_ts
+    with sticky_lock:
+        sticky_label = label
+        sticky_until_ts = time.time() + float(sec)
+
+def _get_sticky() -> Optional[str]:
+    with sticky_lock:
+        if sticky_label and time.time() < sticky_until_ts:
+            return sticky_label
+    return None
+
+def _clear_sticky():
+    global sticky_label, sticky_until_ts
+    with sticky_lock:
+        sticky_label = ""
+        sticky_until_ts = 0.0
 
 def _compute_decision_snapshot() -> Dict[str, Any]:
     """
-    Decide safe corridor direction.
-    Output label: GO_STRAIGHT / TURN_LEFT / TURN_RIGHT / STOP / GO_BACK
+    Output label:
+      - GO_STRAIGHT
+      - TURN_LEFT
+      - TURN_RIGHT
+      - GO_BACK
+      - STOP
+    Key behavior:
+      - If front blocked: pick TURN/GO_BACK (STOP only when boxed_in)
+      - Sticky TURN/BACK for a short time to allow robot to rotate/move back.
     """
     with lock:
         pts = list(latest_points)
         last_ts = latest_ts
 
-    if not pts or (time.time() - last_ts) > 2.0:
+    now = time.time()
+    if not pts or (now - last_ts) > 2.0:
+        _clear_sticky()
         return {
             "ok": False,
             "label": "STOP",
             "reason": "no_recent_lidar",
-            "ts": time.time(),
+            "ts": now,
         }
+
+    # If sticky decision active, return it (but still publish distances for debug)
+    sticky = _get_sticky()
 
     front = _wrap_deg(FRONT_CENTER_DEG)
     left  = _wrap_deg(front + 90.0)
@@ -245,119 +265,109 @@ def _compute_decision_snapshot() -> Dict[str, Any]:
     diag_l = _wrap_deg(front + 45.0)
     diag_r = _wrap_deg(front - 45.0)
 
-    # distances
     d_front_narrow = _min_dist_in_sector(pts, front, FRONT_WIDTH_DEG)
     d_front_wide   = _min_dist_in_sector(pts, front, WIDE_WIDTH_DEG)
     d_left_wide    = _min_dist_in_sector(pts, left,  WIDE_WIDTH_DEG)
     d_right_wide   = _min_dist_in_sector(pts, right, WIDE_WIDTH_DEG)
     d_back_wide    = _min_dist_in_sector(pts, back,  WIDE_WIDTH_DEG)
+    d_diag_l       = _min_dist_in_sector(pts, diag_l, 35.0)
+    d_diag_r       = _min_dist_in_sector(pts, diag_r, 35.0)
 
-    d_diag_l = _min_dist_in_sector(pts, diag_l, 35.0)
-    d_diag_r = _min_dist_in_sector(pts, diag_r, 35.0)
-
-    # Predict collision threshold (within next 1s)
     predict_dist = (ROBOT_SPEED_MPS * PREDICT_T_SEC) + SAFETY_MARGIN_M
-    danger_front = d_front_narrow <= max(STOP_NEAR_M, predict_dist)
+    side_block = max(STOP_NEAR_M, predict_dist)
 
-    # HARD STOP if very near
-    if d_front_narrow <= STOP_NEAR_M:
-        return {
-            "ok": True,
-            "label": "STOP",
-            "reason": "obstacle_very_near",
-            "ts": time.time(),
-            "dist": {
-                "front_narrow": d_front_narrow,
-                "front_wide": d_front_wide,
-                "left": d_left_wide,
-                "right": d_right_wide,
-                "back": d_back_wide,
-                "diag_left": d_diag_l,
-                "diag_right": d_diag_r,
-            },
-            "threshold": {
-                "stop_near_m": STOP_NEAR_M,
-                "predict_dist_m": predict_dist,
-                "predict_t_sec": PREDICT_T_SEC,
-                "robot_speed_mps": ROBOT_SPEED_MPS,
-                "safety_margin_m": SAFETY_MARGIN_M,
+    dist_pack = {
+        "front_narrow": d_front_narrow,
+        "front_wide": d_front_wide,
+        "left": d_left_wide,
+        "right": d_right_wide,
+        "back": d_back_wide,
+        "diag_left": d_diag_l,
+        "diag_right": d_diag_r,
+    }
+
+    thresh_pack = {
+        "stop_near_m": STOP_NEAR_M,
+        "predict_dist_m": predict_dist,
+        "predict_t_sec": PREDICT_T_SEC,
+        "robot_speed_mps": ROBOT_SPEED_MPS,
+        "safety_margin_m": SAFETY_MARGIN_M,
+        "side_block_m": side_block,
+        "sticky_turn_sec": TURN_STICKY_SEC,
+        "sticky_back_sec": BACK_STICKY_SEC,
+    }
+
+    # if sticky exists, we still can break sticky when front is clearly safe
+    if sticky:
+        # Break sticky if front is clearly open
+        if d_front_narrow > max(STOP_NEAR_M, predict_dist) * 1.25:
+            _clear_sticky()
+        else:
+            return {
+                "ok": True,
+                "label": sticky,
+                "reason": "sticky",
+                "ts": now,
+                "dist": dist_pack,
+                "threshold": thresh_pack,
             }
-        }
 
-    # If predicted danger: turn early
-    if danger_front:
-        side_block = max(STOP_NEAR_M, predict_dist)
+    # ===== Main decision =====
+    # Front danger band
+    front_blocked = (d_front_narrow <= max(STOP_NEAR_M, predict_dist))
 
+    if front_blocked:
         left_ok  = max(d_left_wide, d_diag_l) > side_block
         right_ok = max(d_right_wide, d_diag_r) > side_block
+        back_ok  = d_back_wide > side_block
 
-        if not left_ok and not right_ok:
-            if d_back_wide <= side_block:
-                label = "STOP"
-                reason = "boxed_in"
-            else:
-                label = "GO_BACK"
-                reason = "front_and_sides_blocked"
-        else:
-            score_left = min(d_left_wide, d_diag_l)
-            score_right = min(d_right_wide, d_diag_r)
+        # choose best side by score
+        score_left = min(d_left_wide, d_diag_l)
+        score_right = min(d_right_wide, d_diag_r)
 
-            if score_left > score_right:
+        if left_ok or right_ok:
+            if score_left >= score_right:
                 label = "TURN_LEFT"
-                reason = "front_predicted_collision_choose_left"
+                reason = "front_blocked_choose_left"
             else:
                 label = "TURN_RIGHT"
-                reason = "front_predicted_collision_choose_right"
+                reason = "front_blocked_choose_right"
+            _set_sticky(label, TURN_STICKY_SEC)
+        else:
+            if back_ok:
+                label = "GO_BACK"
+                reason = "front_and_sides_blocked_go_back"
+                _set_sticky(label, BACK_STICKY_SEC)
+            else:
+                label = "STOP"
+                reason = "boxed_in"
 
         return {
             "ok": True,
             "label": label,
             "reason": reason,
-            "ts": time.time(),
-            "dist": {
-                "front_narrow": d_front_narrow,
-                "front_wide": d_front_wide,
-                "left": d_left_wide,
-                "right": d_right_wide,
-                "back": d_back_wide,
-                "diag_left": d_diag_l,
-                "diag_right": d_diag_r,
-            },
-            "threshold": {
-                "stop_near_m": STOP_NEAR_M,
-                "predict_dist_m": predict_dist,
-                "predict_t_sec": PREDICT_T_SEC,
-                "robot_speed_mps": ROBOT_SPEED_MPS,
-                "safety_margin_m": SAFETY_MARGIN_M,
-            }
+            "ts": now,
+            "dist": dist_pack,
+            "threshold": thresh_pack,
         }
 
-    # Otherwise safe
+    # Front safe
+    _clear_sticky()
     return {
         "ok": True,
         "label": "GO_STRAIGHT",
         "reason": "front_clear",
-        "ts": time.time(),
-        "dist": {
-            "front_narrow": d_front_narrow,
-            "front_wide": d_front_wide,
-            "left": d_left_wide,
-            "right": d_right_wide,
-            "back": d_back_wide,
-            "diag_left": d_diag_l,
-            "diag_right": d_diag_r,
-        },
-        "threshold": {
-            "stop_near_m": STOP_NEAR_M,
-            "predict_dist_m": predict_dist,
-            "predict_t_sec": PREDICT_T_SEC,
-            "robot_speed_mps": ROBOT_SPEED_MPS,
-            "safety_margin_m": SAFETY_MARGIN_M,
-        }
+        "ts": now,
+        "dist": dist_pack,
+        "threshold": thresh_pack,
     }
 
-
 def _build_points_payload(limit: int = 1600) -> Dict[str, Any]:
+    """
+    IMPORTANT: Provide BOTH schemas for compatibility:
+      - theta/dist_m (original)
+      - angle/dist_cm (your autopilot expects this)
+    """
     with lock:
         pts = list(latest_points[-limit:])
         ts = latest_ts
@@ -365,8 +375,14 @@ def _build_points_payload(limit: int = 1600) -> Dict[str, Any]:
     out = []
     for (theta, dist_m, q, x, y, t) in pts:
         out.append({
+            # original
             "theta": theta,
             "dist_m": dist_m,
+
+            # compatibility for your autopilot/map:
+            "angle": theta,                 # keep 0..360 ok
+            "dist_cm": dist_m * 100.0,
+
             "q": q,
             "x": x,
             "y": y,
@@ -385,19 +401,17 @@ def _build_points_payload(limit: int = 1600) -> Dict[str, Any]:
         }
     }
 
-
 # =======================
-# Background Workers (throttle 300ms)
+# Background Workers
 # =======================
 def decision_worker():
     global latest_decision_label, latest_decision_full
-
     while True:
         payload = _compute_decision_snapshot()
 
         with decision_state_lock:
             latest_decision_full = payload
-            latest_decision_label = payload.get("label", "STOP")
+            latest_decision_label = str(payload.get("label", "STOP") or "STOP")
 
         with cache_lock:
             _decision_cache["ts"] = time.time()
@@ -405,17 +419,13 @@ def decision_worker():
 
         time.sleep(THROTTLE_S)
 
-
 def points_worker():
     while True:
         payload = _build_points_payload()
-
         with cache_lock:
             _points_cache["ts"] = time.time()
             _points_cache["payload"] = payload
-
         time.sleep(THROTTLE_S)
-
 
 # =======================
 # ROUTES
@@ -442,13 +452,8 @@ def api_status():
         "latest_label": lbl,
     })
 
-
 @app.get("/take_lidar_data")
 def take_lidar_data():
-    """
-    Main endpoint for WebDashboard (3D giả).
-    Throttled by background cache (~300ms).
-    """
     with cache_lock:
         payload = _points_cache["payload"]
 
@@ -460,13 +465,8 @@ def take_lidar_data():
 
     return jsonify(payload)
 
-
 @app.get("/ask_lidar_decision")
 def ask_lidar_decision():
-    """
-    Important endpoint: returns latest decision.
-    Throttled by background cache (~300ms).
-    """
     with cache_lock:
         payload = _decision_cache["payload"]
 
@@ -478,33 +478,20 @@ def ask_lidar_decision():
 
     return jsonify(payload)
 
-
 @app.get("/api/decision_label")
 def api_decision_label():
-    """
-    For other classes (main/motion controller) that only need the label.
-    Returns plain text.
-    """
     with decision_state_lock:
         lbl = latest_decision_label
-    return Response(lbl, mimetype="text/plain")
-
+    return Response(str(lbl), mimetype="text/plain")
 
 @app.get("/api/decision")
 def api_decision():
-    """
-    Full decision JSON (same as ask_lidar_decision, but stable for internal pull).
-    """
     with decision_state_lock:
         payload = dict(latest_decision_full)
     return jsonify(payload)
 
-
 @app.post("/api/restart")
 def api_restart():
-    """
-    Restart ultra_simple process.
-    """
     global stop_flag, proc
     stop_flag = True
     try:
@@ -519,7 +506,6 @@ def api_restart():
     threading.Thread(target=lidar_thread_main, daemon=True).start()
     return jsonify({"ok": True})
 
-
 @app.get("/")
 def home():
     return Response(
@@ -528,22 +514,19 @@ def home():
         "<li>/take_lidar_data</li>"
         "<li>/ask_lidar_decision</li>"
         "<li>/api/decision_label</li>"
+        "<li>/api/decision</li>"
         "<li>/api/status</li>"
         "<li>/api/restart (POST)</li>"
         "</ul>",
         mimetype="text/html"
     )
 
-
 def main():
-    # Start background threads
     threading.Thread(target=lidar_thread_main, daemon=True).start()
     threading.Thread(target=points_worker, daemon=True).start()
     threading.Thread(target=decision_worker, daemon=True).start()
 
-    # Run Flask
     app.run(host=HTTP_HOST, port=HTTP_PORT, debug=False, threaded=True)
-
 
 if __name__ == "__main__":
     main()
