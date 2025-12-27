@@ -22,9 +22,9 @@ POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
 # Lidar server (localhost:9399)
 LIDAR_BASE = "http://127.0.0.1:9399"
 URL_LIDAR_STATUS        = f"{LIDAR_BASE}/api/status"
-URL_LIDAR_DECISION_TXT  = f"{LIDAR_BASE}/api/decision_label"   # TEXT: STOP / GO_STRAIGHT / TURN_LEFT / TURN_RIGHT
-URL_LIDAR_DATA          = f"{LIDAR_BASE}/take_lidar_data"      # JSON with points
-URL_LIDAR_DECISION_FULL = f"{LIDAR_BASE}/ask_lidar_decision"   # JSON full (optional)
+URL_LIDAR_DECISION_TXT  = f"{LIDAR_BASE}/api/decision_label"
+URL_LIDAR_DATA          = f"{LIDAR_BASE}/take_lidar_data"
+URL_LIDAR_DECISION_FULL = f"{LIDAR_BASE}/ask_lidar_decision"
 
 # Gesture + camera decision (localhost:8000)
 GEST_BASE = "http://127.0.0.1:8000"
@@ -39,42 +39,37 @@ LOOP_HZ = 20.0
 HTTP_TIMEOUT = 0.6
 
 # Command refresh (reduce jitter)
-CMD_REFRESH_SEC = 0.35  # resend same cmd at most every 0.35s
+CMD_REFRESH_SEC = 0.35
 
 # -------------------------
 # SAFETY + PREDICTION
 # -------------------------
-# Rule 1: if FRONT < 30cm => MUST turn immediately (no forward)
 FRONT_IMMEDIATE_TURN_CM = float(os.environ.get("FRONT_IMMEDIATE_TURN_CM", "50.0"))
+EMERGENCY_STOP_CM       = float(os.environ.get("EMERGENCY_STOP_CM", "30.0"))
 
-# Emergency stop (hard)
-EMERGENCY_STOP_CM = float(os.environ.get("EMERGENCY_STOP_CM", "30.0"))
+ROBOT_WIDTH_CM      = float(os.environ.get("ROBOT_WIDTH_CM", "12.0"))
+CORRIDOR_MARGIN_CM  = float(os.environ.get("CORRIDOR_MARGIN_CM", "2.0"))
+LOOKAHEAD_CM        = float(os.environ.get("LOOKAHEAD_CM", "120.0"))
 
-# Robot size (updated): width ~ 10cm (to pass narrow corridors)
-ROBOT_WIDTH_CM = float(os.environ.get("ROBOT_WIDTH_CM", "12.0"))
-CORRIDOR_MARGIN_CM = float(os.environ.get("CORRIDOR_MARGIN_CM", "2.0"))
-LOOKAHEAD_CM = float(os.environ.get("LOOKAHEAD_CM", "120.0"))
+PREDICT_T_SEC       = float(os.environ.get("PREDICT_T_SEC", "2.0"))
+ROBOT_SPEED_CMPS    = float(os.environ.get("ROBOT_SPEED_CMPS", "35.0"))
+SAFETY_MARGIN_CM    = float(os.environ.get("SAFETY_MARGIN_CM", "5.0"))
 
-# Prediction: "if move 2 seconds more, will collide?"
-PREDICT_T_SEC = float(os.environ.get("PREDICT_T_SEC", "2.0"))
-ROBOT_SPEED_CMPS = float(os.environ.get("ROBOT_SPEED_CMPS", "35.0"))  # ~0.35 m/s
-SAFETY_MARGIN_CM = float(os.environ.get("SAFETY_MARGIN_CM", "5.0"))
+SAFE_TURN_CM            = float(os.environ.get("SAFE_TURN_CM", "25.0"))
+SAFE_FORWARD_MIN_NOW_CM = float(os.environ.get("SAFE_FORWARD_MIN_NOW_CM", "35.0"))
 
-def required_forward_cm() -> float:
-    return ROBOT_SPEED_CMPS * PREDICT_T_SEC + SAFETY_MARGIN_CM
+# ===== NEW: stuck recovery =====
+ESCAPE_BACK_SEC      = float(os.environ.get("ESCAPE_BACK_SEC", "3.0"))
+ESCAPE_MAX_TURN_SEC  = float(os.environ.get("ESCAPE_MAX_TURN_SEC", "6.0"))
 
-# For turning acceptance
-SAFE_TURN_CM = float(os.environ.get("SAFE_TURN_CM", "25.0"))  # smaller because robot narrower now
-SAFE_FORWARD_MIN_NOW_CM = float(os.environ.get("SAFE_FORWARD_MIN_NOW_CM", "35.0"))  # minimal to even try forward
+# khi TURN lock: chỉ unlock khi FRONT >= ngưỡng này
+TURN_UNLOCK_FRONT_CM = float(os.environ.get("TURN_UNLOCK_FRONT_CM", "80.0"))
 
 # Gesture TTL
 GESTURE_TTL_SEC = 1.2
 
 # Debug
 DBG_PRINT_EVERY_SEC = 1.0
-
-# Turn hold: reduce from 2s -> 1s (recalc faster)
-TURN_HOLD_SEC = float(os.environ.get("TURN_HOLD_SEC", "1.0"))
 
 # =========================
 # FACE UDP (optional)
@@ -90,7 +85,7 @@ def set_face(emo: str):
         pass
 
 # =========================
-# HTTP Utils (JSON + TEXT)
+# HTTP Utils
 # =========================
 def http_get(url: str, timeout: float = HTTP_TIMEOUT) -> Optional[requests.Response]:
     try:
@@ -121,7 +116,7 @@ def http_get_text(url: str, timeout: float = HTTP_TIMEOUT) -> Optional[str]:
 # =========================
 class RobotState:
     def __init__(self):
-        self.mode = "BOOT"   # BOOT / STAND / MOVE / TURN / STOP
+        self.mode = "BOOT"   # BOOT / STAND / MOVE / TURN / BACK / STOP
         self.detail = ""
         self.ts = time.time()
 
@@ -134,12 +129,11 @@ class RobotState:
         return f"{self.mode}:{self.detail}" if self.detail else self.mode
 
 # =========================
-# Motion wrapper (NO BACK)
+# Motion wrapper (ALLOW BACK for escape)
 # =========================
 class RobotMotion:
     """
-    NO BACK movement:
-      - Only STOP / FORWARD / TURN_LEFT / TURN_RIGHT
+    Now supports STOP / FORWARD / TURN_LEFT / TURN_RIGHT / BACK
     """
     def __init__(self, motion: MotionController, state: RobotState):
         self.motion = motion
@@ -176,6 +170,14 @@ class RobotMotion:
         self.state.set("MOVE", "FORWARD")
         try:
             self.motion.execute("FORWARD")
+        except Exception:
+            pass
+
+    def back(self):
+        self.set_led("red", bps=0.65)
+        self.state.set("BACK", "BACK")
+        try:
+            self.motion.execute("BACK")
         except Exception:
             pass
 
@@ -234,137 +236,7 @@ class GesturePoller:
             return self.latest_label
 
 # =========================
-# ACCEL / COLLISION DETECTOR
-# =========================
-class CollisionDetector:
-    """
-    Tries to detect collision using:
-      1) Optional HTTP endpoint (ACCEL_URL env)
-      2) Optional robot IMU if available (best-effort)
-    If detected -> collision_recent() True for a short TTL.
-    """
-    def __init__(self, motion: MotionController):
-        self.motion = motion
-        self.dog = getattr(motion, "dog", None)
-
-        self.accel_url = os.environ.get("ACCEL_URL", "").strip()
-        self.poll_hz = float(os.environ.get("ACCEL_POLL_HZ", "30.0"))
-        self.ttl_sec = float(os.environ.get("COLLISION_TTL_SEC", "0.8"))
-
-        # thresholds (tune if needed)
-        self.jerk_th = float(os.environ.get("COLLISION_JERK_TH", "6.0"))    # (g/s) rough
-        self.mag_th  = float(os.environ.get("COLLISION_MAG_TH", "2.2"))     # (g) rough
-
-        self._stop = threading.Event()
-        self.lock = threading.Lock()
-        self.last_collision_ts = 0.0
-        self.last_mag = None
-        self.last_t = None
-        self.last_axayaz = (0.0, 0.0, 0.0)
-
-        self.thread = threading.Thread(target=self._run, daemon=True)
-
-    def start(self):
-        self.thread.start()
-
-    def stop(self):
-        self._stop.set()
-
-    def _read_accel_http(self) -> Optional[Tuple[float, float, float]]:
-        if not self.accel_url:
-            return None
-        js = http_get_json(self.accel_url, timeout=0.35)
-        if not isinstance(js, dict):
-            return None
-
-        # accept common key styles
-        ax = js.get("ax", js.get("x", None))
-        ay = js.get("ay", js.get("y", None))
-        az = js.get("az", js.get("z", None))
-
-        if ax is None and "accel" in js and isinstance(js["accel"], (list, tuple)) and len(js["accel"]) >= 3:
-            ax, ay, az = js["accel"][0], js["accel"][1], js["accel"][2]
-
-        try:
-            ax = float(ax); ay = float(ay); az = float(az)
-        except Exception:
-            return None
-        return (ax, ay, az)
-
-    def _read_accel_imu(self) -> Optional[Tuple[float, float, float]]:
-        """
-        Best-effort for various IMU APIs (depends on your stack).
-        """
-        imu = None
-        try:
-            imu = getattr(self.dog, "imu", None) if self.dog else None
-        except Exception:
-            imu = None
-        if not imu:
-            return None
-
-        # try common method names
-        for fn in ("get_accel", "get_acceleration", "read_accel", "acceleration"):
-            try:
-                if hasattr(imu, fn):
-                    v = getattr(imu, fn)()
-                    if isinstance(v, (list, tuple)) and len(v) >= 3:
-                        ax, ay, az = float(v[0]), float(v[1]), float(v[2])
-                        return (ax, ay, az)
-                    if isinstance(v, dict):
-                        ax = float(v.get("x", v.get("ax", 0.0)))
-                        ay = float(v.get("y", v.get("ay", 0.0)))
-                        az = float(v.get("z", v.get("az", 0.0)))
-                        return (ax, ay, az)
-            except Exception:
-                continue
-        return None
-
-    def _run(self):
-        dt = 1.0 / max(5.0, self.poll_hz)
-        while not self._stop.is_set():
-            now = time.time()
-
-            v = self._read_accel_http()
-            if v is None:
-                v = self._read_accel_imu()
-
-            if v is not None:
-                ax, ay, az = v
-                mag = math.sqrt(ax*ax + ay*ay + az*az)
-
-                with self.lock:
-                    self.last_axayaz = (ax, ay, az)
-
-                    if self.last_mag is not None and self.last_t is not None:
-                        dtm = max(1e-3, now - self.last_t)
-                        jerk = abs(mag - self.last_mag) / dtm
-
-                        # collision trigger
-                        if mag >= self.mag_th or jerk >= self.jerk_th:
-                            self.last_collision_ts = now
-
-                    self.last_mag = mag
-                    self.last_t = now
-
-            time.sleep(dt)
-
-    def collision_recent(self) -> bool:
-        with self.lock:
-            return (time.time() - self.last_collision_ts) <= self.ttl_sec
-
-    def debug(self) -> Dict[str, Any]:
-        with self.lock:
-            return {
-                "collision_recent": self.collision_recent(),
-                "last_collision_age": (time.time() - self.last_collision_ts) if self.last_collision_ts else None,
-                "ax": self.last_axayaz[0],
-                "ay": self.last_axayaz[1],
-                "az": self.last_axayaz[2],
-            }
-
-# =========================
-# Lidar parsing helpers (tolerant)
+# Lidar parsing helpers
 # =========================
 def _to_cm(dist_any: Any) -> Optional[float]:
     try:
@@ -476,7 +348,7 @@ def lidar_clearance(points: List[Tuple[float, float]]) -> Dict[str, float]:
     }
 
 # =========================
-# Corridor clearance (uses robot width = 10cm)
+# Corridor clearance
 # =========================
 def _wrap_deg(a: float) -> float:
     a = a % 360.0
@@ -485,19 +357,12 @@ def _wrap_deg(a: float) -> float:
     return a
 
 def corridor_clearance_cm(points: List[Tuple[float, float]], heading_deg: float) -> float:
-    """
-    Compute min obstacle distance 'y' in a corridor centered on heading_deg:
-      - corridor width = ROBOT_WIDTH_CM + 2*CORRIDOR_MARGIN_CM
-      - consider points within 0..LOOKAHEAD_CM forward
-    Return +inf if no obstacle in corridor.
-    """
     if not points:
         return float("inf")
 
     half_w = (ROBOT_WIDTH_CM * 0.5) + CORRIDOR_MARGIN_CM
     best_y = float("inf")
 
-    # point format: angle_deg where 0deg is forward, positive => left (per your map)
     for ang_deg, dist_cm in points:
         d = float(dist_cm)
         if d <= 0:
@@ -505,14 +370,13 @@ def corridor_clearance_cm(points: List[Tuple[float, float]], heading_deg: float)
         if d > LOOKAHEAD_CM:
             continue
 
-        # rotate frame by heading_deg: rel = ang - heading
         rel = _wrap_deg(float(ang_deg) - float(heading_deg))
         if rel > 180.0:
             rel -= 360.0
 
         rr = math.radians(rel)
-        x = math.sin(rr) * d     # left/right
-        y = math.cos(rr) * d     # forward
+        x = math.sin(rr) * d
+        y = math.cos(rr) * d
 
         if y <= 0:
             continue
@@ -525,75 +389,44 @@ def corridor_clearance_cm(points: List[Tuple[float, float]], heading_deg: float)
     return best_y
 
 def choose_turn_dir(points: List[Tuple[float, float]], clr: Dict[str, float]) -> str:
-    """
-    Decide TURN_LEFT or TURN_RIGHT using corridor clearance (+45/-45) first,
-    fallback to sector clearance LEFT/RIGHT.
-    """
     c_left = corridor_clearance_cm(points, +45.0)
     c_right = corridor_clearance_cm(points, -45.0)
 
-    # if both inf (no points), fallback
     if (not math.isfinite(c_left)) and (not math.isfinite(c_right)):
         left = float(clr.get("LEFT", 0.0) or 0.0)
         right = float(clr.get("RIGHT", 0.0) or 0.0)
         return "TURN_LEFT" if left >= right else "TURN_RIGHT"
 
-    # prefer bigger clearance
-    if c_left >= c_right:
-        return "TURN_LEFT"
-    return "TURN_RIGHT"
+    return "TURN_LEFT" if c_left >= c_right else "TURN_RIGHT"
 
 # =========================
-# Direction picker (NO BACK) + prediction
+# Prediction
 # =========================
+def required_forward_cm() -> float:
+    return ROBOT_SPEED_CMPS * PREDICT_T_SEC + SAFETY_MARGIN_CM
+
 def forward_will_collide(front_cm: float) -> bool:
-    """
-    True if going forward for PREDICT_T_SEC likely collides.
-    """
-    th = required_forward_cm()
-    return float(front_cm) <= th
+    return float(front_cm) <= required_forward_cm()
 
-def pick_direction_no_back(points: List[Tuple[float, float]], clr: Dict[str, float], prefer: str = "FRONT") -> str:
-    """
-    Use:
-      - immediate front rule handled outside
-      - prediction (2s) for forward
-      - corridor clearance with ROBOT_WIDTH_CM=10cm
-    """
+def pick_direction(points: List[Tuple[float, float]], clr: Dict[str, float]) -> str:
     front = float(clr.get("FRONT", 0.0) or 0.0)
     left  = float(clr.get("LEFT", 0.0) or 0.0)
     right = float(clr.get("RIGHT", 0.0) or 0.0)
 
-    # emergency
-    if min(front, left, right) < EMERGENCY_STOP_CM:
-        return "STOP"
-
-    # corridor check for forward
     c0 = corridor_clearance_cm(points, 0.0)
     can_forward_now = (front >= SAFE_FORWARD_MIN_NOW_CM) and (c0 >= SAFE_FORWARD_MIN_NOW_CM)
     safe_forward_pred = (not forward_will_collide(front)) and (c0 >= required_forward_cm())
 
-    if prefer == "FRONT" and can_forward_now and safe_forward_pred:
-        return "FORWARD"
-
-    # Otherwise pick turn direction if side looks better
-    # (still require minimal space to turn)
-    if max(left, right) >= SAFE_TURN_CM:
-        return "TURN_LEFT" if left >= right else "TURN_RIGHT"
-
-    # if forward is OK short-term but fails prediction, still prefer turning
-    if can_forward_now and not safe_forward_pred:
-        # turn away from tighter side
-        return "TURN_LEFT" if left >= right else "TURN_RIGHT"
-
-    # if forward is both ok now + prediction, use it
     if can_forward_now and safe_forward_pred:
         return "FORWARD"
+
+    if max(left, right) >= SAFE_TURN_CM:
+        return "TURN_LEFT" if left >= right else "TURN_RIGHT"
 
     return "STOP"
 
 # =========================
-# Camera Decision (robust)
+# Camera
 # =========================
 def camera_decision_raw() -> Optional[dict]:
     return http_get_json(URL_CAMERA_DECISION, timeout=0.55)
@@ -611,7 +444,7 @@ def camera_is_clear(js: Optional[dict]) -> bool:
     return True
 
 # =========================
-# Lidar status / decision (TEXT + JSON)
+# Lidar status / decision
 # =========================
 def lidar_ready() -> bool:
     js = http_get_json(URL_LIDAR_STATUS, timeout=0.6)
@@ -627,10 +460,6 @@ def lidar_ready() -> bool:
     return ("ready" in st) or ("running" in st)
 
 def normalize_lidar_label(s: str) -> str:
-    """
-    Normalize label from lidarhub.
-    We explicitly DISALLOW BACK.
-    """
     t = (s or "").strip().upper()
     if t in ("GO_STRAIGHT", "STRAIGHT", "FORWARD"):
         return "FORWARD"
@@ -638,6 +467,7 @@ def normalize_lidar_label(s: str) -> str:
         return "TURN_LEFT"
     if t in ("TURNRIGHT",):
         return "TURN_RIGHT"
+    # lidar BACK -> ignore (autopilot tự BACK khi cần)
     if t in ("BACK", "BACKWARD", "GO_BACK"):
         return "STOP"
     if t not in ("STOP", "FORWARD", "TURN_LEFT", "TURN_RIGHT"):
@@ -650,9 +480,6 @@ def lidar_decision_label_text() -> Tuple[Optional[str], Optional[str]]:
         return None, None
     return raw, normalize_lidar_label(raw)
 
-def lidar_decision_full_json() -> Optional[dict]:
-    return http_get_json(URL_LIDAR_DECISION_FULL, timeout=0.55)
-
 def lidar_scan_points() -> Tuple[List[Tuple[float, float]], Optional[dict]]:
     js = http_get_json(URL_LIDAR_DATA, timeout=0.75)
     if not js:
@@ -661,7 +488,7 @@ def lidar_scan_points() -> Tuple[List[Tuple[float, float]], Optional[dict]]:
     return pts, js
 
 # =========================
-# Map Web (2D top-down)
+# Map Web
 # =========================
 class MapServer:
     def __init__(self):
@@ -681,8 +508,10 @@ class MapServer:
 
         self.last_pred_th: float = required_forward_cm()
         self.last_pred_collide: bool = False
-        self.last_collision: bool = False
         self.last_reason: str = ""
+
+        self.escape_state: str = "NONE"   # NONE / BACK / TURN
+        self.lock_turn_cmd: str = ""      # TURN_LEFT / TURN_RIGHT
 
         @self.app.get("/map.json")
         def map_json():
@@ -700,9 +529,11 @@ class MapServer:
                         "cam_label": self.last_cam_label,
                         "pred_th_cm": self.last_pred_th,
                         "pred_collide": self.last_pred_collide,
-                        "collision": self.last_collision,
                         "reason": self.last_reason,
                         "robot_width_cm": ROBOT_WIDTH_CM,
+                        "escape_state": self.escape_state,
+                        "lock_turn_cmd": self.lock_turn_cmd,
+                        "unlock_front_cm": TURN_UNLOCK_FRONT_CM,
                     }
                 }
             return jsonify(payload)
@@ -749,8 +580,12 @@ class MapServer:
 
       <div class="kv"><span class="k">pred_th (2s):</span> <span id="pth">-</span> cm</div>
       <div class="kv"><span class="k">pred_collide:</span> <span id="pc">-</span></div>
-      <div class="kv"><span class="k">collision(accel):</span> <span id="col">-</span></div>
       <div class="kv"><span class="k">reason:</span> <span id="rs">-</span></div>
+
+      <hr style="border:0;border-top:1px solid #223;margin:10px 0;">
+
+      <div class="kv"><span class="k">escape_state:</span> <span id="es">-</span></div>
+      <div class="kv"><span class="k">lock_turn_cmd:</span> <span id="lt">-</span></div>
 
       <hr style="border:0;border-top:1px solid #223;margin:10px 0;">
 
@@ -864,8 +699,10 @@ function draw(data) {
 
   document.getElementById('pth').textContent = (dbg.pred_th_cm ?? '-');
   document.getElementById('pc').textContent = String(dbg.pred_collide ?? '-');
-  document.getElementById('col').textContent = String(dbg.collision ?? '-');
   document.getElementById('rs').textContent = String(dbg.reason ?? '-');
+
+  document.getElementById('es').textContent = String(dbg.escape_state ?? '-');
+  document.getElementById('lt').textContent = String(dbg.lock_turn_cmd ?? '-');
 }
 
 async function tick() {
@@ -894,8 +731,9 @@ tick();
         lidar_dec_norm: str = "",
         cam_label: str = "",
         pred_collide: bool = False,
-        collision: bool = False,
-        reason: str = ""
+        reason: str = "",
+        escape_state: str = "NONE",
+        lock_turn_cmd: str = "",
     ):
         with self.lock:
             self.last_points = points
@@ -908,8 +746,9 @@ tick();
             self.last_cam_label = cam_label or ""
             self.last_pred_th = required_forward_cm()
             self.last_pred_collide = bool(pred_collide)
-            self.last_collision = bool(collision)
             self.last_reason = reason or ""
+            self.escape_state = escape_state
+            self.lock_turn_cmd = lock_turn_cmd
             self.ts = time.time()
 
     def _port_available(self, port: int) -> bool:
@@ -929,13 +768,7 @@ tick();
 
         def _serve():
             try:
-                self.app.run(
-                    host="0.0.0.0",
-                    port=port,
-                    debug=False,
-                    use_reloader=False,
-                    threaded=True
-                )
+                self.app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
             except Exception as e:
                 print(f"[MAP] ERROR: failed to start Flask on port {port}: {e}", flush=True)
 
@@ -945,12 +778,7 @@ tick();
 # =========================
 # Cmd sender (rate limited)
 # =========================
-def send_cmd_rate_limited(
-    rm: RobotMotion,
-    cmd: str,
-    last_sent_cmd: str,
-    last_sent_ts: float
-) -> Tuple[str, float]:
+def send_cmd_rate_limited(rm: RobotMotion, cmd: str, last_sent_cmd: str, last_sent_ts: float) -> Tuple[str, float]:
     now = time.time()
     need_send = (cmd != last_sent_cmd) or ((now - last_sent_ts) >= CMD_REFRESH_SEC)
     if not need_send:
@@ -962,47 +790,78 @@ def send_cmd_rate_limited(
         rm.turn_left()
     elif cmd == "TURN_RIGHT":
         rm.turn_right()
+    elif cmd == "BACK":
+        rm.back()
     else:
         rm.stop()
 
     return cmd, now
 
 # =========================
-# TURN HOLD MANAGER (force 1s)
+# TURN LOCK (keep one direction until front clear)
 # =========================
-class TurnHold:
-    def __init__(self, hold_sec: float = 1.0):
+class TurnLock:
+    def __init__(self):
         self.lock = threading.Lock()
-        self.hold_sec = float(hold_sec)
-        self.active_cmd: str = ""   # TURN_LEFT / TURN_RIGHT
-        self.until_ts: float = 0.0
+        self.cmd: str = ""         # TURN_LEFT / TURN_RIGHT
+        self.active: bool = False
 
     def arm(self, cmd: str):
         if cmd not in ("TURN_LEFT", "TURN_RIGHT"):
             return
-        now = time.time()
         with self.lock:
-            self.active_cmd = cmd
-            self.until_ts = now + self.hold_sec
-
-    def get(self) -> Optional[str]:
-        now = time.time()
-        with self.lock:
-            if not self.active_cmd:
-                return None
-            if now <= self.until_ts:
-                return self.active_cmd
-            self.active_cmd = ""
-            self.until_ts = 0.0
-            return None
+            self.cmd = cmd
+            self.active = True
 
     def clear(self):
         with self.lock:
-            self.active_cmd = ""
-            self.until_ts = 0.0
+            self.cmd = ""
+            self.active = False
+
+    def get(self) -> Optional[str]:
+        with self.lock:
+            if not self.active:
+                return None
+            return self.cmd
 
 # =========================
-# Main autopilot (NO BACK)
+# ESCAPE MANAGER (BACK 3s -> TURN locked until front clear)
+# =========================
+class EscapeManager:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.state = "NONE"       # NONE / BACK / TURN
+        self.until_ts = 0.0
+        self.turn_cmd = ""
+        self.turn_start_ts = 0.0
+
+    def trigger(self, now: float, turn_cmd: str):
+        with self.lock:
+            self.state = "BACK"
+            self.until_ts = now + ESCAPE_BACK_SEC
+            self.turn_cmd = turn_cmd
+            self.turn_start_ts = 0.0
+
+    def set_turn(self, now: float, turn_cmd: str):
+        with self.lock:
+            self.state = "TURN"
+            self.turn_cmd = turn_cmd
+            self.turn_start_ts = now
+            self.until_ts = now + ESCAPE_MAX_TURN_SEC  # timeout fail-safe
+
+    def clear(self):
+        with self.lock:
+            self.state = "NONE"
+            self.until_ts = 0.0
+            self.turn_cmd = ""
+            self.turn_start_ts = 0.0
+
+    def snapshot(self) -> Tuple[str, float, str, float]:
+        with self.lock:
+            return self.state, self.until_ts, self.turn_cmd, self.turn_start_ts
+
+# =========================
+# Main
 # =========================
 def main():
     os.environ.setdefault("SDL_AUDIODRIVER", "alsa")
@@ -1019,11 +878,8 @@ def main():
     gp = GesturePoller()
     gp.start()
 
-    # collision detector (accelerometer)
-    coldet = CollisionDetector(motion)
-    coldet.start()
-
-    turn_hold = TurnHold(hold_sec=TURN_HOLD_SEC)
+    turn_lock = TurnLock()
+    escape = EscapeManager()
 
     rm.boot_stand()
     set_face("what_is_it")
@@ -1047,13 +903,11 @@ def main():
     last_dbg_ts = 0.0
 
     print(f"[DEMO] map web: http://<pi_ip>:{MAP_PORT}/", flush=True)
-    print(f"[CFG] FRONT_IMMEDIATE_TURN_CM={FRONT_IMMEDIATE_TURN_CM}  "
-          f"predict_th(2s)={required_forward_cm():.1f}cm  "
-          f"ROBOT_WIDTH_CM={ROBOT_WIDTH_CM}  TURN_HOLD_SEC={TURN_HOLD_SEC}", flush=True)
+    print(f"[CFG] FRONT_IMMEDIATE_TURN_CM={FRONT_IMMEDIATE_TURN_CM}  EMERGENCY_STOP_CM={EMERGENCY_STOP_CM} "
+          f"ESCAPE_BACK_SEC={ESCAPE_BACK_SEC} TURN_UNLOCK_FRONT_CM={TURN_UNLOCK_FRONT_CM}", flush=True)
 
     try:
         while True:
-            # read sensors first
             pts, scan_js = lidar_scan_points()
             clr = lidar_clearance(pts)
 
@@ -1066,113 +920,133 @@ def main():
             front_cm = float(clr.get("FRONT", 9999.0) or 9999.0)
             pred_collide = forward_will_collide(front_cm)
 
-            collision_now = coldet.collision_recent()
-
-            # holding turn (1s) to avoid jitter
-            holding = turn_hold.get()
-
+            now = time.time()
             reason = ""
+            esc_state, esc_until, esc_turn_cmd, esc_turn_start = escape.snapshot()
+            locked_turn = turn_lock.get()
 
-            # ---------- 0) Collision (accelerometer) override ----------
-            if collision_now:
-                # stop and immediately turn away from tighter side
-                turn_hold.clear()
-                td = choose_turn_dir(pts, clr)
-                last_cmd = td
-                turn_hold.arm(td)
-                reason = "collision_detected_accel -> turn"
-
-            # ---------- 1) Hard emergency stop ----------
-            elif front_cm < EMERGENCY_STOP_CM:
-                turn_hold.clear()
-                last_cmd = "STOP"
-                reason = "emergency_stop(front<EMERGENCY_STOP_CM)"
-
-            # ---------- 2) IMPORTANT BUGFIX: front <30cm => MUST turn now ----------
-            elif front_cm < FRONT_IMMEDIATE_TURN_CM:
-                td = choose_turn_dir(pts, clr)
-                last_cmd = td
-                turn_hold.arm(td)
-                reason = f"front<{FRONT_IMMEDIATE_TURN_CM:.0f}cm -> immediate_turn"
-
-            # ---------- 3) If holding TURN -> keep it (do not recalc) ----------
-            elif holding:
-                last_cmd = holding
-                reason = f"turn_hold({TURN_HOLD_SEC:.1f}s)"
+            # ===== 0) Gesture override (STOP ưu tiên cao) =====
+            g = gp.get_active()
+            if g:
+                g = g.upper().strip()
+                if g in ("STOP", "STOPMUSIC", "SIT", "STANDUP"):
+                    escape.clear()
+                    turn_lock.clear()
+                    last_cmd = "STOP"
+                    reason = f"gesture:{g}"
+                elif g in ("MOVELEFT", "TURNLEFT"):
+                    escape.clear()
+                    turn_lock.arm("TURN_LEFT")
+                    last_cmd = "TURN_LEFT"
+                    reason = f"gesture:{g} -> lock TURN_LEFT"
+                elif g in ("MOVERIGHT", "TURNRIGHT"):
+                    escape.clear()
+                    turn_lock.arm("TURN_RIGHT")
+                    last_cmd = "TURN_RIGHT"
+                    reason = f"gesture:{g} -> lock TURN_RIGHT"
+                else:
+                    last_cmd = "STOP"
+                    reason = f"gesture:unknown({g})"
 
             else:
-                # ---------- 4) Gesture override (NO BACK) ----------
-                g = gp.get_active()
-                if g:
-                    g = g.upper().strip()
-                    if g in ("STOP", "STOPMUSIC", "SIT", "STANDUP"):
-                        last_cmd = "STOP"
-                        reason = f"gesture:{g}"
-                    elif g in ("MOVELEFT", "TURNLEFT"):
-                        last_cmd = "TURN_LEFT"
-                        turn_hold.arm("TURN_LEFT")
-                        reason = f"gesture:{g}"
-                    elif g in ("MOVERIGHT", "TURNRIGHT"):
-                        last_cmd = "TURN_RIGHT"
-                        turn_hold.arm("TURN_RIGHT")
-                        reason = f"gesture:{g}"
+                # ===== 1) ESCAPE state machine =====
+                if esc_state == "BACK":
+                    if now <= esc_until:
+                        last_cmd = "BACK"
+                        reason = f"ESCAPE:BACK({ESCAPE_BACK_SEC:.1f}s)"
                     else:
-                        last_cmd = "STOP"
-                        reason = f"gesture:unknown({g})"
+                        # back xong -> vào TURN theo hướng đã chọn
+                        escape.set_turn(now, esc_turn_cmd or choose_turn_dir(pts, clr))
+                        turn_lock.arm(escape.snapshot()[2])  # lock turn cmd
+                        last_cmd = escape.snapshot()[2]
+                        reason = f"ESCAPE:BACK done -> TURN {last_cmd}"
+
+                elif esc_state == "TURN":
+                    # giữ TURN cho tới khi FRONT clear mới thoát
+                    if front_cm >= TURN_UNLOCK_FRONT_CM and cam_clear and (not pred_collide):
+                        escape.clear()
+                        turn_lock.clear()
+                        last_cmd = "FORWARD"
+                        reason = f"ESCAPE:TURN done (front>={TURN_UNLOCK_FRONT_CM:.0f}) -> FORWARD"
+                    else:
+                        # fail-safe timeout: quay quá lâu vẫn không clear -> back lại và chọn lại
+                        if now >= esc_until:
+                            td = choose_turn_dir(pts, clr)
+                            escape.trigger(now, td)
+                            turn_lock.clear()
+                            last_cmd = "BACK"
+                            reason = "ESCAPE:TURN timeout -> BACK again"
+                        else:
+                            last_cmd = esc_turn_cmd or "TURN_RIGHT"
+                            reason = f"ESCAPE:TURN locked({last_cmd})"
+
                 else:
-                    # ---------- 5) Lidarhub decision primary (NO BACK) ----------
-                    dec = (lidar_dec_norm or "FORWARD").strip().upper()
-                    if dec not in ("STOP", "FORWARD", "TURN_LEFT", "TURN_RIGHT"):
-                        dec = "STOP"
+                    # ===== 2) Nếu FRONT quá sát -> ESCAPE ngay (BACK 3s rồi TURN) =====
+                    if front_cm < EMERGENCY_STOP_CM:
+                        td = choose_turn_dir(pts, clr)
+                        escape.trigger(now, td)
+                        turn_lock.clear()
+                        last_cmd = "BACK"
+                        reason = f"front<{EMERGENCY_STOP_CM:.0f} -> ESCAPE:BACK then {td}"
 
-                    # If lidar says forward but camera blocks OR prediction says collide -> turn immediately
-                    if dec == "FORWARD":
-                        if not cam_clear:
-                            td = choose_turn_dir(pts, clr)
-                            last_cmd = td
-                            turn_hold.arm(td)
-                            reason = "lidar:FORWARD but camera_block -> turn"
-                        elif pred_collide:
-                            td = choose_turn_dir(pts, clr)
-                            last_cmd = td
-                            turn_hold.arm(td)
-                            reason = f"lidar:FORWARD but predict_collide(th={required_forward_cm():.1f}) -> turn"
-                        else:
-                            # corridor + forward safe
-                            c0 = corridor_clearance_cm(pts, 0.0)
-                            if front_cm >= SAFE_FORWARD_MIN_NOW_CM and c0 >= required_forward_cm():
-                                last_cmd = "FORWARD"
-                                reason = "forward_ok(now + predict + corridor)"
+                    else:
+                        # ===== 3) TURN LOCK trong normal: đã quyết định quay => giữ tới khi front clear =====
+                        if locked_turn:
+                            if front_cm >= TURN_UNLOCK_FRONT_CM and cam_clear and (not pred_collide):
+                                turn_lock.clear()
+                                # sau khi unlock, tính lại bình thường
+                                last_cmd = pick_direction(pts, clr)
+                                reason = f"turn_lock cleared (front>={TURN_UNLOCK_FRONT_CM:.0f}) -> {last_cmd}"
                             else:
-                                td = choose_turn_dir(pts, clr)
-                                last_cmd = td
-                                turn_hold.arm(td)
-                                reason = "forward_not_good_in_corridor -> turn"
+                                last_cmd = locked_turn
+                                reason = f"turn_lock({locked_turn})"
 
-                    elif dec in ("TURN_LEFT", "TURN_RIGHT"):
-                        # allow but sanity check: if chosen side is super tight, flip to other side
-                        left = float(clr.get("LEFT", 0.0) or 0.0)
-                        right = float(clr.get("RIGHT", 0.0) or 0.0)
-                        if dec == "TURN_LEFT" and left < SAFE_TURN_CM and right >= SAFE_TURN_CM:
-                            last_cmd = "TURN_RIGHT"
-                            turn_hold.arm("TURN_RIGHT")
-                            reason = "lidar:TURN_LEFT but left_tight -> TURN_RIGHT"
-                        elif dec == "TURN_RIGHT" and right < SAFE_TURN_CM and left >= SAFE_TURN_CM:
-                            last_cmd = "TURN_LEFT"
-                            turn_hold.arm("TURN_LEFT")
-                            reason = "lidar:TURN_RIGHT but right_tight -> TURN_LEFT"
                         else:
-                            last_cmd = dec
-                            turn_hold.arm(dec)
-                            reason = f"lidar:{dec}"
+                            # ===== 4) Normal logic =====
+                            dec = (lidar_dec_norm or "FORWARD").strip().upper()
+                            if dec not in ("STOP", "FORWARD", "TURN_LEFT", "TURN_RIGHT"):
+                                dec = "STOP"
 
-                    else:  # STOP
-                        # try to find best safe move (no back), still using prediction
-                        best = pick_direction_no_back(pts, clr, prefer="FRONT")
-                        if best in ("TURN_LEFT", "TURN_RIGHT"):
-                            turn_hold.arm(best)
-                        last_cmd = best
-                        reason = f"lidar:STOP -> pick:{best}"
+                            # front < immediate_turn -> lock turn ngay
+                            if front_cm < FRONT_IMMEDIATE_TURN_CM:
+                                td = choose_turn_dir(pts, clr)
+                                turn_lock.arm(td)
+                                last_cmd = td
+                                reason = f"front<{FRONT_IMMEDIATE_TURN_CM:.0f} -> lock {td}"
+
+                            else:
+                                # lidar says forward but camera/predict blocks -> lock turn
+                                if dec == "FORWARD":
+                                    if (not cam_clear) or pred_collide:
+                                        td = choose_turn_dir(pts, clr)
+                                        turn_lock.arm(td)
+                                        last_cmd = td
+                                        reason = "lidar:FORWARD but blocked -> lock turn"
+                                    else:
+                                        best = pick_direction(pts, clr)
+                                        if best in ("TURN_LEFT", "TURN_RIGHT"):
+                                            turn_lock.arm(best)
+                                            last_cmd = best
+                                            reason = f"best={best} -> lock turn"
+                                        else:
+                                            last_cmd = best
+                                            reason = f"best={best}"
+
+                                elif dec in ("TURN_LEFT", "TURN_RIGHT"):
+                                    turn_lock.arm(dec)
+                                    last_cmd = dec
+                                    reason = f"lidar:{dec} -> lock"
+
+                                else:  # STOP
+                                    best = pick_direction(pts, clr)
+                                    if best in ("TURN_LEFT", "TURN_RIGHT"):
+                                        turn_lock.arm(best)
+                                        last_cmd = best
+                                        reason = f"lidar:STOP -> pick {best} lock"
+                                    else:
+                                        # nếu STOP nhưng front vẫn OK, có thể là lidar jitter -> tự quyết
+                                        last_cmd = best
+                                        reason = f"lidar:STOP -> pick {best}"
 
             # Send cmd (rate-limited)
             last_sent_cmd, last_sent_ts = send_cmd_rate_limited(
@@ -1183,6 +1057,7 @@ def main():
             )
 
             # Update map
+            esc_state, esc_until, esc_turn_cmd, _ = escape.snapshot()
             map_server.update(
                 points=pts,
                 clearance=clr,
@@ -1192,25 +1067,23 @@ def main():
                 lidar_dec_norm=lidar_dec_norm or "",
                 cam_label=cam_label,
                 pred_collide=pred_collide,
-                collision=collision_now,
-                reason=reason
+                reason=reason,
+                escape_state=esc_state,
+                lock_turn_cmd=(turn_lock.get() or esc_turn_cmd or ""),
             )
 
             # Debug log
-            now = time.time()
             if (now - last_dbg_ts) >= DBG_PRINT_EVERY_SEC:
                 last_dbg_ts = now
                 scan_keys = list(scan_js.keys()) if isinstance(scan_js, dict) else []
-                hold_info = holding if holding else "-"
                 c0 = corridor_clearance_cm(pts, 0.0) if pts else float("inf")
                 print(
-                    f"[DBG] hold={hold_info} pts={len(pts)} "
+                    f"[DBG] esc={esc_state} lock={turn_lock.get() or '-'} "
                     f"front={front_cm:.1f} left={clr.get('LEFT',9999.0):.1f} right={clr.get('RIGHT',9999.0):.1f} "
                     f"c0={c0:.1f} pred_th={required_forward_cm():.1f} pred_collide={pred_collide} "
-                    f"collision={collision_now} "
                     f"lidar_dec_raw={lidar_dec_raw} lidar_dec_norm={lidar_dec_norm} "
-                    f"cam_label={cam_label!r} cam_clear={cam_clear} -> cmd={last_cmd} "
-                    f"| reason={reason} | scan_keys={scan_keys}",
+                    f"cam_label={cam_label!r} cam_clear={cam_clear} -> cmd={last_cmd} | reason={reason} "
+                    f"| scan_keys={scan_keys}",
                     flush=True
                 )
 
@@ -1222,10 +1095,6 @@ def main():
     finally:
         try:
             gp.stop()
-        except Exception:
-            pass
-        try:
-            coldet.stop()
         except Exception:
             pass
         try:
