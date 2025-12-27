@@ -444,7 +444,7 @@ function draw(data) {{
     const sy = oy - y * 1.1 * scale;
 
     const b = Math.max(40, Math.min(255, 300 - d));
-    ctx.fillStyle = `rgb(${b},${b},${b})`;
+    ctx.fillStyle = `rgb(${{b}},${{b}},${{b}})`;
     ctx.fillRect(sx, sy, 2, 2);
   }}
 
