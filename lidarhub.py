@@ -12,7 +12,7 @@ from typing import Dict, Any, List, Tuple, Optional
 from flask import Flask, jsonify, Response
 
 # ============================================================
-# ORIENTATION LOCKED (đúng theo hướng quay mặt đúng của bạn)
+# ORIENTATION LOCKED (đúng theo hướng mặt robot của bạn)
 # ============================================================
 FRONT_CENTER_DEG_HARD = 0.0   # set cứng
 FRONT_MIRROR_HARD = 0         # set cứng
@@ -41,7 +41,7 @@ THROTTLE_S = THROTTLE_MS / 1000.0
 # ===== FRONT 180 =====
 FRONT_HALF_DEG = float(os.environ.get("FRONT_HALF_DEG", "90.0"))
 
-# Snapshot window: tránh smear khi đang xoay
+# Snapshot window: giảm smear khi robot đang xoay
 FRAME_SEC = float(os.environ.get("FRAME_SEC", "0.20"))
 
 # ===== k=3 sectors =====
@@ -61,8 +61,11 @@ CLEAR_STREAK_N = int(os.environ.get("CLEAR_STREAK_N", "2"))
 EMERGENCY_STOP_M = float(os.environ.get("EMERGENCY_STOP_M", "0.25"))
 EMERGENCY_REARM_M = float(os.environ.get("EMERGENCY_REARM_M", "0.45"))
 
-# Debounce label
+# Debounce label (chống nhảy label)
 LABEL_CONFIRM_N = int(os.environ.get("LABEL_CONFIRM_N", "2"))
+
+# ===== Avoid timeout (tránh bị kẹt turn vô hạn) =====
+AVOID_MAX_SEC = float(os.environ.get("AVOID_MAX_SEC", "4.0"))
 
 # ===== Rendering =====
 VIEW_SIZE_PX = int(os.environ.get("VIEW_SIZE_PX", "720"))
@@ -105,6 +108,7 @@ _avoid_lock = threading.Lock()
 _avoid_active: bool = False
 _avoid_clear_streak: int = 0
 _avoid_dir: str = "TURN_RIGHT"  # TURN_RIGHT / TURN_LEFT
+_avoid_start_ts: float = 0.0
 
 # ===== Emergency gate =====
 _em_lock = threading.Lock()
@@ -160,20 +164,55 @@ def _sector_name(rel_deg: float) -> Optional[str]:
 
 
 # =======================
+# Reset logic (FIX kẹt turn)
+# =======================
+def _reset_all_logic():
+    """
+    Reset về "như từ đầu" để robot tính lại fresh:
+    - tắt avoid + reset streak + reset dir default
+    - re-arm emergency gate
+    - reset label debounce
+    """
+    global _avoid_active, _avoid_clear_streak, _avoid_dir, _avoid_start_ts
+    global _em_stop_armed, _em_stop_issued_this_event
+    global _out_label, _pending_label, _pending_n
+
+    with _avoid_lock:
+        _avoid_active = False
+        _avoid_clear_streak = 0
+        _avoid_dir = "TURN_RIGHT"
+        _avoid_start_ts = 0.0
+
+    with _em_lock:
+        _em_stop_armed = True
+        _em_stop_issued_this_event = False
+
+    with _label_lock:
+        _out_label = "STOP"
+        _pending_label = ""
+        _pending_n = 0
+
+
+# =======================
 # Avoid / Emergency gates
 # =======================
 def _avoid_set(active: bool, direction: Optional[str] = None):
-    global _avoid_active, _avoid_clear_streak, _avoid_dir
+    global _avoid_active, _avoid_clear_streak, _avoid_dir, _avoid_start_ts
     with _avoid_lock:
         _avoid_active = bool(active)
         if direction in ("TURN_RIGHT", "TURN_LEFT"):
             _avoid_dir = direction
-        if not active:
+        if active:
+            if _avoid_start_ts <= 0.0:
+                _avoid_start_ts = time.time()
+        else:
             _avoid_clear_streak = 0
+            _avoid_start_ts = 0.0
+            _avoid_dir = "TURN_RIGHT"
 
-def _avoid_get() -> Tuple[bool, int, str]:
+def _avoid_get() -> Tuple[bool, int, str, float]:
     with _avoid_lock:
-        return bool(_avoid_active), int(_avoid_clear_streak), str(_avoid_dir)
+        return bool(_avoid_active), int(_avoid_clear_streak), str(_avoid_dir), float(_avoid_start_ts)
 
 def _avoid_streak_inc():
     global _avoid_clear_streak
@@ -361,23 +400,34 @@ def _unknown(sec: Dict[str, Any]) -> bool:
     return int(sec.get("count", 0)) < int(MIN_SECTOR_POINTS)
 
 def _is_clear_forward(C: Dict[str, Any], min_front: float) -> bool:
-    # Clear khi CENTER đủ điểm + kmean > CLEAR_GO + min_front > CLEAR_GO
+    # Bình thường: cần CENTER đủ điểm để tin
     if _unknown(C):
         return False
     return (float(C["kmean_near"]) > float(CLEAR_GO_M)) and (float(min_front) > float(CLEAR_GO_M))
 
+def _is_clear_forward_relaxed(C: Dict[str, Any], min_front: float) -> bool:
+    """
+    FIX kẹt turn:
+    Trong avoid mode, nếu min_front đã > CLEAR_GO_M thì coi như clear,
+    KHÔNG bị kẹt vì thiếu điểm CENTER.
+    """
+    if float(min_front) <= float(CLEAR_GO_M):
+        return False
+    # nếu CENTER có đủ điểm thì check thêm kmean; còn không thì cho qua
+    if not _unknown(C):
+        return float(C["kmean_near"]) > float(CLEAR_GO_M)
+    return True
+
 def _choose_turn_dir(L: Dict[str, Any], R: Dict[str, Any]) -> str:
-    # chọn hướng thoáng hơn dựa trên kmean_near (nếu unknown thì coi là rất xấu)
+    # chọn hướng thoáng hơn dựa trên kmean_near (unknown coi là xấu)
     l_ok = not _unknown(L)
     r_ok = not _unknown(R)
 
     l_val = float(L["kmean_near"]) if l_ok else -1.0
     r_val = float(R["kmean_near"]) if r_ok else -1.0
 
-    # nếu cả hai unknown => default TURN_RIGHT
     if l_val < 0 and r_val < 0:
         return "TURN_RIGHT"
-
     return "TURN_LEFT" if l_val > r_val else "TURN_RIGHT"
 
 
@@ -409,12 +459,13 @@ def _smooth_label(raw: str) -> str:
 
 
 # =======================
-# Decision logic (ĐÚNG THEO Ý BẠN)
-# - Ưu tiên GO_STRAIGHT nếu clear
-# - TURN chỉ xảy ra SAU khi STOP (emergency) xảy ra trước đó
+# Decision logic
+# - STOP (one-shot) -> enter avoid (turn L/R)
+# - Avoid: nếu clear -> RESET ALL LOGIC rồi GO_STRAIGHT
+# - Không còn kẹt TURN do thiếu điểm CENTER
 # =======================
 def _pack_decision(label: str, reason: str, secs: Dict[str, Dict[str, Any]], min_front: float,
-                   avoid_active: bool, clear_streak: int, avoid_dir: str) -> Dict[str, Any]:
+                   avoid_active: bool, clear_streak: int, avoid_dir: str, avoid_age: float) -> Dict[str, Any]:
     return {
         "ok": True,
         "label": label,
@@ -433,7 +484,13 @@ def _pack_decision(label: str, reason: str, secs: Dict[str, Dict[str, Any]], min
                 "RIGHT": secs["RIGHT"],
             },
             "min_front": float(min_front),
-            "avoid": {"active": bool(avoid_active), "clear_streak": int(clear_streak), "dir": avoid_dir},
+            "avoid": {
+                "active": bool(avoid_active),
+                "clear_streak": int(clear_streak),
+                "dir": avoid_dir,
+                "age_s": float(avoid_age),
+                "max_s": float(AVOID_MAX_SEC),
+            },
             "emergency": {"armed": _em_is_armed(), "issued_this_event": _em_was_issued_this_event()},
             "thresholds": {
                 "clear_go_m": float(CLEAR_GO_M),
@@ -452,7 +509,7 @@ def _compute_decision() -> Dict[str, Any]:
     front_pts, last_ts = _collect_front_points(limit=2400)
 
     if (not front_pts) or ((now - last_ts) > 2.0):
-        _avoid_set(False)
+        _reset_all_logic()
         raw = {"ok": False, "label": "STOP", "reason": "no_recent_front180_points", "ts": now}
         raw["label"] = _smooth_label(raw["label"])
         return raw
@@ -467,10 +524,11 @@ def _compute_decision() -> Dict[str, Any]:
     # 1) Emergency STOP one-shot
     if (min_front <= float(EMERGENCY_STOP_M)) and _em_is_armed():
         _em_disarm_after_issue()
-
-        # bật avoid, chọn hướng thoáng hơn
         turn_dir = _choose_turn_dir(L, R)
         _avoid_set(True, turn_dir)
+
+        avoid_active, streak, avoid_dir, start_ts = _avoid_get()
+        avoid_age = (time.time() - start_ts) if start_ts > 0 else 0.0
 
         raw = _pack_decision(
             label="STOP",
@@ -480,6 +538,7 @@ def _compute_decision() -> Dict[str, Any]:
             avoid_active=True,
             clear_streak=0,
             avoid_dir=turn_dir,
+            avoid_age=avoid_age,
         )
         raw["label"] = _smooth_label(raw["label"])
         return raw
@@ -488,31 +547,44 @@ def _compute_decision() -> Dict[str, Any]:
     if (min_front > float(EMERGENCY_REARM_M)) and (not _em_is_armed()):
         _em_arm()
 
-    # 2) Nếu đang avoid (chỉ có thể xảy ra sau STOP)
-    avoid_active, streak, avoid_dir = _avoid_get()
+    # 2) Avoid mode (chỉ có thể xảy ra sau STOP)
+    avoid_active, streak, avoid_dir, start_ts = _avoid_get()
+    avoid_age = (time.time() - start_ts) if start_ts > 0 else 0.0
+
     if avoid_active:
-        clear_now = _is_clear_forward(C, min_front)
+        # timeout safety: tránh bị kẹt vô hạn
+        if avoid_age >= float(AVOID_MAX_SEC):
+            _reset_all_logic()
+            # tính lại fresh ngay lập tức (fallthrough)
+            avoid_active, streak, avoid_dir, start_ts = _avoid_get()
+            avoid_age = 0.0
+
+        clear_now = _is_clear_forward_relaxed(C, min_front)
         if clear_now:
             _avoid_streak_inc()
         else:
             _avoid_streak_reset()
 
-        avoid_active2, streak2, avoid_dir2 = _avoid_get()
+        avoid_active2, streak2, avoid_dir2, start_ts2 = _avoid_get()
+        avoid_age2 = (time.time() - start_ts2) if start_ts2 > 0 else 0.0
+
         if streak2 >= int(CLEAR_STREAK_N):
-            _avoid_set(False)
+            # ✅ FIX chính: thoát avoid xong là RESET toàn bộ state để tính lại từ đầu
+            _reset_all_logic()
             raw = _pack_decision(
                 label="GO_STRAIGHT",
-                reason="avoid_clear_confirmed -> go_straight",
+                reason="avoid_clear_confirmed -> RESET_STATE -> go_straight",
                 secs=secs,
                 min_front=min_front,
                 avoid_active=False,
                 clear_streak=streak2,
                 avoid_dir=avoid_dir2,
+                avoid_age=avoid_age2,
             )
             raw["label"] = _smooth_label(raw["label"])
             return raw
 
-        # continue turning in chosen direction
+        # Continue turning theo hướng đã chọn
         raw = _pack_decision(
             label=avoid_dir2,
             reason="avoid_mode_turn_until_clear (triggered_by_stop)",
@@ -521,11 +593,12 @@ def _compute_decision() -> Dict[str, Any]:
             avoid_active=True,
             clear_streak=streak2,
             avoid_dir=avoid_dir2,
+            avoid_age=avoid_age2,
         )
         raw["label"] = _smooth_label(raw["label"])
         return raw
 
-    # 3) Bình thường: ƯU TIÊN GO_STRAIGHT nếu clear
+    # 3) Normal mode: ưu tiên GO_STRAIGHT nếu clear
     if _is_clear_forward(C, min_front):
         raw = _pack_decision(
             label="GO_STRAIGHT",
@@ -534,13 +607,13 @@ def _compute_decision() -> Dict[str, Any]:
             min_front=min_front,
             avoid_active=False,
             clear_streak=0,
-            avoid_dir=avoid_dir,
+            avoid_dir="TURN_RIGHT",
+            avoid_age=0.0,
         )
         raw["label"] = _smooth_label(raw["label"])
         return raw
 
-    # 4) Không clear nhưng CHƯA có STOP => vẫn GO_STRAIGHT (theo yêu cầu của bạn)
-    # (robot thật sẽ dựa nodejs/logic khác để quyết định dừng / đi chậm / v.v.)
+    # 4) Không clear nhưng chưa emergency stop => theo policy của bạn vẫn GO_STRAIGHT
     raw = _pack_decision(
         label="GO_STRAIGHT",
         reason="not_clear_but_no_emergency_stop -> still_go_straight (per_policy)",
@@ -548,7 +621,8 @@ def _compute_decision() -> Dict[str, Any]:
         min_front=min_front,
         avoid_active=False,
         clear_streak=0,
-        avoid_dir=avoid_dir,
+        avoid_dir="TURN_RIGHT",
+        avoid_age=0.0,
     )
     raw["label"] = _smooth_label(raw["label"])
     return raw
@@ -624,7 +698,6 @@ def _render_map_png(decision: Dict[str, Any], front_points: List[Dict[str, Any]]
         if 0 <= px < W and 0 <= py < H:
             img.putpixel((px, py), (80, 80, 80))
 
-    # action arrow
     if label == "GO_STRAIGHT":
         ax, ay = rel_to_px(0.0, min(1.0, VIEW_RANGE_M * 0.9))
         draw.line((cx, cy, ax, ay), fill=(0, 0, 0), width=4)
@@ -658,11 +731,13 @@ def _render_map_png(decision: Dict[str, Any], front_points: List[Dict[str, Any]]
         tx, ty = rel_to_px(rel, min(SECTOR_RING_M * 0.85, VIEW_RANGE_M))
         draw.text((tx - 35, ty - 10), f"{name}:{fmt_dist(d)}", fill=(0, 0, 0), font=font_small)
 
+    avoid_dbg = dbg.get("avoid", {}) if isinstance(dbg, dict) else {}
     hud = [
         f"label: {label}",
         f"front_center={FRONT_CENTER_DEG_HARD:.1f} mirror={FRONT_MIRROR_HARD} flip={FRONT_FLIP_HARD}",
         f"frame_sec={FRAME_SEC:.2f} k_near={K_NEAR} confirm_n={LABEL_CONFIRM_N}",
-        f"clear_go={CLEAR_GO_M:.2f}m  emergency_stop={EMERGENCY_STOP_M:.2f}m",
+        f"clear_go={CLEAR_GO_M:.2f}m em_stop={EMERGENCY_STOP_M:.2f}m avoid_max={AVOID_MAX_SEC:.1f}s",
+        f"avoid: active={avoid_dbg.get('active')} dir={avoid_dbg.get('dir')} streak={avoid_dbg.get('clear_streak')} age={avoid_dbg.get('age_s')}",
         f"L={fmt_dist(dL)} C={fmt_dist(dC)} R={fmt_dist(dR)}",
         f"reason: {str(decision.get('reason',''))[:90]}",
     ]
@@ -671,6 +746,7 @@ def _render_map_png(decision: Dict[str, Any], front_points: List[Dict[str, Any]]
         draw.text((10, y0), s, fill=(0, 0, 0), font=font)
         y0 += 22
 
+    import io
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
@@ -749,7 +825,8 @@ def api_status():
         dec = dict(latest_decision_full)
         lbl = latest_decision_label
 
-    avoid_active, streak, avoid_dir = _avoid_get()
+    avoid_active, streak, avoid_dir, start_ts = _avoid_get()
+    avoid_age = (time.time() - start_ts) if start_ts > 0 else 0.0
     now = time.time()
 
     return jsonify({
@@ -770,11 +847,8 @@ def api_status():
             "frame_sec": float(FRAME_SEC),
         },
 
-        "avoid": {"active": bool(avoid_active), "clear_streak": int(streak), "dir": avoid_dir},
-        "emergency": {
-            "armed": _em_is_armed(),
-            "issued_this_event": _em_was_issued_this_event(),
-        },
+        "avoid": {"active": bool(avoid_active), "clear_streak": int(streak), "dir": avoid_dir, "age_s": float(avoid_age)},
+        "emergency": {"armed": _em_is_armed(), "issued_this_event": _em_was_issued_this_event()},
 
         "thresholds": {
             "clear_go_m": float(CLEAR_GO_M),
@@ -782,6 +856,7 @@ def api_status():
             "min_sector_points": int(MIN_SECTOR_POINTS),
             "k_near": int(K_NEAR),
             "label_confirm_n": int(LABEL_CONFIRM_N),
+            "avoid_max_sec": float(AVOID_MAX_SEC),
             "emergency_stop_m": float(EMERGENCY_STOP_M),
             "emergency_rearm_m": float(EMERGENCY_REARM_M),
         },
@@ -827,6 +902,11 @@ def api_map_png():
             _map_cache["ts"] = time.time()
     return Response(png, mimetype="image/png")
 
+@app.post("/api/reset_logic")
+def api_reset_logic():
+    _reset_all_logic()
+    return jsonify({"ok": True})
+
 @app.get("/dashboard")
 def dashboard():
     html = f"""
@@ -839,10 +919,11 @@ def dashboard():
           img {{ border:1px solid #ccc; border-radius:8px; }}
           .box {{ padding:10px; border:1px solid #ddd; border-radius:8px; min-width: 420px; }}
           .mono {{ font-family: monospace; white-space: pre; }}
+          button {{ padding:6px 10px; }}
         </style>
       </head>
       <body>
-        <h3>LiDAR Front-180 Map + k=3 sectors (STOP -> TURN(L/R) until clear)</h3>
+        <h3>LiDAR Front-180 Map (STOP -> TURN, clear -> RESET STATE)</h3>
         <div class="row">
           <img id="map" src="/api/map.png?ts={time.time()}" width="{VIEW_SIZE_PX}" height="{VIEW_SIZE_PX}"/>
           <div class="box">
@@ -852,6 +933,7 @@ def dashboard():
   "mirror": {FRONT_MIRROR_HARD},
   "flip": {FRONT_FLIP_HARD}
 }}</div>
+            <button onclick="resetLogic()">Reset Logic</button>
             <hr/>
             <div><b>Decision</b></div>
             <div id="label" class="mono">loading...</div>
@@ -862,6 +944,12 @@ def dashboard():
         </div>
 
         <script>
+          async function resetLogic() {{
+            try {{
+              await fetch('/api/reset_logic', {{ method:'POST' }});
+            }} catch(e) {{}}
+          }}
+
           async function tick() {{
             try {{
               const d = await fetch('/api/decision').then(r=>r.json());
@@ -903,7 +991,7 @@ def dashboard():
 @app.get("/")
 def home():
     return Response(
-        "<h3>lidarhub_front180_stop_then_turn running</h3>"
+        "<h3>lidarhub_front180_stop_then_turn_reset running</h3>"
         "<ul>"
         "<li><a href='/dashboard'>/dashboard</a></li>"
         "<li>/api/map.png</li>"
@@ -911,6 +999,7 @@ def home():
         "<li>/api/decision</li>"
         "<li>/api/decision_label</li>"
         "<li>/api/status</li>"
+        "<li>/api/reset_logic (POST)</li>"
         "</ul>",
         mimetype="text/html"
     )
@@ -920,6 +1009,7 @@ def home():
 # Main
 # =======================
 def main():
+    _reset_all_logic()
     threading.Thread(target=lidar_thread_main, daemon=True).start()
     threading.Thread(target=points_worker, daemon=True).start()
     threading.Thread(target=decision_worker, daemon=True).start()
