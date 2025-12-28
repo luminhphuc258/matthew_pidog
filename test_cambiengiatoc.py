@@ -4,14 +4,11 @@
 from smbus2 import SMBus
 from time import sleep, time
 import math
-import sys
+import statistics as stats
 
-# ====== I2C addresses (the ones you scanned) ======
-ADDR_ACC = 0x36   # Acc + Gyro (SH3001)
-
+ADDR_ACC = 0x36
 BUS_ID = 1
 
-# ====== regs (the ones from your code) ======
 REG_AX = 0x01
 REG_AY = 0x03
 REG_AZ = 0x05
@@ -19,30 +16,28 @@ REG_GX = 0x07
 REG_GY = 0x09
 REG_GZ = 0x0B
 
-# Optional WHO_AM_I (may differ by SH3001 implementation; safe read)
-REG_WHOAMI_CANDIDATES = [0x30, 0x0F, 0x1A]  # try a few common ones
-REG_TEMP_CANDIDATES = [0x0D, 0x0E, 0x09]    # your temp reg in sample was 0x09 (but that overlaps GY), so keep optional
+# sampling
+DT = 0.02          # 50 Hz (quan trọng để bắt va chạm)
+CALIB_S = 3.0      # đứng yên để calibrate
+COOLDOWN_S = 0.8   # tránh spam CRASH liên tục
 
-# ====== Detection thresholds (tune if needed) ======
-# raw units unknown -> use relative thresholding
-JERK_THRESHOLD = 8000.0      # accel delta magnitude / sample
-GYRO_SPIKE_THRESHOLD = 12000.0  # gyro magnitude (after bias removal)
-CRASH_COOLDOWN_S = 1.0       # avoid spamming crash events
+# sensitivity (tăng/giảm nếu muốn)
+K_JERK = 8.0       # jerk threshold = mean + K*std
+K_GYRO = 8.0
+K_ACCDELTA = 6.0
 
-# ====== Calibration ======
-CALIB_SECONDS = 2.5
-SAMPLE_DT = 0.10  # 10Hz (match your sleep)
+# minimum thresholds (để khỏi quá nhạy nếu noise thấp)
+MIN_JERK_TH = 40.0
+MIN_GYRO_TH = 10.0
+MIN_ACCDELTA_TH = 30.0
 
 bus = SMBus(BUS_ID)
-
-def read_u8(addr, reg):
-    return bus.read_byte_data(addr, reg)
 
 def read_word(addr, reg):
     hi = bus.read_byte_data(addr, reg)
     lo = bus.read_byte_data(addr, reg + 1)
     val = (hi << 8) | lo
-    if val & 0x8000:  # signed
+    if val & 0x8000:
         val -= 65536
     return val
 
@@ -58,86 +53,91 @@ def read_gyro_raw():
     gz = read_word(ADDR_ACC, REG_GZ)
     return gx, gy, gz
 
-def try_read_whoami():
-    for r in REG_WHOAMI_CANDIDATES:
-        try:
-            v = read_u8(ADDR_ACC, r)
-            return r, v
-        except Exception:
-            pass
-    return None, None
-
-def try_read_temp():
-    for r in REG_TEMP_CANDIDATES:
-        try:
-            raw = read_word(ADDR_ACC, r)
-            # generic SH3001-ish conversion (may be wrong; use just for "changes")
-            temp_c = raw / 512.0 + 23.0
-            return r, raw, temp_c
-        except Exception:
-            pass
-    return None, None, None
-
-def vec_mag(x, y, z):
+def mag3(x, y, z):
     return math.sqrt(x*x + y*y + z*z)
 
-def now_str():
-    t = time()
-    ms = int((t - int(t)) * 1000)
-    return f"{time():.3f}"
+def mean_std(xs):
+    if len(xs) < 2:
+        return (xs[0] if xs else 0.0), 0.0
+    return stats.mean(xs), stats.pstdev(xs)
 
 def main():
-    print("=== IMU SH3001 QUICK TEST (PiDog) ===")
-    print(f"I2C addr: 0x{ADDR_ACC:02X} bus: {BUS_ID}")
+    print("=== IMU SH3001 CRASH TEST (AUTO THRESHOLD) ===")
+    print(f"I2C addr=0x{ADDR_ACC:02X} bus={BUS_ID}  dt={DT}s")
 
-    # Basic read test
+    # quick read check
     try:
         ax, ay, az = read_accel_raw()
         gx, gy, gz = read_gyro_raw()
-        print(f"[BOOT] raw read OK | ACC=({ax},{ay},{az}) GYRO=({gx},{gy},{gz})")
+        print(f"[BOOT] ACC=({ax},{ay},{az}) GYRO=({gx},{gy},{gz})")
     except Exception as e:
-        print("[BOOT] ERROR: cannot read IMU from I2C:", e)
-        print("Tips: check wiring, i2c enabled, correct bus=1, address=0x36.")
-        sys.exit(1)
+        print("[BOOT] ERROR reading IMU:", e)
+        return
 
-    who_r, who_v = try_read_whoami()
-    if who_r is not None:
-        print(f"[BOOT] WHO_AM_I? reg=0x{who_r:02X} val=0x{who_v:02X} (optional)")
-    else:
-        print("[BOOT] WHO_AM_I read: not available (optional)")
-
-    tr, traw, tc = try_read_temp()
-    if tr is not None:
-        print(f"[BOOT] TEMP? reg=0x{tr:02X} raw={traw} approx={tc:.2f}C (optional)")
-    else:
-        print("[BOOT] TEMP read: not available (optional)")
-
-    # ====== Calibrate gyro bias ======
-    print(f"\n[CALIB] Hold robot still for {CALIB_SECONDS:.1f}s... calibrating gyro bias")
+    print(f"\n[CALIB] Giữ robot đứng yên {CALIB_S:.1f}s để auto set ngưỡng...")
     t0 = time()
-    n = 0
-    sum_gx = sum_gy = sum_gz = 0.0
-    while time() - t0 < CALIB_SECONDS:
-        gx, gy, gz = read_gyro_raw()
-        sum_gx += gx
-        sum_gy += gy
-        sum_gz += gz
-        n += 1
-        sleep(SAMPLE_DT)
 
-    bias_gx = sum_gx / max(1, n)
-    bias_gy = sum_gy / max(1, n)
-    bias_gz = sum_gz / max(1, n)
-    print(f"[CALIB] done. gyro_bias=({bias_gx:.1f},{bias_gy:.1f},{bias_gz:.1f}) samples={n}\n")
+    jerk_samples = []
+    gyro_samples = []
+    accmag_samples = []
+    accdelta_samples = []
 
-    # ====== Main loop: detect movement + crash ======
+    # gyro bias
+    gxs, gys, gzs = [], [], []
+
     last_ax, last_ay, last_az = read_accel_raw()
-    last_t = time()
-    last_crash_t = 0.0
+    last_accmag = mag3(last_ax, last_ay, last_az)
 
-    print("Columns:")
-    print("  t | acc_mag | jerk | gyro_mag | flags")
-    print("-----------------------------------------------------------")
+    while time() - t0 < CALIB_S:
+        ax, ay, az = read_accel_raw()
+        gx, gy, gz = read_gyro_raw()
+
+        gxs.append(gx); gys.append(gy); gzs.append(gz)
+
+        accmag = mag3(ax, ay, az)
+        accmag_samples.append(accmag)
+
+        dax, day, daz = ax-last_ax, ay-last_ay, az-last_az
+        jerk = mag3(dax, day, daz)
+        jerk_samples.append(jerk)
+
+        accdelta = abs(accmag - last_accmag)
+        accdelta_samples.append(accdelta)
+
+        # gyro mag (raw during still)
+        gyro_samples.append(mag3(gx, gy, gz))
+
+        last_ax, last_ay, last_az = ax, ay, az
+        last_accmag = accmag
+
+        sleep(DT)
+
+    bias_gx = stats.mean(gxs) if gxs else 0.0
+    bias_gy = stats.mean(gys) if gys else 0.0
+    bias_gz = stats.mean(gzs) if gzs else 0.0
+
+    jerk_mu, jerk_sd = mean_std(jerk_samples)
+    gyro_mu, gyro_sd = mean_std(gyro_samples)
+    accdelta_mu, accdelta_sd = mean_std(accdelta_samples)
+    accmag_mu, accmag_sd = mean_std(accmag_samples)
+
+    jerk_th = max(MIN_JERK_TH, jerk_mu + K_JERK * jerk_sd)
+    gyro_th = max(MIN_GYRO_TH, gyro_mu + K_GYRO * gyro_sd)
+    accdelta_th = max(MIN_ACCDELTA_TH, accdelta_mu + K_ACCDELTA * accdelta_sd)
+
+    print("[CALIB] done.")
+    print(f"  gyro_bias=({bias_gx:.1f},{bias_gy:.1f},{bias_gz:.1f})")
+    print(f"  jerk:     mean={jerk_mu:.1f} sd={jerk_sd:.1f}  -> TH={jerk_th:.1f}")
+    print(f"  gyro_mag: mean={gyro_mu:.1f} sd={gyro_sd:.1f}  -> TH={gyro_th:.1f}")
+    print(f"  accΔmag:  mean={accdelta_mu:.1f} sd={accdelta_sd:.1f} -> TH={accdelta_th:.1f}")
+    print(f"  acc_mag baseline≈{accmag_mu:.1f} (sd={accmag_sd:.1f})\n")
+
+    print("Columns: t | acc_mag | jerk | gyro_mag | accΔ | flags")
+    print("--------------------------------------------------------------")
+
+    last_ax, last_ay, last_az = read_accel_raw()
+    last_accmag = mag3(last_ax, last_ay, last_az)
+    last_crash_t = 0.0
 
     while True:
         try:
@@ -149,36 +149,33 @@ def main():
             gy2 = gy - bias_gy
             gz2 = gz - bias_gz
 
-            acc_mag = vec_mag(ax, ay, az)
-            gyro_mag = vec_mag(gx2, gy2, gz2)
+            accmag = mag3(ax, ay, az)
+            gyro_mag = mag3(gx2, gy2, gz2)
 
-            # jerk = delta accel magnitude-ish (raw)
-            dax = ax - last_ax
-            day = ay - last_ay
-            daz = az - last_az
-            jerk = vec_mag(dax, day, daz)
+            dax, day, daz = ax-last_ax, ay-last_ay, az-last_az
+            jerk = mag3(dax, day, daz)
+
+            accdelta = abs(accmag - last_accmag)
 
             flags = []
-            moving = (jerk > (JERK_THRESHOLD * 0.25)) or (gyro_mag > (GYRO_SPIKE_THRESHOLD * 0.25))
-            if moving:
+            if jerk > jerk_th * 0.35 or gyro_mag > gyro_th * 0.35:
                 flags.append("MOVE")
 
-            crash = (jerk >= JERK_THRESHOLD) or (gyro_mag >= GYRO_SPIKE_THRESHOLD)
-            if crash and (time() - last_crash_t) >= CRASH_COOLDOWN_S:
+            crash = (jerk >= jerk_th) or (gyro_mag >= gyro_th) or (accdelta >= accdelta_th)
+            if crash and (time() - last_crash_t) >= COOLDOWN_S:
                 flags.append("CRASH!")
                 last_crash_t = time()
 
-            # print log
-            tstamp = time()
-            print(f"{tstamp:10.3f} | {acc_mag:8.1f} | {jerk:8.1f} | {gyro_mag:9.1f} | {' '.join(flags) if flags else '-'}")
+            ts = time()
+            print(f"{ts:10.3f} | {accmag:7.1f} | {jerk:6.1f} | {gyro_mag:7.1f} | {accdelta:6.1f} | {' '.join(flags) if flags else '-'}")
 
             last_ax, last_ay, last_az = ax, ay, az
-            last_t = tstamp
+            last_accmag = accmag
 
         except Exception as e:
             print(f"{time():10.3f} | ERROR: {e}")
 
-        sleep(SAMPLE_DT)
+        sleep(DT)
 
 if __name__ == "__main__":
     main()
