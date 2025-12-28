@@ -1,1106 +1,562 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
-import re
+"""
+LiDAR Hub (Port 9399)
+- Endpoints:
+    GET  /api/status              -> JSON status
+    GET  /api/decision_label      -> TEXT: STOP / GO_STRAIGHT / TURN_LEFT / TURN_RIGHT
+    GET  /api/decision            -> JSON decision + sectors (debug)
+    GET  /take_lidar_data         -> JSON last scan (points + derived fields)
+    POST /ingest_scan             -> PUSH raw scan into hub (recommended)
+    POST /api/pose                -> Optional: update pose from your odom (x,y,yaw_deg)
+- Decision recomputed continuously (no sticky direction).
+"""
+
 import time
 import math
 import threading
-import subprocess
-from typing import Dict, Any, List, Tuple, Optional
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, List, Optional, Tuple
 
-from flask import Flask, jsonify, Response, request
+import requests
+from flask import Flask, jsonify, request, Response
 
-# =======================
-# CONFIG (env overridable)
-# =======================
-RPLIDAR_BIN = os.environ.get(
-    "RPLIDAR_BIN",
-    os.path.expanduser("~/rplidar_sdk/output/Linux/Release/ultra_simple")
-)
-RPLIDAR_PORT = os.environ.get("RPLIDAR_PORT", "/dev/ttyUSB0")
-RPLIDAR_BAUD = int(os.environ.get("RPLIDAR_BAUD", "460800"))
+# =========================
+# CONFIG
+# =========================
 
-HTTP_HOST = os.environ.get("HOST", "0.0.0.0")
-HTTP_PORT = int(os.environ.get("PORT", "9399"))
+HOST = "0.0.0.0"
+PORT = 9399
 
-MAX_RANGE_M = float(os.environ.get("MAX_RANGE_M", "12.0"))
-POINT_LIMIT = int(os.environ.get("POINT_LIMIT", "3000"))
+# How often to recompute decision (Hz). User asked "mỗi giây" -> set to 1.0 if you want.
+DECISION_HZ = 5.0  # change to 1.0 if you want exactly once per second
 
-THROTTLE_MS = int(os.environ.get("THROTTLE_MS", "200"))
-THROTTLE_S = THROTTLE_MS / 1000.0
+# Scan staleness: if last scan older than this -> STOP fail-safe
+MAX_SCAN_AGE_S = 0.50
 
-# Safety / motion model
-STOP_NEAR_M = float(os.environ.get("STOP_NEAR_M", "0.30"))      # stop if center < 30cm
-LOOKAHEAD_M = float(os.environ.get("LOOKAHEAD_M", "1.20"))      # obstacle counting range for sector stats
-PREDICT_T_SEC = float(os.environ.get("PREDICT_T_SEC", "1.0"))
-ROBOT_SPEED_MPS = float(os.environ.get("ROBOT_SPEED_MPS", "0.35"))
-SAFETY_MARGIN_M = float(os.environ.get("SAFETY_MARGIN_M", "0.10"))
+# Mode to get scans:
+#   "PUSH"      -> your LiDAR reader POSTs scans to /ingest_scan
+#   "PULL_HTTP" -> hub pulls from RAW_SCAN_URL
+SCAN_MODE = "PUSH"
 
-# Plot/Heading
-FRONT_CENTER_DEG = float(os.environ.get("FRONT_CENTER_DEG", "0.0"))
-FRONT_MIRROR = int(os.environ.get("FRONT_MIRROR", "0"))  # set 1 if left/right inverted
+# If PULL_HTTP:
+RAW_SCAN_URL = "http://127.0.0.1:9398/scan"  # change if you have a raw scan server
+RAW_SCAN_TIMEOUT_S = 0.25
+RAW_SCAN_PULL_HZ = 10.0
 
-RECENT_SEC = float(os.environ.get("RECENT_SEC", "0.7"))
+# Sector geometry (k=3): CENTER, LEFT, RIGHT
+CENTER_HALF_DEG = 28.0     # CENTER is [-28..+28] degrees relative to front
+FRONT_ARC_DEG = 85.0       # "front hemisphere" considered for safety (wider than CENTER)
 
-# Auto front calib (back wall -> front = back + 180)
-AUTO_FRONT_CALIB = int(os.environ.get("AUTO_FRONT_CALIB", "1"))
-AUTO_CALIB_BIN_DEG = float(os.environ.get("AUTO_CALIB_BIN_DEG", "10.0"))
-AUTO_CALIB_SMOOTH = float(os.environ.get("AUTO_CALIB_SMOOTH", "0.35"))
-AUTO_CALIB_NEAR_CAP_M = float(os.environ.get("AUTO_CALIB_NEAR_CAP_M", "2.0"))
-AUTO_CALIB_PERCENTILE = float(os.environ.get("AUTO_CALIB_PERCENTILE", "20.0"))
+# Filtering
+MIN_QUALITY = 5            # ignore points with q < MIN_QUALITY
+MAX_RANGE_M = 12.0
+USE_ONLY_FRONT_180 = False  # If True -> only consider rel_deg in [-90..+90] for decision
 
-# k=3 sectors in FRONT 180
-SECTOR_CENTER_DEG = float(os.environ.get("SECTOR_CENTER_DEG", "30.0"))  # center half-width (default +-30)
-FRONT_HALF_DEG = float(os.environ.get("FRONT_HALF_DEG", "90.0"))        # front 180 = [-90..+90]
+# Safety distances (tune!)
+HARD_STOP_M = 0.35         # if any obstacle in FRONT_ARC within this -> STOP
+TURN_REQUIRED_M = 0.75     # if obstacle in FRONT_ARC within this -> must TURN (not GO_STRAIGHT)
+GO_CLEAR_M = 0.90          # need at least this clearance to GO_STRAIGHT comfortably
 
-# Sticky turn
-CLEAR_RELEASE_M = float(os.environ.get("CLEAR_RELEASE_M", "0.40"))      # release when center_min > 40cm
-CLEAR_CONFIRM_SEC = float(os.environ.get("CLEAR_CONFIRM_SEC", "0.25"))  # require stable clear a bit
-TURN_STICKY_MIN_SEC = float(os.environ.get("TURN_STICKY_MIN_SEC", "0.35"))
+# If one side is too close, bias to turn away even if center looks ok
+SIDE_TOO_CLOSE_M = 0.55
 
-# ===== Map (occupancy) =====
-MAP_SIZE_M = float(os.environ.get("MAP_SIZE_M", "10.0"))   # world map width/height in meters
-MAP_RES_M = float(os.environ.get("MAP_RES_M", "0.05"))     # meters per cell (0.05 => 20 cells/m)
-MAP_DECAY = float(os.environ.get("MAP_DECAY", "0.985"))    # 0.985 => fade old points slowly
-MAP_HIT = float(os.environ.get("MAP_HIT", "30.0"))         # add value per hit
-MAP_MAX = float(os.environ.get("MAP_MAX", "255.0"))
+# Optional: mirror left/right if your coordinate is flipped
+MIRROR_LEFT_RIGHT = False
 
-# pose dead-reckoning (based on decision)
-TURN_RATE_DEG_S = float(os.environ.get("TURN_RATE_DEG_S", "70.0"))  # turning angular speed estimate
-BACK_SPEED_MPS = float(os.environ.get("BACK_SPEED_MPS", "0.20"))    # if label BACK exists later
+# Small helper: clamp
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
 
-# view render
-VIEW_SIZE_PX = int(os.environ.get("VIEW_SIZE_PX", "640"))           # output image px
-VIEW_RANGE_M = float(os.environ.get("VIEW_RANGE_M", "3.5"))         # visible radius around robot
-SECTOR_RING_M = float(os.environ.get("SECTOR_RING_M", "1.2"))        # ring overlay radius
-SECTOR_ALPHA = int(os.environ.get("SECTOR_ALPHA", "90"))             # 0..255
+def _now() -> float:
+    return time.time()
 
-LINE_RE = re.compile(r"theta:\s*([0-9.]+)\s+Dist:\s*([0-9.]+)\s+Q:\s*(\d+)")
+def _ang_norm_360(deg: float) -> float:
+    deg = deg % 360.0
+    return deg + 360.0 if deg < 0 else deg
+
+def _ang_norm_180(deg: float) -> float:
+    """Normalize to [-180, +180]."""
+    deg = (deg + 180.0) % 360.0 - 180.0
+    return deg
+
+def _safe_float(x: float) -> Optional[float]:
+    if x is None:
+        return None
+    if isinstance(x, float) and (math.isinf(x) or math.isnan(x)):
+        return None
+    return float(x)
+
+@dataclass
+class SectorStats:
+    count: int = 0
+    min_dist: Optional[float] = None
+    avg_dist: Optional[float] = None
+
+@dataclass
+class Decision:
+    label: str = "STOP"
+    reason: str = "boot"
+    ts: float = 0.0
+    sectors: Dict[str, SectorStats] = None
+    front: Dict[str, Any] = None
+
+class LidarHub:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+        self._pose = {"x": 0.0, "y": 0.0, "yaw_deg": 0.0}  # optional external updates
+
+        self._front_center_deg = 180.0  # default; update via ingest if provided
+        self._mirror = bool(MIRROR_LEFT_RIGHT)
+
+        self._last_scan: Optional[Dict[str, Any]] = None
+        self._last_scan_ts: float = 0.0
+
+        self._decision = Decision(
+            label="STOP",
+            reason="boot",
+            ts=_now(),
+            sectors={"LEFT": SectorStats(), "CENTER": SectorStats(), "RIGHT": SectorStats()},
+            front={"min_dist": None, "min_rel_deg": None, "min_angle": None}
+        )
+
+        self._running = True
+        self._pull_thread = None
+        self._decision_thread = None
+
+    # -------------------------
+    # External interface
+    # -------------------------
+    def update_pose(self, x: float, y: float, yaw_deg: float) -> None:
+        with self._lock:
+            self._pose = {"x": float(x), "y": float(y), "yaw_deg": float(yaw_deg)}
+
+    def ingest_scan(self, scan: Dict[str, Any]) -> None:
+        """
+        scan expected minimal format:
+        {
+          "ts": optional timestamp,
+          "frame": { "front_center_deg_used": ..., "back_deg_est": ..., "max_range_m": ... } optional,
+          "points": [ {"angle": deg, "dist_m": float, "q": int} ... ]  (dist_cm also accepted)
+        }
+        """
+        ts = float(scan.get("ts") or _now())
+
+        frame = scan.get("frame") or {}
+        # Prefer explicit front center; else compute from back_deg_est if present
+        if "front_center_deg_used" in frame:
+            fcd = float(frame["front_center_deg_used"])
+        elif "front_center_deg" in frame:
+            fcd = float(frame["front_center_deg"])
+        elif "back_deg_est" in frame:
+            fcd = _ang_norm_360(float(frame["back_deg_est"]) + 180.0)
+        else:
+            fcd = None
+
+        points = scan.get("points") or []
+        # Normalize points: angle, dist_m, q
+        norm_points: List[Dict[str, Any]] = []
+        for p in points:
+            try:
+                ang = float(p.get("angle", p.get("theta", 0.0)))
+                q = int(p.get("q", p.get("quality", 0)))
+                if "dist_m" in p:
+                    dist_m = float(p["dist_m"])
+                elif "dist_cm" in p:
+                    dist_m = float(p["dist_cm"]) / 100.0
+                else:
+                    continue
+                if dist_m <= 0:
+                    continue
+                norm_points.append({"angle": ang, "dist_m": dist_m, "q": q})
+            except Exception:
+                continue
+
+        with self._lock:
+            if fcd is not None:
+                self._front_center_deg = _ang_norm_360(fcd)
+            # max range (optional)
+            if "max_range_m" in frame:
+                # keep max_range if needed later
+                pass
+
+            self._last_scan = {
+                "ok": True,
+                "ts": ts,
+                "n": len(norm_points),
+                "frame": {
+                    "front_center_deg_used": self._front_center_deg,
+                    "mirror": int(self._mirror),
+                    "max_range_m": float(frame.get("max_range_m", MAX_RANGE_M)),
+                },
+                "points_raw": norm_points,
+            }
+            self._last_scan_ts = ts
+
+    def get_status(self) -> Dict[str, Any]:
+        with self._lock:
+            scan_age = _now() - self._last_scan_ts if self._last_scan_ts else None
+            dec_age = _now() - self._decision.ts if self._decision and self._decision.ts else None
+            return {
+                "running": bool(self._running),
+                "scan_age_s": _safe_float(scan_age),
+                "decision_age_s": _safe_float(dec_age),
+                "pose": dict(self._pose),
+                "front_center": float(self._front_center_deg),
+            }
+
+    def get_decision_label(self) -> str:
+        with self._lock:
+            return str(self._decision.label)
+
+    def get_decision_json(self) -> Dict[str, Any]:
+        with self._lock:
+            d = self._decision
+            return {
+                "label": d.label,
+                "reason": d.reason,
+                "ts": d.ts,
+                "sectors": {
+                    k: {
+                        "count": int(v.count),
+                        "min_dist": _safe_float(v.min_dist),
+                        "avg_dist": _safe_float(v.avg_dist),
+                    } for k, v in (d.sectors or {}).items()
+                },
+                "front": dict(d.front or {}),
+            }
+
+    def get_last_scan_debug(self) -> Dict[str, Any]:
+        """
+        Return last scan with derived fields similar to your current output:
+        points: [{angle, dist_m, dist_cm, q, rel_deg, angle_front_360, is_front_180, k3_sector, x, y, ts}, ...]
+        """
+        with self._lock:
+            scan = self._last_scan
+            fcd = self._front_center_deg
+            mirror = self._mirror
+            pose = dict(self._pose)
+
+        if not scan:
+            return {"ok": False, "error": "no_scan"}
+
+        pts = scan.get("points_raw", [])
+        out_points: List[Dict[str, Any]] = []
+
+        for p in pts:
+            ang = float(p["angle"])
+            dist_m = float(p["dist_m"])
+            q = int(p["q"])
+
+            # compute rel_deg: 0 means "front"
+            rel = _ang_norm_180(_ang_norm_360(ang - fcd))
+
+            # optional mirror
+            if mirror:
+                rel = -rel
+
+            is_front_180 = (abs(rel) <= 90.0)
+
+            # sector (k=3)
+            k3 = None
+            if is_front_180:
+                if abs(rel) <= CENTER_HALF_DEG:
+                    k3 = "CENTER"
+                elif rel > CENTER_HALF_DEG:
+                    k3 = "LEFT"
+                else:
+                    k3 = "RIGHT"
+
+            # make angle_front_360 similar concept: 0..360 where 180 is "front_center"? (your client already handles)
+            angle_front_360 = _ang_norm_360(ang - (fcd - 180.0))
+            rel_deg = rel
+
+            # coords for map (keep your "forward is negative x" style)
+            rel_rad = math.radians(rel_deg)
+            x = -dist_m * math.cos(rel_rad)
+            y = -dist_m * math.sin(rel_rad)
+
+            out_points.append({
+                "angle": ang,
+                "theta": ang,
+                "dist_m": dist_m,
+                "dist_cm": dist_m * 100.0,
+                "q": q,
+                "rel_deg": rel_deg,
+                "angle_front_360": angle_front_360,
+                "is_front_180": bool(is_front_180),
+                "k3_sector": k3,
+                "x": x,
+                "y": y,
+                "ts": float(scan.get("ts", _now())),
+            })
+
+        return {
+            "ok": True,
+            "ts": float(scan.get("ts", _now())),
+            "last_point_ts": float(scan.get("ts", _now())),
+            "n": len(out_points),
+            "frame": {
+                "front_center_deg_used": float(fcd),
+                "mirror": int(mirror),
+                "max_range_m": float(scan.get("frame", {}).get("max_range_m", MAX_RANGE_M)),
+                "back_deg_est": float(_ang_norm_360(fcd - 180.0)),
+            },
+            "pose": pose,
+            "points": out_points
+        }
+
+    # -------------------------
+    # Threads
+    # -------------------------
+    def start(self) -> None:
+        self._running = True
+
+        if SCAN_MODE.upper() == "PULL_HTTP":
+            self._pull_thread = threading.Thread(target=self._pull_loop, daemon=True)
+            self._pull_thread.start()
+
+        self._decision_thread = threading.Thread(target=self._decision_loop, daemon=True)
+        self._decision_thread.start()
+
+    def _pull_loop(self) -> None:
+        interval = 1.0 / max(1e-3, float(RAW_SCAN_PULL_HZ))
+        while self._running:
+            t0 = _now()
+            try:
+                r = requests.get(RAW_SCAN_URL, timeout=RAW_SCAN_TIMEOUT_S)
+                if r.ok:
+                    data = r.json()
+                    # data should contain points; we accept flexible format
+                    self.ingest_scan(data)
+            except Exception:
+                pass
+
+            dt = _now() - t0
+            time.sleep(max(0.0, interval - dt))
+
+    def _decision_loop(self) -> None:
+        interval = 1.0 / max(1e-3, float(DECISION_HZ))
+        while self._running:
+            t0 = _now()
+            decision = self._compute_decision()
+            with self._lock:
+                self._decision = decision
+            dt = _now() - t0
+            time.sleep(max(0.0, interval - dt))
+
+    # -------------------------
+    # Core logic (FIXED)
+    # -------------------------
+    def _compute_decision(self) -> Decision:
+        with self._lock:
+            scan = self._last_scan
+            scan_ts = self._last_scan_ts
+            fcd = self._front_center_deg
+            mirror = self._mirror
+
+        now = _now()
+        age = now - scan_ts if scan_ts else 999.0
+
+        # Fail-safe
+        if (not scan) or (age > MAX_SCAN_AGE_S):
+            return Decision(
+                label="STOP",
+                reason=f"fail_safe_no_fresh_scan age={age:.3f}s",
+                ts=now,
+                sectors={"LEFT": SectorStats(), "CENTER": SectorStats(), "RIGHT": SectorStats()},
+                front={"min_dist": None, "min_rel_deg": None, "min_angle": None}
+            )
+
+        pts = scan.get("points_raw", [])
+        # Build derived list for decision quickly
+        derived: List[Tuple[float, float, int]] = []  # (rel_deg, dist_m, q)
+        for p in pts:
+            q = int(p["q"])
+            if q < MIN_QUALITY:
+                continue
+            dist_m = float(p["dist_m"])
+            if dist_m <= 0 or dist_m > MAX_RANGE_M:
+                continue
+
+            ang = float(p["angle"])
+            rel = _ang_norm_180(_ang_norm_360(ang - fcd))
+            if mirror:
+                rel = -rel
+
+            # optionally only consider front half for decision
+            if USE_ONLY_FRONT_180 and abs(rel) > 90.0:
+                continue
+
+            derived.append((rel, dist_m, q))
+
+        if len(derived) < 30:
+            # too few points -> fail-safe
+            return Decision(
+                label="STOP",
+                reason=f"fail_safe_low_points n={len(derived)}",
+                ts=now,
+                sectors={"LEFT": SectorStats(), "CENTER": SectorStats(), "RIGHT": SectorStats()},
+                front={"min_dist": None, "min_rel_deg": None, "min_angle": None}
+            )
+
+        # Compute FRONT ARC minimum (THIS is the key fix)
+        front_min = None
+        front_min_rel = None
+        for rel, dist, _q in derived:
+            if abs(rel) <= FRONT_ARC_DEG:
+                if (front_min is None) or (dist < front_min):
+                    front_min = dist
+                    front_min_rel = rel
+
+        # Sector stats in front-180 (for steering)
+        def sector_name(rel_deg: float) -> Optional[str]:
+            if abs(rel_deg) > 90.0:
+                return None
+            if abs(rel_deg) <= CENTER_HALF_DEG:
+                return "CENTER"
+            return "LEFT" if rel_deg > 0 else "RIGHT"
+
+        buckets = {"LEFT": [], "CENTER": [], "RIGHT": []}
+        for rel, dist, _q in derived:
+            s = sector_name(rel)
+            if s:
+                buckets[s].append((rel, dist))
+
+        def stats(vals: List[Tuple[float, float]]) -> SectorStats:
+            if not vals:
+                return SectorStats(count=0, min_dist=None, avg_dist=None)
+            dists = [v[1] for v in vals]
+            return SectorStats(
+                count=len(dists),
+                min_dist=min(dists),
+                avg_dist=sum(dists) / max(1, len(dists))
+            )
+
+        s_left = stats(buckets["LEFT"])
+        s_center = stats(buckets["CENTER"])
+        s_right = stats(buckets["RIGHT"])
+
+        # Helper: pick turn direction based on clearance
+        left_min = s_left.min_dist if s_left.min_dist is not None else 999.0
+        right_min = s_right.min_dist if s_right.min_dist is not None else 999.0
+        center_min = s_center.min_dist if s_center.min_dist is not None else 999.0
+
+        # Decision rules (no sticky)
+        # 1) Hard stop if something extremely close in the front arc
+        if (front_min is not None) and (front_min <= HARD_STOP_M):
+            return Decision(
+                label="STOP",
+                reason=f"hard_stop front_min={front_min:.3f}m rel={front_min_rel:.1f}deg",
+                ts=now,
+                sectors={"LEFT": s_left, "CENTER": s_center, "RIGHT": s_right},
+                front={"min_dist": front_min, "min_rel_deg": front_min_rel, "min_angle": None}
+            )
+
+        # 2) If something near in front arc -> must turn away (NOT go straight)
+        if (front_min is not None) and (front_min <= TURN_REQUIRED_M):
+            # turn to the side with bigger clearance
+            if right_min >= left_min:
+                lbl = "TURN_RIGHT"
+                why = f"front_blocked front_min={front_min:.3f} -> turn_right (R={right_min:.3f} >= L={left_min:.3f})"
+            else:
+                lbl = "TURN_LEFT"
+                why = f"front_blocked front_min={front_min:.3f} -> turn_left (L={left_min:.3f} > R={right_min:.3f})"
+
+            return Decision(
+                label=lbl,
+                reason=why,
+                ts=now,
+                sectors={"LEFT": s_left, "CENTER": s_center, "RIGHT": s_right},
+                front={"min_dist": front_min, "min_rel_deg": front_min_rel, "min_angle": None}
+            )
+
+        # 3) Even if center looks ok, if one side is too close, bias away (prevents body clipping barrel)
+        if left_min <= SIDE_TOO_CLOSE_M and right_min > left_min:
+            return Decision(
+                label="TURN_RIGHT",
+                reason=f"side_too_close_left L={left_min:.3f} -> turn_right",
+                ts=now,
+                sectors={"LEFT": s_left, "CENTER": s_center, "RIGHT": s_right},
+                front={"min_dist": front_min, "min_rel_deg": front_min_rel, "min_angle": None}
+            )
+        if right_min <= SIDE_TOO_CLOSE_M and left_min > right_min:
+            return Decision(
+                label="TURN_LEFT",
+                reason=f"side_too_close_right R={right_min:.3f} -> turn_left",
+                ts=now,
+                sectors={"LEFT": s_left, "CENTER": s_center, "RIGHT": s_right},
+                front={"min_dist": front_min, "min_rel_deg": front_min_rel, "min_angle": None}
+            )
+
+        # 4) If center corridor not clear enough -> turn to better side
+        if center_min < GO_CLEAR_M:
+            if right_min >= left_min:
+                lbl = "TURN_RIGHT"
+                why = f"center_not_clear C={center_min:.3f} < {GO_CLEAR_M:.2f} -> turn_right"
+            else:
+                lbl = "TURN_LEFT"
+                why = f"center_not_clear C={center_min:.3f} < {GO_CLEAR_M:.2f} -> turn_left"
+            return Decision(
+                label=lbl,
+                reason=why,
+                ts=now,
+                sectors={"LEFT": s_left, "CENTER": s_center, "RIGHT": s_right},
+                front={"min_dist": front_min, "min_rel_deg": front_min_rel, "min_angle": None}
+            )
+
+        # 5) Otherwise go straight
+        return Decision(
+            label="GO_STRAIGHT",
+            reason=f"clear front_min={front_min:.3f} C={center_min:.3f}",
+            ts=now,
+            sectors={"LEFT": s_left, "CENTER": s_center, "RIGHT": s_right},
+            front={"min_dist": front_min, "min_rel_deg": front_min_rel, "min_angle": None}
+        )
+
+
+# =========================
+# Flask app
+# =========================
 
 app = Flask(__name__)
+hub = LidarHub()
+hub.start()
 
-lock = threading.Lock()
-latest_points: List[Tuple[float, float, int, float, float, float]] = []  # (theta, dist_m, q, x, y, ts) - x/y from lidar polar (theta abs)
-latest_ts: float = 0.0
-
-status: Dict[str, Any] = {
-    "running": False,
-    "last_error": "",
-    "port": RPLIDAR_PORT,
-    "baud": RPLIDAR_BAUD,
-    "bin": RPLIDAR_BIN,
-}
-
-proc: Optional[subprocess.Popen] = None
-stop_flag = False
-
-cache_lock = threading.Lock()
-_points_cache: Dict[str, Any] = {"ts": 0.0, "payload": None}
-_decision_cache: Dict[str, Any] = {"ts": 0.0, "payload": None}
-_map_cache: Dict[str, Any] = {"ts": 0.0, "png": None}
-
-decision_state_lock = threading.Lock()
-latest_decision_label: str = "STOP"
-latest_decision_full: Dict[str, Any] = {"ok": False, "label": "STOP", "reason": "init", "ts": 0.0}
-
-_front_center_lock = threading.Lock()
-_front_center_est_deg: float = FRONT_CENTER_DEG
-_last_back_deg: Optional[float] = None
-
-# Sticky turn state
-_sticky_lock = threading.Lock()
-_sticky_label: Optional[str] = None            # "TURN_LEFT" / "TURN_RIGHT" / None
-_sticky_since: float = 0.0
-_sticky_clear_start: Optional[float] = None
-
-# Pose for map (world frame)
-_pose_lock = threading.Lock()
-pose_x = 0.0
-pose_y = 0.0
-pose_yaw = 0.0  # radians, 0 = facing +X in world
-_pose_last_ts = 0.0
-
-# Occupancy grid
-_grid_lock = threading.Lock()
-grid_w = int(round(MAP_SIZE_M / MAP_RES_M))
-grid_h = int(round(MAP_SIZE_M / MAP_RES_M))
-grid = [[0.0 for _ in range(grid_w)] for __ in range(grid_h)]  # float for decay
-
-
-# =======================
-# Math helpers
-# =======================
-def _wrap_deg(a: float) -> float:
-    a = a % 360.0
-    if a < 0:
-        a += 360.0
-    return a
-
-def _wrap_rel_deg(a: float) -> float:
-    a = _wrap_deg(a)
-    if a > 180.0:
-        a -= 360.0
-    return a
-
-def _ema_angle_deg(prev_deg: float, new_deg: float, alpha: float) -> float:
-    prev = _wrap_deg(prev_deg)
-    new = _wrap_deg(new_deg)
-    delta = _wrap_rel_deg(new - prev)
-    return _wrap_deg(prev + alpha * delta)
-
-def polar_to_xy_m(theta_deg: float, dist_m: float) -> Tuple[float, float]:
-    th = math.radians(theta_deg)
-    return dist_m * math.cos(th), dist_m * math.sin(th)
-
-def _percentile(sorted_vals: List[float], p: float) -> float:
-    if not sorted_vals:
-        return float("inf")
-    p = max(0.0, min(100.0, p))
-    k = (len(sorted_vals) - 1) * (p / 100.0)
-    f = math.floor(k)
-    c = math.ceil(k)
-    if f == c:
-        return sorted_vals[int(k)]
-    return sorted_vals[f] * (c - k) + sorted_vals[c] * (k - f)
-
-def _get_front_center_deg() -> float:
-    with _front_center_lock:
-        return float(_front_center_est_deg)
-
-def _set_front_center_deg(v: float):
-    global _front_center_est_deg
-    with _front_center_lock:
-        _front_center_est_deg = float(_wrap_deg(v))
-
-def _rel_deg(theta_deg: float, center_deg: float) -> float:
-    # rel in [-180..180], + is left
-    rel = _wrap_rel_deg(theta_deg - center_deg)
-    if FRONT_MIRROR == 1:
-        rel = -rel
-    return rel
-
-def _sector_name(rel_deg: float) -> Optional[str]:
-    # only use front half for k=3 decision
-    if abs(rel_deg) > FRONT_HALF_DEG:
-        return None
-    c = float(SECTOR_CENTER_DEG)
-    if rel_deg < -c:
-        return "RIGHT"
-    if rel_deg > c:
-        return "LEFT"
-    return "CENTER"
-
-
-# =======================
-# Lidar process
-# =======================
-def _spawn_ultra_simple() -> subprocess.Popen:
-    cmd = [
-        "stdbuf", "-oL", "-eL",
-        RPLIDAR_BIN,
-        "--channel", "--serial",
-        RPLIDAR_PORT,
-        str(RPLIDAR_BAUD),
-    ]
-    return subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        universal_newlines=True,
-    )
-
-def _reader_loop():
-    global proc, latest_ts, stop_flag
-
-    stop_flag = False
-    status["last_error"] = ""
-
-    try:
-        proc = _spawn_ultra_simple()
-    except Exception as e:
-        status["running"] = False
-        status["last_error"] = f"Cannot start ultra_simple: {e}"
-        return
-
-    if not proc.stdout:
-        status["running"] = False
-        status["last_error"] = "ultra_simple has no stdout"
-        return
-
-    status["running"] = True
-
-    try:
-        for line in proc.stdout:
-            if stop_flag:
-                break
-
-            m = LINE_RE.search(line)
-            if not m:
-                continue
-
-            theta = float(m.group(1))
-            dist_mm = float(m.group(2))
-            q = int(m.group(3))
-
-            if dist_mm <= 1:
-                continue
-
-            dist_m = dist_mm / 1000.0
-            if dist_m > MAX_RANGE_M:
-                continue
-
-            ts = time.time()
-            x, y = polar_to_xy_m(theta, dist_m)
-
-            with lock:
-                latest_points.append((theta, dist_m, q, x, y, ts))
-                if len(latest_points) > POINT_LIMIT:
-                    latest_points[:] = latest_points[-POINT_LIMIT:]
-                latest_ts = ts
-
-    except Exception as e:
-        status["last_error"] = f"Reader loop error: {e}"
-    finally:
-        status["running"] = False
-        try:
-            if proc and proc.poll() is None:
-                proc.terminate()
-        except Exception:
-            pass
-
-def lidar_thread_main():
-    while True:
-        _reader_loop()
-        if stop_flag:
-            return
-        time.sleep(1.0)
-
-
-# =======================
-# Auto FRONT calibration (back wall -> front)
-# =======================
-def _estimate_back_direction_percentile(
-    pts: List[Tuple[float, float, int, float, float, float]],
-    recent_sec: float
-) -> Optional[float]:
-    now = time.time()
-    bin_deg = max(2.0, float(AUTO_CALIB_BIN_DEG))
-    bins = max(12, int(round(360.0 / bin_deg)))
-
-    recent = [(theta, dist_m, ts) for (theta, dist_m, q, x, y, ts) in pts if (now - ts) <= recent_sec and dist_m > 0.02]
-    if len(recent) < 50:
-        return None
-
-    dists = sorted([d for (_, d, _) in recent])
-    cutoff = _percentile(dists, float(AUTO_CALIB_PERCENTILE))
-    cutoff = min(float(AUTO_CALIB_NEAR_CAP_M), cutoff)
-    cutoff = max(0.35, cutoff)
-
-    counts = [0] * bins
-    dist_sums = [0.0] * bins
-
-    for (theta, dist_m, ts) in recent:
-        if dist_m > cutoff:
-            continue
-        idx = int(_wrap_deg(theta) // bin_deg) % bins
-        counts[idx] += 1
-        dist_sums[idx] += dist_m
-
-    best_idx = None
-    best_score = -1e18
-    for i in range(bins):
-        if counts[i] < 6:
-            continue
-        mean_d = dist_sums[i] / max(1, counts[i])
-        score = (counts[i] * 1.0) + (2.0 - mean_d) * 6.0
-        if score > best_score:
-            best_score = score
-            best_idx = i
-
-    if best_idx is None:
-        return None
-
-    back_center = (best_idx + 0.5) * bin_deg
-    return float(_wrap_deg(back_center))
-
-def _auto_calibrate_front_center(pts: List[Tuple[float, float, int, float, float, float]]):
-    global _last_back_deg
-    if AUTO_FRONT_CALIB != 1:
-        _set_front_center_deg(FRONT_CENTER_DEG)
-        _last_back_deg = None
-        return
-
-    back = _estimate_back_direction_percentile(pts, recent_sec=RECENT_SEC)
-    if back is None:
-        return
-
-    _last_back_deg = back
-    front = _wrap_deg(back + 180.0)
-
-    prev = _get_front_center_deg()
-    alpha = max(0.05, min(1.0, float(AUTO_CALIB_SMOOTH)))
-    sm = _ema_angle_deg(prev, front, alpha)
-    _set_front_center_deg(sm)
-
-
-# =======================
-# k=3 sector stats
-# =======================
-def _sector_stats(
-    pts: List[Tuple[float, float, int, float, float, float]],
-    front_abs: float
-) -> Dict[str, Dict[str, float]]:
-    now = time.time()
-    out = {
-        "LEFT":   {"count": 0.0, "min_dist": float("inf")},
-        "CENTER": {"count": 0.0, "min_dist": float("inf")},
-        "RIGHT":  {"count": 0.0, "min_dist": float("inf")},
-    }
-
-    for (theta, dist_m, q, x, y, ts) in pts:
-        if now - ts > RECENT_SEC:
-            continue
-        if dist_m <= 0.02:
-            continue
-
-        rel = _rel_deg(theta, front_abs)
-        sec = _sector_name(rel)
-        if sec is None:
-            continue
-
-        if dist_m < out[sec]["min_dist"]:
-            out[sec]["min_dist"] = dist_m
-
-        if dist_m <= LOOKAHEAD_M:
-            out[sec]["count"] += 1.0
-
-    return out
-
-def _choose_direction_from_sectors(secs: Dict[str, Dict[str, float]]) -> Tuple[str, str, Dict[str, Any]]:
-    cmin = float(secs["CENTER"]["min_dist"])
-    if cmin <= STOP_NEAR_M:
-        return ("STOP", "center_too_close", {"center_min": cmin, "stop_near_m": STOP_NEAR_M})
-
-    lc = secs["LEFT"]["count"]
-    cc = secs["CENTER"]["count"]
-    rc = secs["RIGHT"]["count"]
-
-    m = min(lc, cc, rc)
-    candidates = []
-    if lc == m: candidates.append("LEFT")
-    if cc == m: candidates.append("CENTER")
-    if rc == m: candidates.append("RIGHT")
-
-    if "CENTER" in candidates:
-        best = "CENTER"
-    else:
-        lmin = float(secs["LEFT"]["min_dist"])
-        rmin = float(secs["RIGHT"]["min_dist"])
-        best = "LEFT" if lmin >= rmin else "RIGHT"
-
-    if best == "CENTER":
-        return ("GO_STRAIGHT", "k3_best_center", {"counts": {"L": lc, "C": cc, "R": rc}})
-    if best == "LEFT":
-        return ("TURN_LEFT", "k3_best_left", {"counts": {"L": lc, "C": cc, "R": rc}})
-    return ("TURN_RIGHT", "k3_best_right", {"counts": {"L": lc, "C": cc, "R": rc}})
-
-def _apply_sticky_turn(desired_label: str, center_min: float, now: float) -> Tuple[str, str, Dict[str, Any]]:
-    global _sticky_label, _sticky_since, _sticky_clear_start
-
-    with _sticky_lock:
-        cur = _sticky_label
-
-        if cur in ("TURN_LEFT", "TURN_RIGHT"):
-            held_for = now - _sticky_since
-
-            if held_for < TURN_STICKY_MIN_SEC:
-                return (cur, "sticky_min_hold", {"held_for": held_for})
-
-            if center_min > CLEAR_RELEASE_M:
-                if _sticky_clear_start is None:
-                    _sticky_clear_start = now
-                if (now - _sticky_clear_start) >= CLEAR_CONFIRM_SEC:
-                    _sticky_label = None
-                    _sticky_clear_start = None
-                    cur = None
-                else:
-                    return (cur, "sticky_wait_clear_confirm", {"center_min": center_min, "clear_for": now - _sticky_clear_start})
-            else:
-                _sticky_clear_start = None
-                return (cur, "sticky_turn_until_front_clear", {"center_min": center_min, "clear_release_m": CLEAR_RELEASE_M})
-
-        if cur is None and desired_label in ("TURN_LEFT", "TURN_RIGHT"):
-            _sticky_label = desired_label
-            _sticky_since = now
-            _sticky_clear_start = None
-            return (desired_label, "set_sticky_turn", {"center_min": center_min})
-
-    return (desired_label, "not_sticky", {"center_min": center_min})
-
-
-def _compute_decision() -> Dict[str, Any]:
-    with lock:
-        pts = list(latest_points)
-        last_ts = float(latest_ts)
-
-    now = time.time()
-    if (not pts) or ((now - last_ts) > 2.0):
-        return {"ok": False, "label": "STOP", "reason": "no_recent_lidar", "ts": now}
-
-    _auto_calibrate_front_center(pts)
-    front_abs = _get_front_center_deg()
-
-    secs = _sector_stats(pts, front_abs)
-    center_min = float(secs["CENTER"]["min_dist"])
-
-    desired_label, desired_reason, desired_dbg = _choose_direction_from_sectors(secs)
-    final_label, sticky_reason, sticky_dbg = _apply_sticky_turn(desired_label, center_min, now)
-
-    predict_dist = (ROBOT_SPEED_MPS * PREDICT_T_SEC) + SAFETY_MARGIN_M
-
-    return {
-        "ok": True,
-        "label": final_label,
-        "reason": f"{desired_reason} | {sticky_reason}",
-        "ts": now,
-        "debug": {
-            "front_center_deg_used": float(front_abs),
-            "back_deg_est": float(_last_back_deg) if _last_back_deg is not None else None,
-            "sectors": {
-                "LEFT":   {"count": int(secs["LEFT"]["count"]),   "min_dist": float(secs["LEFT"]["min_dist"])},
-                "CENTER": {"count": int(secs["CENTER"]["count"]), "min_dist": float(secs["CENTER"]["min_dist"])},
-                "RIGHT":  {"count": int(secs["RIGHT"]["count"]),  "min_dist": float(secs["RIGHT"]["min_dist"])},
-            },
-            "predict_dist_m": float(predict_dist),
-            "desired": {"label": desired_label, "reason": desired_reason, **desired_dbg},
-            "sticky": {"label": final_label, "reason": sticky_reason, **sticky_dbg},
-        }
-    }
-
-
-# =======================
-# Pose + Map update
-# =======================
-def _decision_to_twist(label: str) -> Tuple[float, float]:
-    """
-    returns (v, w) in robot local frame:
-      v: m/s forward
-      w: rad/s positive = turn left
-    """
-    w = math.radians(TURN_RATE_DEG_S)
-    if label == "GO_STRAIGHT":
-        return (ROBOT_SPEED_MPS, 0.0)
-    if label == "TURN_LEFT":
-        return (0.0, +w)
-    if label == "TURN_RIGHT":
-        return (0.0, -w)
-    if label == "BACK":
-        return (-BACK_SPEED_MPS, 0.0)
-    return (0.0, 0.0)
-
-def _integrate_pose(dt: float, label: str):
-    global pose_x, pose_y, pose_yaw
-    v, w = _decision_to_twist(label)
-
-    # simple unicycle integration
-    if abs(w) < 1e-6:
-        dx = v * dt * math.cos(pose_yaw)
-        dy = v * dt * math.sin(pose_yaw)
-        pose_x += dx
-        pose_y += dy
-    else:
-        # rotate in place (v ~ 0), still keep yaw update
-        pose_yaw += w * dt
-
-    # keep yaw in [-pi..pi]
-    while pose_yaw > math.pi:
-        pose_yaw -= 2 * math.pi
-    while pose_yaw < -math.pi:
-        pose_yaw += 2 * math.pi
-
-def _world_to_grid(wx: float, wy: float) -> Optional[Tuple[int, int]]:
-    # map origin at center
-    ox = MAP_SIZE_M * 0.5
-    oy = MAP_SIZE_M * 0.5
-    gx = int((wx + ox) / MAP_RES_M)
-    gy = int((wy + oy) / MAP_RES_M)
-    if 0 <= gx < grid_w and 0 <= gy < grid_h:
-        return gx, gy
-    return None
-
-def _grid_decay_and_hit(hit_cells: List[Tuple[int, int]]):
-    # decay whole grid (simple, ok for moderate size)
-    # NOTE: for huge grid, optimize later
-    for y in range(grid_h):
-        row = grid[y]
-        for x in range(grid_w):
-            row[x] *= MAP_DECAY
-
-    # apply hits
-    for (gx, gy) in hit_cells:
-        v = grid[gy][gx] + MAP_HIT
-        if v > MAP_MAX:
-            v = MAP_MAX
-        grid[gy][gx] = v
-
-def _update_map_from_lidar(pts: List[Tuple[float, float, int, float, float, float]], front_abs: float):
-    """
-    Convert lidar points -> robot frame (x_fwd, y_left) using rel angle
-    Then transform to world using pose (x,y,yaw), mark occupancy
-    """
-    now = time.time()
-
-    with _pose_lock:
-        rx = pose_x
-        ry = pose_y
-        yaw = pose_yaw
-
-    c = math.cos(yaw)
-    s = math.sin(yaw)
-
-    hit_cells: List[Tuple[int, int]] = []
-
-    for (theta, dist_m, q, x, y, ts) in pts:
-        if now - ts > RECENT_SEC:
-            continue
-        if dist_m <= 0.05 or dist_m > MAX_RANGE_M:
-            continue
-
-        # rel angle where 0=front, +left
-        rel = _rel_deg(theta, front_abs)
-        rel_rad = math.radians(rel)
-
-        # robot frame: x forward, y left
-        x_f = dist_m * math.cos(rel_rad)
-        y_l = dist_m * math.sin(rel_rad)
-
-        # transform to world
-        wx = rx + (c * x_f - s * y_l)
-        wy = ry + (s * x_f + c * y_l)
-
-        cell = _world_to_grid(wx, wy)
-        if cell:
-            hit_cells.append(cell)
-
-    with _grid_lock:
-        _grid_decay_and_hit(hit_cells)
-
-def map_worker():
-    global _pose_last_ts
-    while True:
-        with decision_state_lock:
-            lbl = latest_decision_label
-            dec = dict(latest_decision_full)
-
-        with lock:
-            pts = list(latest_points)
-            last_ts = float(latest_ts)
-
-        now = time.time()
-        if _pose_last_ts <= 0.0:
-            _pose_last_ts = now
-
-        dt = now - _pose_last_ts
-        _pose_last_ts = now
-        dt = max(0.0, min(0.25, dt))  # clamp
-
-        # integrate pose based on current decision label
-        with _pose_lock:
-            _integrate_pose(dt, lbl)
-            rx, ry, yaw = pose_x, pose_y, pose_yaw
-
-        # update map using latest points
-        if pts and (now - last_ts) < 2.0:
-            front_abs = _get_front_center_deg()
-            _update_map_from_lidar(pts, front_abs)
-
-        # render png cache
-        try:
-            png = _render_map_png(decision=dec)
-            with cache_lock:
-                _map_cache["ts"] = time.time()
-                _map_cache["png"] = png
-        except Exception:
-            pass
-
-        time.sleep(THROTTLE_S)
-
-
-# =======================
-# Rendering (PNG)
-# =======================
-def _render_map_png(decision: Dict[str, Any]) -> bytes:
-    # pillow (PIL) renderer
-    from PIL import Image, ImageDraw, ImageFont
-
-    # get current pose
-    with _pose_lock:
-        rx, ry, yaw = pose_x, pose_y, pose_yaw
-
-    # snapshot grid
-    with _grid_lock:
-        # copy for rendering
-        g = [row[:] for row in grid]
-
-    # build image
-    W = H = int(VIEW_SIZE_PX)
-    img = Image.new("RGB", (W, H), (240, 240, 240))
-    draw = ImageDraw.Draw(img)
-
-    # view window centered at robot
-    # pixels per meter
-    ppm = (W * 0.5) / max(0.5, float(VIEW_RANGE_M))
-
-    def world_to_px(wx: float, wy: float) -> Tuple[int, int]:
-        dx = (wx - rx)
-        dy = (wy - ry)
-        px = int(W * 0.5 + dx * ppm)
-        py = int(H * 0.5 - dy * ppm)
-        return px, py
-
-    # draw occupancy as dark points
-    # only draw cells within view to reduce cost
-    view_min_x = rx - VIEW_RANGE_M
-    view_max_x = rx + VIEW_RANGE_M
-    view_min_y = ry - VIEW_RANGE_M
-    view_max_y = ry + VIEW_RANGE_M
-
-    # grid bounds in cells
-    ox = MAP_SIZE_M * 0.5
-    oy = MAP_SIZE_M * 0.5
-    gx0 = int((view_min_x + ox) / MAP_RES_M)
-    gx1 = int((view_max_x + ox) / MAP_RES_M)
-    gy0 = int((view_min_y + oy) / MAP_RES_M)
-    gy1 = int((view_max_y + oy) / MAP_RES_M)
-    gx0 = max(0, min(grid_w - 1, gx0))
-    gx1 = max(0, min(grid_w - 1, gx1))
-    gy0 = max(0, min(grid_h - 1, gy0))
-    gy1 = max(0, min(grid_h - 1, gy1))
-
-    # draw occupancy
-    for gy in range(gy0, gy1 + 1):
-        row = g[gy]
-        wy = (gy * MAP_RES_M) - oy
-        for gx in range(gx0, gx1 + 1):
-            v = row[gx]
-            if v < 10.0:
-                continue
-            wx = (gx * MAP_RES_M) - ox
-            px, py = world_to_px(wx, wy)
-            if 0 <= px < W and 0 <= py < H:
-                # intensity: darker = stronger occupancy
-                d = int(max(0, min(200, 220 - (v / MAP_MAX) * 200)))
-                img.putpixel((px, py), (d, d, d))
-
-    # draw robot (center)
-    cx, cy = int(W * 0.5), int(H * 0.5)
-    r = 8
-    draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(20, 20, 20))
-
-    # heading arrow
-    hx = cx + int(math.cos(yaw) * 25)
-    hy = cy - int(math.sin(yaw) * 25)
-    draw.line((cx, cy, hx, hy), fill=(0, 0, 0), width=3)
-
-    # overlay 3 sector wedges around robot (LEFT/CENTER/RIGHT relative to heading)
-    # angles in image: PIL uses degrees from +x, counterclockwise, but y-axis down => we handle by converting from world yaw
-    # We'll draw wedges in screen space based on heading direction.
-    # Define wedge spans relative to heading:
-    # RIGHT: [-90..-SECTOR_CENTER_DEG), CENTER: [-SECTOR_CENTER_DEG..+SECTOR_CENTER_DEG], LEFT: (+SECTOR_CENTER_DEG..+90]
-    sector_defs = {
-        "RIGHT": (-90.0, -SECTOR_CENTER_DEG),
-        "CENTER": (-SECTOR_CENTER_DEG, +SECTOR_CENTER_DEG),
-        "LEFT": (+SECTOR_CENTER_DEG, +90.0),
-    }
-
-    label = str(decision.get("label", "STOP"))
-    selected_sector = None
-    if label == "GO_STRAIGHT":
-        selected_sector = "CENTER"
-    elif label == "TURN_LEFT":
-        selected_sector = "LEFT"
-    elif label == "TURN_RIGHT":
-        selected_sector = "RIGHT"
-
-    # get min distances from decision debug if available
-    dbg = decision.get("debug", {}) if isinstance(decision, dict) else {}
-    secdbg = dbg.get("sectors", {}) if isinstance(dbg, dict) else {}
-    dL = float(secdbg.get("LEFT", {}).get("min_dist", float("inf"))) if isinstance(secdbg.get("LEFT", {}), dict) else float("inf")
-    dC = float(secdbg.get("CENTER", {}).get("min_dist", float("inf"))) if isinstance(secdbg.get("CENTER", {}), dict) else float("inf")
-    dR = float(secdbg.get("RIGHT", {}).get("min_dist", float("inf"))) if isinstance(secdbg.get("RIGHT", {}), dict) else float("inf")
-
-    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    od = ImageDraw.Draw(overlay)
-    ring_px = int(SECTOR_RING_M * ppm)
-    bbox = (cx - ring_px, cy - ring_px, cx + ring_px, cy + ring_px)
-
-    def rel_to_pil_deg(rel_deg: float) -> float:
-        # direction (world) = yaw + rel
-        ang = yaw + math.radians(rel_deg)
-        # convert to screen angle: PIL 0deg at +x, ccw. Our screen y is down, so use -sin
-        # We can map by using standard: angle_screen = -ang
-        return math.degrees(-ang) % 360.0
-
-    for name, (a0, a1) in sector_defs.items():
-        # compute start/end in PIL degrees (note: pieslice draws from start to end CCW)
-        start = rel_to_pil_deg(a1)  # swap because of inversion
-        end   = rel_to_pil_deg(a0)
-
-        if selected_sector == name:
-            fill = (0, 255, 0, SECTOR_ALPHA)   # green
-        else:
-            fill = (255, 0, 0, SECTOR_ALPHA)   # red
-
-        od.pieslice(bbox, start=start, end=end, fill=fill)
-
-    img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
-    draw = ImageDraw.Draw(img)
-
-    # text
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
-        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
-    except Exception:
-        font = None
-        font_small = None
-
-    def fmt_dist(d: float) -> str:
-        if not math.isfinite(d):
-            return "inf"
-        return f"{d*100:.0f}cm"
-
-    # write distances near each sector
-    # place at direction: left (+60), center (0), right (-60)
-    text_items = [
-        ("LEFT",   +60.0, fmt_dist(dL)),
-        ("CENTER",  0.0,  fmt_dist(dC)),
-        ("RIGHT",  -60.0, fmt_dist(dR)),
-    ]
-    for name, rel, t in text_items:
-        ang = yaw + math.radians(rel)
-        tx = cx + int(math.cos(ang) * ring_px * 0.75)
-        ty = cy - int(math.sin(ang) * ring_px * 0.75)
-        draw.text((tx - 25, ty - 10), f"{name}:{t}", fill=(0, 0, 0), font=font_small)
-
-    # top-left HUD
-    hud = [
-        f"label: {label}",
-        f"pose: x={rx:.2f} y={ry:.2f} yaw={math.degrees(yaw):.1f}deg",
-        f"L={fmt_dist(dL)} C={fmt_dist(dC)} R={fmt_dist(dR)}",
-        f"front_center_deg={_get_front_center_deg():.1f}  mirror={FRONT_MIRROR}",
-    ]
-    y0 = 8
-    for s in hud:
-        draw.text((8, y0), s, fill=(0, 0, 0), font=font)
-        y0 += 22
-
-    # draw range circle
-    rr = int(VIEW_RANGE_M * ppm)
-    draw.ellipse((cx - rr, cy - rr, cx + rr, cy + rr), outline=(150, 150, 150), width=2)
-
-    # encode png
-    import io
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
-
-
-# =======================
-# Workers
-# =======================
-def decision_worker():
-    global latest_decision_label, latest_decision_full
-    while True:
-        payload = _compute_decision()
-        with decision_state_lock:
-            latest_decision_full = payload
-            latest_decision_label = str(payload.get("label", "STOP") or "STOP")
-        with cache_lock:
-            _decision_cache["ts"] = time.time()
-            _decision_cache["payload"] = payload
-        time.sleep(THROTTLE_S)
-
-def points_worker():
-    while True:
-        payload = _build_points_payload()
-        with cache_lock:
-            _points_cache["ts"] = time.time()
-            _points_cache["payload"] = payload
-        time.sleep(THROTTLE_S)
-
-
-# =======================
-# Points payload (360° + extra info)
-# =======================
-def _front_angles_for_plot(theta_raw: float, front_center_abs: float) -> Dict[str, Any]:
-    rel = _rel_deg(theta_raw, front_center_abs)
-    angle_front_360 = _wrap_deg(rel)  # 0..360 where 0=front
-    sec = _sector_name(rel)
-    return {
-        "rel_deg": float(rel),
-        "angle_front_360": float(angle_front_360),
-        "is_front_180": bool(abs(rel) <= FRONT_HALF_DEG),
-        "k3_sector": sec,
-    }
-
-def _build_points_payload(limit: int = 1600) -> Dict[str, Any]:
-    with lock:
-        pts = list(latest_points[-limit:])
-        ts = float(latest_ts)
-
-    front_abs = _get_front_center_deg()
-    out = []
-    for (theta, dist_m, q, x, y, t) in pts:
-        ang = _front_angles_for_plot(theta, front_abs)
-        out.append({
-            "theta": theta,
-            "angle": theta,
-            "dist_m": dist_m,
-            "dist_cm": dist_m * 100.0,
-            "q": q,
-            "x": x,
-            "y": y,
-            "ts": t,
-            **ang
-        })
-
-    return {
-        "ok": True,
-        "ts": time.time(),
-        "last_point_ts": ts,
-        "n": len(out),
-        "points": out,
-        "frame": {
-            "front_center_deg_used": float(front_abs),
-            "back_deg_est": float(_last_back_deg) if _last_back_deg is not None else None,
-            "max_range_m": float(MAX_RANGE_M),
-        }
-    }
-
-
-# =======================
-# ROUTES
-# =======================
 @app.get("/api/status")
 def api_status():
-    with lock:
-        pts_n = len(latest_points)
-        ts = float(latest_ts)
-
-    with decision_state_lock:
-        lbl = latest_decision_label
-        dec = dict(latest_decision_full)
-
-    with _sticky_lock:
-        sticky = _sticky_label
-        sticky_since = _sticky_since
-        clear_start = _sticky_clear_start
-
-    with _pose_lock:
-        rx, ry, yaw = pose_x, pose_y, pose_yaw
-
-    now = time.time()
-    return jsonify({
-        "running": status["running"],
-        "port": status["port"],
-        "baud": status["baud"],
-        "bin": status["bin"],
-        "points_buffered": pts_n,
-        "last_point_ts": ts,
-        "age_s": (now - ts) if ts else None,
-        "last_error": status["last_error"],
-        "pid": proc.pid if proc else None,
-
-        "latest_label": lbl,
-        "front_center_deg_used": float(_get_front_center_deg()),
-        "back_deg_est": float(_last_back_deg) if _last_back_deg is not None else None,
-        "auto_front_calib": int(AUTO_FRONT_CALIB),
-        "front_mirror": int(FRONT_MIRROR),
-
-        "k3": {
-            "sector_center_deg": float(SECTOR_CENTER_DEG),
-            "lookahead_m": float(LOOKAHEAD_M),
-            "stop_near_m": float(STOP_NEAR_M),
-        },
-
-        "sticky_turn": {
-            "sticky_label": sticky,
-            "held_for_sec": (now - sticky_since) if sticky else None,
-            "clear_for_sec": (now - clear_start) if clear_start else None,
-            "clear_release_m": float(CLEAR_RELEASE_M),
-            "clear_confirm_sec": float(CLEAR_CONFIRM_SEC),
-            "turn_sticky_min_sec": float(TURN_STICKY_MIN_SEC),
-        },
-
-        "pose": {
-            "x": rx, "y": ry, "yaw_deg": math.degrees(yaw)
-        },
-
-        "decision": dec,
-    })
-
-@app.get("/take_lidar_data")
-def take_lidar_data():
-    with cache_lock:
-        payload = _points_cache["payload"]
-    if payload is None:
-        payload = _build_points_payload()
-        with cache_lock:
-            _points_cache["payload"] = payload
-            _points_cache["ts"] = time.time()
-    return jsonify(payload)
-
-@app.get("/ask_lidar_decision")
-def ask_lidar_decision():
-    with cache_lock:
-        payload = _decision_cache["payload"]
-    if payload is None:
-        payload = _compute_decision()
-        with cache_lock:
-            _decision_cache["payload"] = payload
-            _decision_cache["ts"] = time.time()
-    return jsonify(payload)
+    return jsonify(hub.get_status())
 
 @app.get("/api/decision_label")
 def api_decision_label():
-    with decision_state_lock:
-        lbl = latest_decision_label
-    return Response(str(lbl), mimetype="text/plain")
+    # Return plain text label
+    return Response(hub.get_decision_label(), mimetype="text/plain")
 
 @app.get("/api/decision")
 def api_decision():
-    with decision_state_lock:
-        payload = dict(latest_decision_full)
-    return jsonify(payload)
+    return jsonify(hub.get_decision_json())
 
-@app.get("/api/map.png")
-def api_map_png():
-    # cache-bust optional
-    with cache_lock:
-        png = _map_cache["png"]
-    if png is None:
-        with decision_state_lock:
-            dec = dict(latest_decision_full)
-        png = _render_map_png(dec)
-        with cache_lock:
-            _map_cache["png"] = png
-            _map_cache["ts"] = time.time()
-    return Response(png, mimetype="image/png")
+@app.get("/take_lidar_data")
+def take_lidar_data():
+    return jsonify(hub.get_last_scan_debug())
 
-@app.get("/dashboard")
-def dashboard():
-    # simple live page (auto refresh)
-    html = f"""
-    <html>
-      <head>
-        <title>LiDAR 2D Map</title>
-        <style>
-          body {{ font-family: Arial; margin: 12px; }}
-          .row {{ display:flex; gap:12px; align-items:flex-start; }}
-          img {{ border:1px solid #ccc; border-radius:8px; }}
-          .box {{ padding:10px; border:1px solid #ddd; border-radius:8px; min-width: 320px; }}
-          .mono {{ font-family: monospace; white-space: pre; }}
-        </style>
-      </head>
-      <body>
-        <h3>LiDAR 2D Map (360°) + k=3 sector overlay</h3>
-        <div class="row">
-          <img id="map" src="/api/map.png?ts={time.time()}" width="{VIEW_SIZE_PX}" height="{VIEW_SIZE_PX}"/>
-          <div class="box">
-            <div><b>Decision</b></div>
-            <div id="label" class="mono">loading...</div>
-            <hr/>
-            <div><b>Status</b></div>
-            <div id="status" class="mono">loading...</div>
-          </div>
-        </div>
+@app.post("/ingest_scan")
+def ingest_scan():
+    data = request.get_json(force=True, silent=True) or {}
+    hub.ingest_scan(data)
+    return jsonify({"ok": True, "n": int((data.get("n") or len(data.get("points", [])) or 0))})
 
-        <script>
-          async function tick() {{
-            try {{
-              const d = await fetch('/api/decision').then(r=>r.json());
-              const s = await fetch('/api/status').then(r=>r.json());
-              document.getElementById('label').textContent =
-                JSON.stringify({{label: d.label, reason: d.reason, sectors: (d.debug||{{}}).sectors}}, null, 2);
-              document.getElementById('status').textContent =
-                JSON.stringify({{running: s.running, age_s: s.age_s, pose: s.pose, front_center: s.front_center_deg_used}}, null, 2);
-
-              // refresh image
-              const img = document.getElementById('map');
-              img.src = '/api/map.png?ts=' + Date.now();
-            }} catch(e) {{
-              console.log(e);
-            }}
-          }}
-          setInterval(tick, {THROTTLE_MS});
-          tick();
-        </script>
-      </body>
-    </html>
-    """
-    return Response(html, mimetype="text/html")
-
-@app.post("/api/restart")
-def api_restart():
-    global stop_flag, proc
-    stop_flag = True
-    try:
-        if proc and proc.poll() is None:
-            proc.terminate()
-    except Exception:
-        pass
-
-    time.sleep(0.4)
-
-    stop_flag = False
-    threading.Thread(target=lidar_thread_main, daemon=True).start()
+@app.post("/api/pose")
+def api_pose():
+    data = request.get_json(force=True, silent=True) or {}
+    x = float(data.get("x", 0.0))
+    y = float(data.get("y", 0.0))
+    yaw = float(data.get("yaw_deg", 0.0))
+    hub.update_pose(x, y, yaw)
     return jsonify({"ok": True})
-
-@app.post("/api/map_reset")
-def api_map_reset():
-    global grid, pose_x, pose_y, pose_yaw, _pose_last_ts
-    with _grid_lock:
-        for y in range(grid_h):
-            for x in range(grid_w):
-                grid[y][x] = 0.0
-    with _pose_lock:
-        pose_x = pose_y = 0.0
-        pose_yaw = 0.0
-        _pose_last_ts = 0.0
-    return jsonify({"ok": True})
-
-@app.get("/")
-def home():
-    return Response(
-        "<h3>lidarhub running</h3>"
-        "<ul>"
-        "<li><a href='/dashboard'>/dashboard</a></li>"
-        "<li>/api/map.png</li>"
-        "<li>/take_lidar_data</li>"
-        "<li>/ask_lidar_decision</li>"
-        "<li>/api/decision_label</li>"
-        "<li>/api/decision</li>"
-        "<li>/api/status</li>"
-        "<li>/api/restart (POST)</li>"
-        "<li>/api/map_reset (POST)</li>"
-        "</ul>",
-        mimetype="text/html"
-    )
-
-
-# =======================
-# Main
-# =======================
-def main():
-    _set_front_center_deg(FRONT_CENTER_DEG)
-    threading.Thread(target=lidar_thread_main, daemon=True).start()
-    threading.Thread(target=points_worker, daemon=True).start()
-    threading.Thread(target=decision_worker, daemon=True).start()
-    threading.Thread(target=map_worker, daemon=True).start()
-    app.run(host=HTTP_HOST, port=HTTP_PORT, debug=False, threaded=True)
 
 if __name__ == "__main__":
-    main()
+    # threaded=True so endpoints responsive while threads running
+    app.run(host=HOST, port=PORT, threaded=True)
