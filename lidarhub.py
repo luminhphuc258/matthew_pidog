@@ -46,30 +46,37 @@ FRAME_SEC = float(os.environ.get("FRAME_SEC", "0.20"))
 
 # ===== k=3 sectors =====
 SECTOR_CENTER_DEG = float(os.environ.get("SECTOR_CENTER_DEG", "30.0"))
-
-# Robust distance: average K điểm gần nhất
 K_NEAR = int(os.environ.get("K_NEAR", "6"))
-
-# Sector đủ điểm mới tin (giảm nhảy do thiếu điểm)
 MIN_SECTOR_POINTS = int(os.environ.get("MIN_SECTOR_POINTS", "20"))
 
 # ===== Thresholds =====
-CLEAR_GO_M = float(os.environ.get("CLEAR_GO_M", "0.95"))  # clear để đi thẳng
+CLEAR_GO_M = float(os.environ.get("CLEAR_GO_M", "0.95"))        # clear để đi thẳng (hành lang)
+OBSTACLE_NEAR_M = float(os.environ.get("OBSTACLE_NEAR_M", "0.70"))  # nếu bất kỳ vùng nào quá gần => STOP rồi TURN
 CLEAR_STREAK_N = int(os.environ.get("CLEAR_STREAK_N", "2"))
 
-# ✅ NEW: nếu bất kỳ sector nào quá gần -> STOP rồi TURN
-# mặc định 0.70m giống “obstacle_near=0.70m” bạn đang dùng
-OBSTACLE_NEAR_M = float(os.environ.get("OBSTACLE_NEAR_M", "0.70"))
-
-# Emergency STOP one-shot (siêu sát)
+# Emergency STOP one-shot (cực gần)
 EMERGENCY_STOP_M = float(os.environ.get("EMERGENCY_STOP_M", "0.25"))
 EMERGENCY_REARM_M = float(os.environ.get("EMERGENCY_REARM_M", "0.45"))
 
-# Debounce label (chống nhảy label)
 LABEL_CONFIRM_N = int(os.environ.get("LABEL_CONFIRM_N", "2"))
 
 # ===== Avoid timeout (tránh bị kẹt turn vô hạn) =====
-AVOID_MAX_SEC = float(os.environ.get("AVOID_MAX_SEC", "4.0"))
+AVOID_MAX_SEC = float(os.environ.get("AVOID_MAX_SEC", "5.0"))
+
+# ===== Gap Planner / Corridor =====
+# Robot rộng 15cm (theo bạn)
+ROBOT_WIDTH_M = float(os.environ.get("ROBOT_WIDTH_M", "0.15"))  # 15cm
+# Margin để không cạ chân ghế (tăng chút cho chắc)
+CORRIDOR_MARGIN_M = float(os.environ.get("CORRIDOR_MARGIN_M", "0.04"))
+LOOKAHEAD_M = float(os.environ.get("LOOKAHEAD_M", "0.80"))
+
+BIN_DEG = float(os.environ.get("BIN_DEG", "5.0"))  # 5 độ/bin
+GAP_MIN_WIDTH_DEG = float(os.environ.get("GAP_MIN_WIDTH_DEG", "12.0"))
+TURN_DEADBAND_DEG = float(os.environ.get("TURN_DEADBAND_DEG", "12.0"))
+
+# chống lắc trái/phải
+AVOID_COMMIT_SEC = float(os.environ.get("AVOID_COMMIT_SEC", "0.9"))     # giữ hướng turn tối thiểu
+AVOID_SWITCH_HYST = float(os.environ.get("AVOID_SWITCH_HYST", "0.18"))  # chỉ đổi khi tốt hơn rõ rệt
 
 # ===== Rendering =====
 VIEW_SIZE_PX = int(os.environ.get("VIEW_SIZE_PX", "720"))
@@ -107,12 +114,13 @@ decision_state_lock = threading.Lock()
 latest_decision_full: Dict[str, Any] = {"ok": False, "label": "STOP", "reason": "init", "ts": 0.0}
 latest_decision_label: str = "STOP"
 
-# ===== Avoid state (CHỈ bật sau STOP) =====
+# ===== Avoid state (bật sau STOP) =====
 _avoid_lock = threading.Lock()
 _avoid_active: bool = False
 _avoid_clear_streak: int = 0
 _avoid_dir: str = "TURN_RIGHT"  # TURN_RIGHT / TURN_LEFT
 _avoid_start_ts: float = 0.0
+_avoid_last_switch_ts: float = 0.0
 
 # ===== Emergency gate =====
 _em_lock = threading.Lock()
@@ -146,9 +154,7 @@ def _rel_deg(theta_deg: float) -> float:
     fc = float(FRONT_CENTER_DEG_HARD)
     if int(FRONT_FLIP_HARD) == 1:
         fc = _wrap_deg(fc + 180.0)
-
     rel = _wrap_rel_deg(theta_deg - fc)
-
     if int(FRONT_MIRROR_HARD) == 1:
         rel = -rel
     return rel
@@ -168,7 +174,7 @@ def _sector_name(rel_deg: float) -> Optional[str]:
 
 
 # =======================
-# Reset logic (FIX kẹt turn)
+# Reset logic
 # =======================
 def _reset_all_logic():
     """
@@ -177,7 +183,7 @@ def _reset_all_logic():
     - re-arm emergency gate
     - reset label debounce
     """
-    global _avoid_active, _avoid_clear_streak, _avoid_dir, _avoid_start_ts
+    global _avoid_active, _avoid_clear_streak, _avoid_dir, _avoid_start_ts, _avoid_last_switch_ts
     global _em_stop_armed, _em_stop_issued_this_event
     global _out_label, _pending_label, _pending_n
 
@@ -186,6 +192,7 @@ def _reset_all_logic():
         _avoid_clear_streak = 0
         _avoid_dir = "TURN_RIGHT"
         _avoid_start_ts = 0.0
+        _avoid_last_switch_ts = 0.0
 
     with _em_lock:
         _em_stop_armed = True
@@ -201,22 +208,26 @@ def _reset_all_logic():
 # Avoid / Emergency gates
 # =======================
 def _avoid_set(active: bool, direction: Optional[str] = None):
-    global _avoid_active, _avoid_clear_streak, _avoid_dir, _avoid_start_ts
+    global _avoid_active, _avoid_clear_streak, _avoid_dir, _avoid_start_ts, _avoid_last_switch_ts
     with _avoid_lock:
         _avoid_active = bool(active)
         if direction in ("TURN_RIGHT", "TURN_LEFT"):
             _avoid_dir = direction
         if active:
+            now = time.time()
             if _avoid_start_ts <= 0.0:
-                _avoid_start_ts = time.time()
+                _avoid_start_ts = now
+            if _avoid_last_switch_ts <= 0.0:
+                _avoid_last_switch_ts = now
         else:
             _avoid_clear_streak = 0
             _avoid_start_ts = 0.0
+            _avoid_last_switch_ts = 0.0
             _avoid_dir = "TURN_RIGHT"
 
-def _avoid_get() -> Tuple[bool, int, str, float]:
+def _avoid_get() -> Tuple[bool, int, str, float, float]:
     with _avoid_lock:
-        return bool(_avoid_active), int(_avoid_clear_streak), str(_avoid_dir), float(_avoid_start_ts)
+        return bool(_avoid_active), int(_avoid_clear_streak), str(_avoid_dir), float(_avoid_start_ts), float(_avoid_last_switch_ts)
 
 def _avoid_streak_inc():
     global _avoid_clear_streak
@@ -227,6 +238,24 @@ def _avoid_streak_reset():
     global _avoid_clear_streak
     with _avoid_lock:
         _avoid_clear_streak = 0
+
+def _avoid_maybe_switch(new_dir: str):
+    """
+    Chỉ đổi hướng turn nếu:
+    - đã qua commit time
+    """
+    global _avoid_dir, _avoid_last_switch_ts
+    if new_dir not in ("TURN_LEFT", "TURN_RIGHT"):
+        return
+    now = time.time()
+    with _avoid_lock:
+        if not _avoid_active:
+            return
+        if now - _avoid_last_switch_ts < float(AVOID_COMMIT_SEC):
+            return
+        if new_dir != _avoid_dir:
+            _avoid_dir = new_dir
+            _avoid_last_switch_ts = now
 
 def _em_is_armed() -> bool:
     with _em_lock:
@@ -403,102 +432,216 @@ def _sector_metrics(front_points: List[Dict[str, Any]]) -> Dict[str, Dict[str, A
 def _unknown(sec: Dict[str, Any]) -> bool:
     return int(sec.get("count", 0)) < int(MIN_SECTOR_POINTS)
 
-def _is_clear_forward(C: Dict[str, Any], min_front: float) -> bool:
-    # cần CENTER đủ điểm để tin
-    if _unknown(C):
-        return False
-    return (float(C["kmean_near"]) > float(CLEAR_GO_M)) and (float(min_front) > float(CLEAR_GO_M))
-
-def _is_clear_forward_relaxed(C: Dict[str, Any], min_front: float) -> bool:
+def _sector_near(secs: Dict[str, Dict[str, Any]]) -> Tuple[bool, float]:
     """
-    Trong avoid mode, nếu min_front đã > CLEAR_GO_M thì coi như clear,
-    KHÔNG bị kẹt vì thiếu điểm CENTER.
+    Rule mới theo bạn:
+    Nếu trong 3 vùng có vật cản quá gần (<= OBSTACLE_NEAR_M) => STOP rồi TURN
     """
-    if float(min_front) <= float(CLEAR_GO_M):
-        return False
-    if not _unknown(C):
-        return float(C["kmean_near"]) > float(CLEAR_GO_M)
-    return True
-
-
-# =======================
-# ✅ NEW: ranking / scoring directions
-# =======================
-def _clamp(x: float, a: float, b: float) -> float:
-    return max(a, min(b, x))
-
-def _sector_score(sec: Dict[str, Any]) -> float:
-    """
-    Score càng cao càng tốt.
-    - min_dist: quan trọng nhất (độ an toàn)
-    - kmean_near: ổn định hơn min_dist
-    - count: tăng độ tin cậy (ít điểm -> phạt)
-    """
-    cnt = int(sec.get("count", 0))
-    min_d = float(sec.get("min_dist", float("inf")))
-    kmean = float(sec.get("kmean_near", float("inf")))
-
-    if not math.isfinite(min_d) or not math.isfinite(kmean) or cnt <= 0:
-        return -1e9
-
-    # chuẩn hoá theo VIEW_RANGE_M để score không quá lớn
-    base_min = _clamp(min_d / max(0.5, VIEW_RANGE_M), 0.0, 2.0)
-    base_km  = _clamp(kmean / max(0.5, VIEW_RANGE_M), 0.0, 2.0)
-
-    # count confidence: >= MIN_SECTOR_POINTS -> 1.0, ít hơn -> giảm
-    conf = _clamp(cnt / float(MIN_SECTOR_POINTS), 0.0, 1.5)
-
-    # trọng số: min_dist > kmean > count
-    score = (0.70 * base_min + 0.25 * base_km + 0.05 * conf)
-    return score
-
-def _pick_best_turn_dir(L: Dict[str, Any], R: Dict[str, Any]) -> str:
-    ls = _sector_score(L) if not _unknown(L) else -1e9
-    rs = _sector_score(R) if not _unknown(R) else -1e9
-    if ls <= -1e8 and rs <= -1e8:
-        return "TURN_RIGHT"
-    return "TURN_LEFT" if ls > rs else "TURN_RIGHT"
-
-def _pick_best_direction(secs: Dict[str, Dict[str, Any]], min_front: float) -> Tuple[str, str]:
-    """
-    Return (label, reason)
-    Normal mode rule:
-    - Nếu forward clear => GO_STRAIGHT
-    - Nếu không clear => chọn TURN_LEFT / TURN_RIGHT theo score (min_dist+count)
-    - Nếu cả 2 bên unknown => STOP
-    """
-    L = secs["LEFT"]; C = secs["CENTER"]; R = secs["RIGHT"]
-
-    if _is_clear_forward(C, min_front):
-        return "GO_STRAIGHT", "rank: forward_clear -> go_straight"
-
-    # forward không clear => không cho đi thẳng, phải chọn turn
-    td = _pick_best_turn_dir(L, R)
-    if td:
-        return td, f"rank: forward_not_clear -> choose {td} by score(min_dist+kmean+count)"
-    return "STOP", "rank: unknown_sides -> stop"
-
-
-# =======================
-# ✅ NEW: near-obstacle detection (3 sectors)
-# =======================
-def _too_close_any_sector(secs: Dict[str, Dict[str, Any]], min_front: float) -> Tuple[bool, str]:
-    """
-    Nếu bất kỳ vùng nào quá gần (<= OBSTACLE_NEAR_M) -> stop then turn.
-    Ưu tiên min_front vì nó là min của toàn front180.
-    """
-    if math.isfinite(min_front) and float(min_front) <= float(OBSTACLE_NEAR_M):
-        return True, f"min_front<=OBSTACLE_NEAR({min_front:.3f}<={OBSTACLE_NEAR_M:.2f})"
-
-    # thêm check theo từng sector (có đủ điểm thì tin hơn)
-    for name in ("CENTER", "LEFT", "RIGHT"):
-        s = secs[name]
-        if _unknown(s):
+    mins = []
+    for k in ("LEFT", "CENTER", "RIGHT"):
+        d = float(secs.get(k, {}).get("min_dist", float("inf")))
+        # nếu sector thiếu điểm thì coi như không tin (đỡ STOP do thiếu dữ liệu)
+        if _unknown(secs.get(k, {})):
             continue
-        md = float(s.get("min_dist", float("inf")))
-        if math.isfinite(md) and md <= float(OBSTACLE_NEAR_M):
-            return True, f"{name}.min_dist<=OBSTACLE_NEAR({md:.3f}<={OBSTACLE_NEAR_M:.2f})"
-    return False, ""
+        mins.append(d)
+    if not mins:
+        return False, float("inf")
+    m = min(mins)
+    return (m <= float(OBSTACLE_NEAR_M)), m
+
+
+# =======================
+# Gap Planner + Corridor
+# =======================
+def _rotate_xy(x: float, y: float, heading_deg: float) -> Tuple[float, float]:
+    # heading_deg: + là quay về bên trái
+    r = math.radians(heading_deg)
+    c = math.cos(r)
+    s = math.sin(r)
+    # (x',y') = R(heading)*(x,y)
+    xr = x * c - y * s
+    yr = x * s + y * c
+    return xr, yr
+
+def _corridor_min_x(front_points: List[Dict[str, Any]], heading_deg: float) -> float:
+    """
+    Hành lang hình chữ nhật:
+    - chiều dài: LOOKAHEAD_M
+    - nửa bề rộng: (ROBOT_WIDTH/2 + margin)
+    Trả về min khoảng cách phía trước x (m) của điểm nào nằm trong corridor.
+    Nếu không có điểm -> inf (coi như clear).
+    """
+    half_w = (float(ROBOT_WIDTH_M) * 0.5) + float(CORRIDOR_MARGIN_M)
+    best = float("inf")
+
+    for p in front_points:
+        rel = float(p["rel_deg"])
+        d = float(p["dist_m"])
+        if not math.isfinite(d) or d <= 0:
+            continue
+        # đổi sang tọa độ robot frame (x forward, y left)
+        rr = math.radians(rel)
+        x = d * math.cos(rr)
+        y = d * math.sin(rr)
+
+        # đổi sang frame corridor (quay ngược heading để corridor nằm thẳng)
+        xc, yc = _rotate_xy(x, y, -heading_deg)
+
+        if xc <= 0.0 or xc > float(LOOKAHEAD_M):
+            continue
+        if abs(yc) <= half_w:
+            if xc < best:
+                best = xc
+
+    return best
+
+def _build_bins(front_points: List[Dict[str, Any]]) -> Tuple[List[float], List[float]]:
+    """
+    bins cho -90..+90 (front180), bước BIN_DEG.
+    dist_bin = min dist trong bin.
+    center_deg_bin = list góc center của mỗi bin.
+    """
+    bin_deg = float(BIN_DEG)
+    n = int(round((180.0 / bin_deg))) + 1  # -90..+90 inclusive
+    centers = [-90.0 + i * bin_deg for i in range(n)]
+    dists = [float("inf")] * n
+
+    for p in front_points:
+        rel = float(p["rel_deg"])
+        d = float(p["dist_m"])
+        if not math.isfinite(d) or d <= 0:
+            continue
+        if rel < -90.0 or rel > 90.0:
+            continue
+        idx = int(round((rel + 90.0) / bin_deg))
+        if 0 <= idx < n:
+            if d < dists[idx]:
+                dists[idx] = d
+
+    return dists, centers
+
+def _find_gaps(dists: List[float], centers: List[float]) -> List[Dict[str, Any]]:
+    """
+    Gap = đoạn liên tục các bin "free".
+    Free condition: dist >= OBSTACLE_NEAR_M (đủ xa để đi qua khe).
+    """
+    free_th = float(OBSTACLE_NEAR_M)
+    bin_deg = float(BIN_DEG)
+
+    gaps: List[Dict[str, Any]] = []
+    i = 0
+    n = len(dists)
+    while i < n:
+        if not math.isfinite(dists[i]) or dists[i] < free_th:
+            i += 1
+            continue
+        j = i
+        while j < n and (math.isfinite(dists[j]) and dists[j] >= free_th):
+            j += 1
+
+        start_deg = centers[i] - 0.5 * bin_deg
+        end_deg = centers[j - 1] + 0.5 * bin_deg
+        width_deg = end_deg - start_deg
+
+        if width_deg >= float(GAP_MIN_WIDTH_DEG):
+            # best heading = trung tâm gap, ưu tiên gần 0
+            best_deg = (start_deg + end_deg) * 0.5
+            # clearance đại diện = min(dist) trong gap (cẩn thận)
+            clearance = min(dists[i:j]) if i < j else float("inf")
+            gaps.append({
+                "start_deg": float(start_deg),
+                "end_deg": float(end_deg),
+                "width_deg": float(width_deg),
+                "best_deg": float(best_deg),
+                "clearance_m": float(clearance),
+                "i0": int(i),
+                "i1": int(j - 1),
+            })
+
+        i = j
+
+    return gaps
+
+def _score_gap(g: Dict[str, Any]) -> float:
+    """
+    Score heuristic:
+    - khe rộng hơn tốt hơn
+    - clearance lớn tốt hơn
+    - gần hướng thẳng (0 độ) tốt hơn (đỡ lắc)
+    """
+    width = float(g.get("width_deg", 0.0))
+    clear = float(g.get("clearance_m", 0.0))
+    best = float(g.get("best_deg", 0.0))
+
+    # normalize
+    w_n = max(0.0, min(1.0, width / 60.0))              # >=60deg coi như max
+    c_n = max(0.0, min(1.0, clear / max(1.0, CLEAR_GO_M)))  # >=CLEAR_GO ~ max
+    s_n = 1.0 - max(0.0, min(1.0, abs(best) / 90.0))    # 0deg best
+
+    return 0.45 * w_n + 0.35 * c_n + 0.20 * s_n
+
+def _pick_best_heading(front_points: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Trả:
+    - best_heading_deg, best_score
+    - top_candidates (list 3)
+    - bins preview
+    """
+    dists, centers = _build_bins(front_points)
+    gaps = _find_gaps(dists, centers)
+    for g in gaps:
+        g["score"] = float(_score_gap(g))
+
+    gaps_sorted = sorted(gaps, key=lambda x: float(x.get("score", 0.0)), reverse=True)
+    top = gaps_sorted[:3]
+
+    if top:
+        best = top[0]
+        return {
+            "best_heading_deg": float(best["best_deg"]),
+            "best_score": float(best["score"]),
+            "candidates": [{
+                "best_deg": float(x["best_deg"]),
+                "score": float(x["score"]),
+                "width_deg": float(x["width_deg"]),
+                "clearance_m": float(x["clearance_m"]),
+                "start_deg": float(x["start_deg"]),
+                "end_deg": float(x["end_deg"]),
+            } for x in top],
+            "bins": {
+                "bin_deg": float(BIN_DEG),
+                "centers": centers,
+                "dists": dists,
+            }
+        }
+
+    # fallback: nếu không có gap đủ rộng, chọn hướng nào corridor tốt hơn (±45)
+    c0 = _corridor_min_x(front_points, 0.0)
+    cl = _corridor_min_x(front_points, +45.0)
+    cr = _corridor_min_x(front_points, -45.0)
+
+    best_h = 0.0
+    best_s = 0.0
+    if cl >= cr and cl > c0:
+        best_h, best_s = +45.0, 0.1
+    elif cr > cl and cr > c0:
+        best_h, best_s = -45.0, 0.1
+
+    return {
+        "best_heading_deg": float(best_h),
+        "best_score": float(best_s),
+        "candidates": [],
+        "bins": {
+            "bin_deg": float(BIN_DEG),
+            "centers": centers,
+            "dists": dists,
+        }
+    }
+
+def _heading_to_label(heading_deg: float) -> str:
+    if abs(float(heading_deg)) <= float(TURN_DEADBAND_DEG):
+        return "GO_STRAIGHT"
+    return "TURN_LEFT" if float(heading_deg) > 0 else "TURN_RIGHT"
 
 
 # =======================
@@ -529,14 +672,14 @@ def _smooth_label(raw: str) -> str:
 
 
 # =======================
-# Decision logic (FIX)
-# - Emergency stop (0.25m): STOP one-shot -> avoid turn
-# - Obstacle near (0.70m default): STOP one-shot -> avoid turn  ✅ FIX BUG
-# - Avoid mode: turn until clear -> RESET ALL -> GO_STRAIGHT
-# - Normal: forward clear => GO_STRAIGHT else TURN based on ranking (min_dist+count)
+# Decision logic (Gap Planner)
+# - NEAR in any sector => STOP then TURN
+# - Avoid: turn theo hướng tốt, có commit, clear => RESET STATE => GO_STRAIGHT
+# - Normal: ưu tiên corridor thẳng, không clear thì steer theo gap heading
 # =======================
 def _pack_decision(label: str, reason: str, secs: Dict[str, Dict[str, Any]], min_front: float,
-                   avoid_active: bool, clear_streak: int, avoid_dir: str, avoid_age: float) -> Dict[str, Any]:
+                   avoid_active: bool, clear_streak: int, avoid_dir: str, avoid_age: float,
+                   planner_dbg: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "ok": True,
         "label": label,
@@ -561,6 +704,8 @@ def _pack_decision(label: str, reason: str, secs: Dict[str, Dict[str, Any]], min
                 "dir": avoid_dir,
                 "age_s": float(avoid_age),
                 "max_s": float(AVOID_MAX_SEC),
+                "commit_s": float(AVOID_COMMIT_SEC),
+                "switch_hyst": float(AVOID_SWITCH_HYST),
             },
             "emergency": {"armed": _em_is_armed(), "issued_this_event": _em_was_issued_this_event()},
             "thresholds": {
@@ -572,7 +717,12 @@ def _pack_decision(label: str, reason: str, secs: Dict[str, Dict[str, Any]], min
                 "label_confirm_n": int(LABEL_CONFIRM_N),
                 "emergency_stop_m": float(EMERGENCY_STOP_M),
                 "emergency_rearm_m": float(EMERGENCY_REARM_M),
-            }
+                "robot_width_m": float(ROBOT_WIDTH_M),
+                "corridor_margin_m": float(CORRIDOR_MARGIN_M),
+                "lookahead_m": float(LOOKAHEAD_M),
+                "bin_deg": float(BIN_DEG),
+            },
+            "planner": planner_dbg or {},
         }
     }
 
@@ -588,17 +738,59 @@ def _compute_decision() -> Dict[str, Any]:
 
     secs = _sector_metrics(front_pts)
     min_front = _min_front_any(front_pts)
+    L = secs["LEFT"]
+    C = secs["CENTER"]
+    R = secs["RIGHT"]
 
-    L = secs["LEFT"]; C = secs["CENTER"]; R = secs["RIGHT"]
+    # planner snapshot
+    plan = _pick_best_heading(front_pts)
+    best_heading = float(plan.get("best_heading_deg", 0.0))
+    best_label = _heading_to_label(best_heading)
+    best_score = float(plan.get("best_score", 0.0))
 
-    # 1) Emergency STOP one-shot (siêu sát)
+    # corridors debug (planned + others)
+    cand_headings = [best_heading]
+    # thêm 2 corridor khác (nếu có candidates)
+    for c in (plan.get("candidates") or []):
+        hd = float(c.get("best_deg", 0.0))
+        if hd not in cand_headings:
+            cand_headings.append(hd)
+        if len(cand_headings) >= 3:
+            break
+    # luôn show straight corridor
+    if 0.0 not in cand_headings:
+        cand_headings.append(0.0)
+
+    corridors_dbg = []
+    for hd in cand_headings[:4]:
+        mx = _corridor_min_x(front_pts, hd)
+        corridors_dbg.append({
+            "heading_deg": float(hd),
+            "min_x_m": float(mx if math.isfinite(mx) else 999.0),
+            "is_clear": bool((not math.isfinite(mx)) or (mx >= float(CLEAR_GO_M))),
+        })
+
+    near_any, near_min = _sector_near(secs)
+
+    # ========== Emergency STOP one-shot ==========
     if (min_front <= float(EMERGENCY_STOP_M)) and _em_is_armed():
         _em_disarm_after_issue()
-        turn_dir = _pick_best_turn_dir(L, R)
+        # vào avoid, chọn hướng turn theo best_heading (nhưng không cho GO_STRAIGHT)
+        turn_dir = "TURN_LEFT" if best_heading > 0 else "TURN_RIGHT"
         _avoid_set(True, turn_dir)
 
-        avoid_active, streak, avoid_dir, start_ts = _avoid_get()
+        avoid_active, streak, avoid_dir, start_ts, _swts = _avoid_get()
         avoid_age = (time.time() - start_ts) if start_ts > 0 else 0.0
+
+        planner_dbg = {
+            "best_heading_deg": best_heading,
+            "best_label": best_label,
+            "best_score": best_score,
+            "near_any": near_any,
+            "near_min_m": float(near_min),
+            "corridors": corridors_dbg,
+            "candidates": plan.get("candidates", []),
+        }
 
         raw = _pack_decision(
             label="STOP",
@@ -609,36 +801,87 @@ def _compute_decision() -> Dict[str, Any]:
             clear_streak=0,
             avoid_dir=turn_dir,
             avoid_age=avoid_age,
+            planner_dbg=planner_dbg,
         )
         raw["label"] = _smooth_label(raw["label"])
         return raw
 
-    # Re-arm emergency when safe again
+    # re-arm emergency
     if (min_front > float(EMERGENCY_REARM_M)) and (not _em_is_armed()):
         _em_arm()
 
-    # 2) Avoid mode (chỉ có thể xảy ra sau STOP)
-    avoid_active, streak, avoid_dir, start_ts = _avoid_get()
+    # ========== Rule mới: NEAR ở bất kỳ vùng nào => STOP rồi TURN ==========
+    avoid_active, streak, avoid_dir, start_ts, last_sw = _avoid_get()
     avoid_age = (time.time() - start_ts) if start_ts > 0 else 0.0
 
-    if avoid_active:
-        # timeout safety: tránh bị kẹt vô hạn
-        if avoid_age >= float(AVOID_MAX_SEC):
-            _reset_all_logic()
-            avoid_active, streak, avoid_dir, start_ts = _avoid_get()
-            avoid_age = 0.0
+    if (not avoid_active) and near_any:
+        # vào avoid + phát STOP trước
+        turn_dir = "TURN_LEFT" if best_heading > 0 else "TURN_RIGHT"
+        _avoid_set(True, turn_dir)
 
-        clear_now = _is_clear_forward_relaxed(C, min_front)
+        planner_dbg = {
+            "best_heading_deg": best_heading,
+            "best_label": best_label,
+            "best_score": best_score,
+            "near_any": near_any,
+            "near_min_m": float(near_min),
+            "corridors": corridors_dbg,
+            "candidates": plan.get("candidates", []),
+        }
+
+        raw = _pack_decision(
+            label="STOP",
+            reason=f"near_obstacle(min={near_min:.3f} <= {OBSTACLE_NEAR_M:.2f}) -> STOP then enter_avoid({turn_dir})",
+            secs=secs,
+            min_front=min_front,
+            avoid_active=True,
+            clear_streak=0,
+            avoid_dir=turn_dir,
+            avoid_age=0.0,
+            planner_dbg=planner_dbg,
+        )
+        raw["label"] = _smooth_label(raw["label"])
+        return raw
+
+    # ========== Avoid mode ==========
+    avoid_active, streak, avoid_dir, start_ts, last_sw = _avoid_get()
+    avoid_age = (time.time() - start_ts) if start_ts > 0 else 0.0
+
+    # timeout safety: tránh kẹt
+    if avoid_active and avoid_age >= float(AVOID_MAX_SEC):
+        _reset_all_logic()
+        avoid_active, streak, avoid_dir, start_ts, last_sw = _avoid_get()
+        avoid_age = 0.0
+
+    # kiểm tra clear corridor thẳng để thoát avoid
+    cmin0 = _corridor_min_x(front_pts, 0.0)
+    corridor_clear0 = (not math.isfinite(cmin0)) or (cmin0 >= float(CLEAR_GO_M))
+    clear_now = corridor_clear0 and (float(min_front) >= float(CLEAR_GO_M))
+
+    if avoid_active:
+        # nếu clear -> đếm streak
         if clear_now:
             _avoid_streak_inc()
         else:
             _avoid_streak_reset()
 
-        avoid_active2, streak2, avoid_dir2, start_ts2 = _avoid_get()
+        avoid_active2, streak2, avoid_dir2, start_ts2, last_sw2 = _avoid_get()
         avoid_age2 = (time.time() - start_ts2) if start_ts2 > 0 else 0.0
 
+        planner_dbg = {
+            "best_heading_deg": best_heading,
+            "best_label": best_label,
+            "best_score": best_score,
+            "near_any": near_any,
+            "near_min_m": float(near_min),
+            "corridor_min_x0_m": float(cmin0 if math.isfinite(cmin0) else 999.0),
+            "corridor_clear0": bool(corridor_clear0),
+            "clear_now": bool(clear_now),
+            "corridors": corridors_dbg,
+            "candidates": plan.get("candidates", []),
+        }
+
         if streak2 >= int(CLEAR_STREAK_N):
-            # ✅ FIX: thoát avoid là RESET state để tính lại từ đầu
             _reset_all_logic()
             raw = _pack_decision(
                 label="GO_STRAIGHT",
@@ -649,67 +892,92 @@ def _compute_decision() -> Dict[str, Any]:
                 clear_streak=streak2,
                 avoid_dir=avoid_dir2,
                 avoid_age=avoid_age2,
+                planner_dbg=planner_dbg,
             )
             raw["label"] = _smooth_label(raw["label"])
             return raw
 
+        # update hướng turn (nhưng chống lắc: commit time)
+        desired_turn = "TURN_LEFT" if best_heading > 0 else "TURN_RIGHT"
+        # chỉ đổi hướng khi heading mới "khác" và thực sự đáng đổi (score đủ cao)
+        # (giữ đơn giản: nếu best_score lớn hơn một ngưỡng và best_heading đổi bên)
+        if desired_turn != avoid_dir2 and best_score >= float(AVOID_SWITCH_HYST):
+            _avoid_maybe_switch(desired_turn)
+            avoid_active2, streak2, avoid_dir2, start_ts2, last_sw2 = _avoid_get()
+
         raw = _pack_decision(
             label=avoid_dir2,
-            reason="avoid_mode_turn_until_clear (triggered_by_stop)",
+            reason="avoid_mode_turn_until_clear (NEAR->STOP triggered)",
             secs=secs,
             min_front=min_front,
             avoid_active=True,
             clear_streak=streak2,
             avoid_dir=avoid_dir2,
             avoid_age=avoid_age2,
+            planner_dbg=planner_dbg,
         )
         raw["label"] = _smooth_label(raw["label"])
         return raw
 
-    # 3) ✅ NEW: obstacle too near anywhere -> STOP 1 nhịp rồi TURN
-    too_close, why_close = _too_close_any_sector(secs, min_front)
-    if too_close:
-        # STOP one-shot -> enter avoid
-        turn_dir = _pick_best_turn_dir(L, R)
-        _avoid_set(True, turn_dir)
+    # ========== Normal mode ==========
+    planner_dbg = {
+        "best_heading_deg": best_heading,
+        "best_label": best_label,
+        "best_score": best_score,
+        "near_any": near_any,
+        "near_min_m": float(near_min),
+        "corridor_min_x0_m": float(cmin0 if math.isfinite(cmin0) else 999.0),
+        "corridor_clear0": bool(corridor_clear0),
+        "corridors": corridors_dbg,
+        "candidates": plan.get("candidates", []),
+    }
 
-        avoid_active, streak, avoid_dir, start_ts = _avoid_get()
-        avoid_age = (time.time() - start_ts) if start_ts > 0 else 0.0
-
+    # ưu tiên đi thẳng nếu corridor thẳng clear
+    if corridor_clear0 and (float(min_front) >= float(CLEAR_GO_M)):
         raw = _pack_decision(
-            label="STOP",
-            reason=f"obstacle_near -> STOP then enter_avoid({turn_dir}) | {why_close}",
+            label="GO_STRAIGHT",
+            reason="corridor_forward_clear -> go_straight",
             secs=secs,
             min_front=min_front,
-            avoid_active=True,
+            avoid_active=False,
             clear_streak=0,
-            avoid_dir=turn_dir,
-            avoid_age=avoid_age,
+            avoid_dir="TURN_RIGHT",
+            avoid_age=0.0,
+            planner_dbg=planner_dbg,
         )
         raw["label"] = _smooth_label(raw["label"])
         return raw
 
-    # 4) Normal mode: xếp hạng hướng đi (min_dist + count)
-    best_label, why = _pick_best_direction(secs, min_front)
+    # nếu không clear: steer theo best gap (không cần STOP trừ khi NEAR)
+    steer = best_label
+    if steer == "GO_STRAIGHT":
+        # không clear mà best vẫn straight: chọn bên corridor tốt hơn
+        cl = _corridor_min_x(front_pts, +35.0)
+        cr = _corridor_min_x(front_pts, -35.0)
+        steer = "TURN_LEFT" if cl >= cr else "TURN_RIGHT"
+        planner_dbg["fallback_turn"] = {"cl_m": float(cl if math.isfinite(cl) else 999.0), "cr_m": float(cr if math.isfinite(cr) else 999.0)}
+
     raw = _pack_decision(
-        label=best_label,
-        reason=why,
+        label=steer,
+        reason=f"not_clear_forward -> steer_by_gap_planner({steer})",
         secs=secs,
         min_front=min_front,
         avoid_active=False,
         clear_streak=0,
         avoid_dir="TURN_RIGHT",
         avoid_age=0.0,
+        planner_dbg=planner_dbg,
     )
     raw["label"] = _smooth_label(raw["label"])
     return raw
 
 
 # =======================
-# Rendering
+# Rendering (map + corridors)
 # =======================
 def _render_map_png(decision: Dict[str, Any], front_points: List[Dict[str, Any]]) -> bytes:
     from PIL import Image, ImageDraw, ImageFont
+    import io
 
     W = H = int(VIEW_SIZE_PX)
     img = Image.new("RGB", (W, H), (240, 240, 240))
@@ -718,27 +986,32 @@ def _render_map_png(decision: Dict[str, Any], front_points: List[Dict[str, Any]]
     cx, cy = W // 2, H // 2
     ppm = (W * 0.45) / max(0.5, float(VIEW_RANGE_M))
 
+    # semi arc boundary
     rr = int(VIEW_RANGE_M * ppm)
     bbox = (cx - rr, cy - rr, cx + rr, cy + rr)
     draw.arc(bbox, start=0, end=180, fill=(160, 160, 160), width=3)
 
+    # robot center
     draw.ellipse((cx - 7, cy - 7, cx + 7, cy + 7), fill=(20, 20, 20))
+
+    def xy_to_px(x_fwd: float, y_left: float) -> Tuple[int, int]:
+        px = int(cx + y_left * ppm)
+        py = int(cy - x_fwd * ppm)
+        return px, py
 
     def rel_to_px(rel_deg: float, dist_m: float) -> Tuple[int, int]:
         r = math.radians(rel_deg)
         x_fwd = dist_m * math.cos(r)
         y_left = dist_m * math.sin(r)
-        px = int(cx + y_left * ppm)
-        py = int(cy - x_fwd * ppm)
-        return px, py
+        return xy_to_px(x_fwd, y_left)
 
+    # --- sector overlay (giữ giống bản cũ)
     overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     od = ImageDraw.Draw(overlay)
     ring_px = int(SECTOR_RING_M * ppm)
     bbox2 = (cx - ring_px, cy - ring_px, cx + ring_px, cy + ring_px)
 
     label = str(decision.get("label", "STOP"))
-
     selected_sector = None
     if label == "GO_STRAIGHT":
         selected_sector = "CENTER"
@@ -765,6 +1038,7 @@ def _render_map_png(decision: Dict[str, Any], front_points: List[Dict[str, Any]]
     img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
     draw = ImageDraw.Draw(img)
 
+    # --- draw points
     for p in front_points:
         d = float(p["dist_m"])
         rel = float(p["rel_deg"])
@@ -774,6 +1048,51 @@ def _render_map_png(decision: Dict[str, Any], front_points: List[Dict[str, Any]]
         if 0 <= px < W and 0 <= py < H:
             img.putpixel((px, py), (80, 80, 80))
 
+    # --- Corridor overlays (màu theo yêu cầu)
+    dbg = decision.get("debug", {}) if isinstance(decision, dict) else {}
+    planner = dbg.get("planner", {}) if isinstance(dbg, dict) else {}
+    corridors = planner.get("corridors", []) if isinstance(planner, dict) else []
+
+    half_w = (float(ROBOT_WIDTH_M) * 0.5) + float(CORRIDOR_MARGIN_M)
+    look = float(LOOKAHEAD_M)
+
+    def corridor_poly(heading_deg: float) -> List[Tuple[int, int]]:
+        # rectangle in corridor frame: x in [0, look], y in [-half_w, +half_w]
+        corners = [
+            (0.0, -half_w),
+            (look, -half_w),
+            (look, +half_w),
+            (0.0, +half_w),
+        ]
+        pts = []
+        for (xh, yh) in corners:
+            x, y = _rotate_xy(xh, yh, heading_deg)  # rotate into robot frame
+            pts.append(xy_to_px(x, y))
+        return pts
+
+    # planned corridor = heading của best (corridors[0] thường là best)
+    # vẽ các corridor khác vàng nhạt
+    # dùng overlay RGBA để alpha đẹp
+    cor_ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    cd = ImageDraw.Draw(cor_ov)
+
+    for i, c in enumerate(corridors):
+        hd = float(c.get("heading_deg", 0.0))
+        poly = corridor_poly(hd)
+
+        if i == 0:
+            fill = (0, 200, 0, 70)      # xanh (corridor chuẩn bị đi)
+            outline = (0, 120, 0, 140)
+        else:
+            fill = (255, 235, 59, 45)   # vàng nhạt (corridor khác)
+            outline = (180, 160, 0, 110)
+
+        cd.polygon(poly, fill=fill, outline=outline)
+
+    img = Image.alpha_composite(img.convert("RGBA"), cor_ov).convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    # --- draw arrow theo label
     if label == "GO_STRAIGHT":
         ax, ay = rel_to_px(0.0, min(1.0, VIEW_RANGE_M * 0.9))
         draw.line((cx, cy, ax, ay), fill=(0, 0, 0), width=4)
@@ -784,6 +1103,7 @@ def _render_map_png(decision: Dict[str, Any], front_points: List[Dict[str, Any]]
         ax, ay = rel_to_px(+45.0, min(1.0, VIEW_RANGE_M * 0.9))
         draw.line((cx, cy, ax, ay), fill=(0, 0, 0), width=4)
 
+    # fonts
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
         font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
@@ -791,7 +1111,6 @@ def _render_map_png(decision: Dict[str, Any], front_points: List[Dict[str, Any]]
         font = None
         font_small = None
 
-    dbg = decision.get("debug", {}) if isinstance(decision, dict) else {}
     secdbg = dbg.get("sectors", {}) if isinstance(dbg, dict) else {}
 
     def fmt_dist(d: float) -> str:
@@ -808,21 +1127,25 @@ def _render_map_png(decision: Dict[str, Any], front_points: List[Dict[str, Any]]
         draw.text((tx - 35, ty - 10), f"{name}:{fmt_dist(d)}", fill=(0, 0, 0), font=font_small)
 
     avoid_dbg = dbg.get("avoid", {}) if isinstance(dbg, dict) else {}
+    cor0 = planner.get("corridor_min_x0_m", None) if isinstance(planner, dict) else None
+
     hud = [
         f"label: {label}",
         f"front_center={FRONT_CENTER_DEG_HARD:.1f} mirror={FRONT_MIRROR_HARD} flip={FRONT_FLIP_HARD}",
-        f"frame_sec={FRAME_SEC:.2f} k_near={K_NEAR} confirm_n={LABEL_CONFIRM_N}",
+        f"frame_sec={FRAME_SEC:.2f} bin={BIN_DEG:.1f}deg lookahead={LOOKAHEAD_M:.2f}m",
         f"clear_go={CLEAR_GO_M:.2f}m obstacle_near={OBSTACLE_NEAR_M:.2f}m em_stop={EMERGENCY_STOP_M:.2f}m",
+        f"robot_w={ROBOT_WIDTH_M*100:.0f}cm margin={CORRIDOR_MARGIN_M*100:.0f}cm",
         f"avoid: active={avoid_dbg.get('active')} dir={avoid_dbg.get('dir')} streak={avoid_dbg.get('clear_streak')} age={avoid_dbg.get('age_s')}",
-        f"L={fmt_dist(dL)} C={fmt_dist(dC)} R={fmt_dist(dR)}",
-        f"reason: {str(decision.get('reason',''))[:110]}",
+        f"L={fmt_dist(dL)} C={fmt_dist(dC)} R={fmt_dist(dR)} min_front={fmt_dist(float(dbg.get('min_front', float('inf'))))}",
+        f"best_heading={planner.get('best_heading_deg', 0.0)} deg score={planner.get('best_score', 0.0)}",
+        f"corridor0_min_x={(cor0 if cor0 is not None else '-')}",
+        f"reason: {str(decision.get('reason',''))[:90]}",
     ]
     y0 = 10
     for s in hud:
         draw.text((10, y0), s, fill=(0, 0, 0), font=font)
         y0 += 22
 
-    import io
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
@@ -889,7 +1212,7 @@ def map_worker():
 
 
 # =======================
-# ROUTES
+# ROUTES (giữ y chang format/endpoint cũ)
 # =======================
 @app.get("/api/status")
 def api_status():
@@ -901,7 +1224,7 @@ def api_status():
         dec = dict(latest_decision_full)
         lbl = latest_decision_label
 
-    avoid_active, streak, avoid_dir, start_ts = _avoid_get()
+    avoid_active, streak, avoid_dir, start_ts, last_sw = _avoid_get()
     avoid_age = (time.time() - start_ts) if start_ts > 0 else 0.0
     now = time.time()
 
@@ -936,6 +1259,10 @@ def api_status():
             "avoid_max_sec": float(AVOID_MAX_SEC),
             "emergency_stop_m": float(EMERGENCY_STOP_M),
             "emergency_rearm_m": float(EMERGENCY_REARM_M),
+            "robot_width_m": float(ROBOT_WIDTH_M),
+            "corridor_margin_m": float(CORRIDOR_MARGIN_M),
+            "lookahead_m": float(LOOKAHEAD_M),
+            "bin_deg": float(BIN_DEG),
         },
 
         "latest_label": lbl,
@@ -989,18 +1316,18 @@ def dashboard():
     html = f"""
     <html>
       <head>
-        <title>LiDAR Front-180 Map</title>
+        <title>LiDAR Front-180 Map (Gap Planner)</title>
         <style>
           body {{ font-family: Arial; margin: 12px; }}
           .row {{ display:flex; gap:12px; align-items:flex-start; }}
           img {{ border:1px solid #ccc; border-radius:8px; }}
-          .box {{ padding:10px; border:1px solid #ddd; border-radius:8px; min-width: 460px; }}
+          .box {{ padding:10px; border:1px solid #ddd; border-radius:8px; min-width: 420px; }}
           .mono {{ font-family: monospace; white-space: pre; }}
           button {{ padding:6px 10px; }}
         </style>
       </head>
       <body>
-        <h3>LiDAR Front-180 Map (NEAR -> STOP then TURN, clear -> RESET STATE)</h3>
+        <h3>LiDAR Front-180 Map (Gap Planner) — NEAR => STOP then TURN, clear => RESET STATE</h3>
         <div class="row">
           <img id="map" src="/api/map.png?ts={time.time()}" width="{VIEW_SIZE_PX}" height="{VIEW_SIZE_PX}"/>
           <div class="box">
@@ -1040,7 +1367,8 @@ def dashboard():
                   min_front: (d.debug||{{}}).min_front,
                   avoid: (d.debug||{{}}).avoid,
                   emergency: (d.debug||{{}}).emergency,
-                  thresholds: (d.debug||{{}}).thresholds
+                  thresholds: (d.debug||{{}}).thresholds,
+                  planner: (d.debug||{{}}).planner
                 }}, null, 2);
 
               document.getElementById('status').textContent =
@@ -1068,7 +1396,7 @@ def dashboard():
 @app.get("/")
 def home():
     return Response(
-        "<h3>lidarhub_front180_ranked_stop_then_turn running</h3>"
+        "<h3>lidarhub_front180_gap_planner running</h3>"
         "<ul>"
         "<li><a href='/dashboard'>/dashboard</a></li>"
         "<li>/api/map.png</li>"
