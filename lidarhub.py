@@ -31,59 +31,52 @@ THROTTLE_MS = int(os.environ.get("THROTTLE_MS", "200"))
 THROTTLE_S = THROTTLE_MS / 1000.0
 
 # Safety / motion model
-STOP_NEAR_M = float(os.environ.get("STOP_NEAR_M", "0.30"))      # stop if center < 30cm
-LOOKAHEAD_M = float(os.environ.get("LOOKAHEAD_M", "1.20"))      # obstacle counting range for sector stats
+STOP_NEAR_M = float(os.environ.get("STOP_NEAR_M", "0.30"))      # used by k3 center stop condition
+LOOKAHEAD_M = float(os.environ.get("LOOKAHEAD_M", "1.20"))
 PREDICT_T_SEC = float(os.environ.get("PREDICT_T_SEC", "1.0"))
 ROBOT_SPEED_MPS = float(os.environ.get("ROBOT_SPEED_MPS", "0.35"))
 SAFETY_MARGIN_M = float(os.environ.get("SAFETY_MARGIN_M", "0.10"))
 
 # Plot/Heading
 FRONT_CENTER_DEG = float(os.environ.get("FRONT_CENTER_DEG", "0.0"))
-FRONT_MIRROR = int(os.environ.get("FRONT_MIRROR", "0"))  # set 1 if left/right inverted
-
+FRONT_MIRROR = int(os.environ.get("FRONT_MIRROR", "0"))  # 1 if left/right inverted
 RECENT_SEC = float(os.environ.get("RECENT_SEC", "0.7"))
 
-# Auto front calib (back wall -> front = back + 180)
+# Auto front calib
 AUTO_FRONT_CALIB = int(os.environ.get("AUTO_FRONT_CALIB", "1"))
 AUTO_CALIB_BIN_DEG = float(os.environ.get("AUTO_CALIB_BIN_DEG", "10.0"))
 AUTO_CALIB_SMOOTH = float(os.environ.get("AUTO_CALIB_SMOOTH", "0.35"))
 AUTO_CALIB_NEAR_CAP_M = float(os.environ.get("AUTO_CALIB_NEAR_CAP_M", "2.0"))
 AUTO_CALIB_PERCENTILE = float(os.environ.get("AUTO_CALIB_PERCENTILE", "20.0"))
 
-# k=3 sectors in FRONT 180
-SECTOR_CENTER_DEG = float(os.environ.get("SECTOR_CENTER_DEG", "30.0"))  # center half-width (default +-30)
-FRONT_HALF_DEG = float(os.environ.get("FRONT_HALF_DEG", "90.0"))        # front 180 = [-90..+90]
+# k=3 sectors (front 180)
+SECTOR_CENTER_DEG = float(os.environ.get("SECTOR_CENTER_DEG", "30.0"))
+FRONT_HALF_DEG = float(os.environ.get("FRONT_HALF_DEG", "90.0"))
 
-# Sticky turn
-CLEAR_RELEASE_M = float(os.environ.get("CLEAR_RELEASE_M", "0.40"))      # release when center_min > 40cm
-CLEAR_CONFIRM_SEC = float(os.environ.get("CLEAR_CONFIRM_SEC", "0.25"))  # require stable clear a bit
-TURN_STICKY_MIN_SEC = float(os.environ.get("TURN_STICKY_MIN_SEC", "0.35"))
+# ===== Front arc safety override =====
+FRONT_ARC_DEG = float(os.environ.get("FRONT_ARC_DEG", "85.0"))              # ±85°
+FRONT_ARC_BLOCK_M = float(os.environ.get("FRONT_ARC_BLOCK_M", "0.55"))      # block GO_STRAIGHT if <= 0.55m
+FRONT_ARC_HARD_STOP_M = float(os.environ.get("FRONT_ARC_HARD_STOP_M", "0.35"))  # STOP one-shot if <= 0.35m
 
-# ===== NEW: Front-arc safety (Fix GO_STRAIGHT) =====
-# Nếu trong front arc (±FRONT_ARC_DEG) có điểm gần hơn FRONT_ARC_BLOCK_M => chặn GO_STRAIGHT (TURN/STOP)
-FRONT_ARC_DEG = float(os.environ.get("FRONT_ARC_DEG", "85.0"))
-FRONT_ARC_BLOCK_M = float(os.environ.get("FRONT_ARC_BLOCK_M", "0.55"))
-FRONT_ARC_HARD_STOP_M = float(os.environ.get("FRONT_ARC_HARD_STOP_M", "0.35"))
-
-# STOP rồi mới TURN (để robot dừng lại 1 nhịp)
-STOP_THEN_TURN_HOLD_SEC = float(os.environ.get("STOP_THEN_TURN_HOLD_SEC", "0.20"))
+# Re-arm threshold: must clear past this to allow next STOP again
+HARD_STOP_REARM_M = float(os.environ.get("HARD_STOP_REARM_M", "0.45"))
 
 # ===== Map (occupancy) =====
-MAP_SIZE_M = float(os.environ.get("MAP_SIZE_M", "10.0"))   # world map width/height in meters
-MAP_RES_M = float(os.environ.get("MAP_RES_M", "0.05"))     # meters per cell (0.05 => 20 cells/m)
-MAP_DECAY = float(os.environ.get("MAP_DECAY", "0.985"))    # 0.985 => fade old points slowly
-MAP_HIT = float(os.environ.get("MAP_HIT", "30.0"))         # add value per hit
+MAP_SIZE_M = float(os.environ.get("MAP_SIZE_M", "10.0"))
+MAP_RES_M = float(os.environ.get("MAP_RES_M", "0.05"))
+MAP_DECAY = float(os.environ.get("MAP_DECAY", "0.985"))
+MAP_HIT = float(os.environ.get("MAP_HIT", "30.0"))
 MAP_MAX = float(os.environ.get("MAP_MAX", "255.0"))
 
 # pose dead-reckoning (based on decision)
-TURN_RATE_DEG_S = float(os.environ.get("TURN_RATE_DEG_S", "70.0"))  # turning angular speed estimate
-BACK_SPEED_MPS = float(os.environ.get("BACK_SPEED_MPS", "0.20"))    # if label BACK exists later
+TURN_RATE_DEG_S = float(os.environ.get("TURN_RATE_DEG_S", "70.0"))
+BACK_SPEED_MPS = float(os.environ.get("BACK_SPEED_MPS", "0.20"))
 
 # view render
-VIEW_SIZE_PX = int(os.environ.get("VIEW_SIZE_PX", "640"))           # output image px
-VIEW_RANGE_M = float(os.environ.get("VIEW_RANGE_M", "3.5"))         # visible radius around robot
-SECTOR_RING_M = float(os.environ.get("SECTOR_RING_M", "1.2"))        # ring overlay radius
-SECTOR_ALPHA = int(os.environ.get("SECTOR_ALPHA", "90"))             # 0..255
+VIEW_SIZE_PX = int(os.environ.get("VIEW_SIZE_PX", "640"))
+VIEW_RANGE_M = float(os.environ.get("VIEW_RANGE_M", "3.5"))
+SECTOR_RING_M = float(os.environ.get("SECTOR_RING_M", "1.2"))
+SECTOR_ALPHA = int(os.environ.get("SECTOR_ALPHA", "90"))
 
 LINE_RE = re.compile(r"theta:\s*([0-9.]+)\s+Dist:\s*([0-9.]+)\s+Q:\s*(\d+)")
 
@@ -117,17 +110,14 @@ _front_center_lock = threading.Lock()
 _front_center_est_deg: float = FRONT_CENTER_DEG
 _last_back_deg: Optional[float] = None
 
-# Sticky turn state
-_sticky_lock = threading.Lock()
-_sticky_label: Optional[str] = None            # "TURN_LEFT" / "TURN_RIGHT" / None
-_sticky_since: float = 0.0
-_sticky_clear_start: Optional[float] = None
+# ===== STOP one-shot then TURN state =====
+_stopturn_lock = threading.Lock()
+_stopturn_active: bool = False
+_stopturn_next: Optional[str] = None         # "TURN_LEFT"/"TURN_RIGHT"
+_stopturn_stop_issued: bool = False
+_stopturn_reason: str = ""
+_hard_stop_armed: bool = True               # re-arm gate to avoid repeated STOP spam
 
-# ===== NEW: STOP-then-TURN state (keeps endpoints unchanged) =====
-_stop_turn_lock = threading.Lock()
-_stop_hold_until: float = 0.0
-_pending_turn_label: Optional[str] = None
-_pending_turn_reason: str = ""
 
 # Pose for map (world frame)
 _pose_lock = threading.Lock()
@@ -140,7 +130,7 @@ _pose_last_ts = 0.0
 _grid_lock = threading.Lock()
 grid_w = int(round(MAP_SIZE_M / MAP_RES_M))
 grid_h = int(round(MAP_SIZE_M / MAP_RES_M))
-grid = [[0.0 for _ in range(grid_w)] for __ in range(grid_h)]  # float for decay
+grid = [[0.0 for _ in range(grid_w)] for __ in range(grid_h)]
 
 
 # =======================
@@ -196,7 +186,6 @@ def _rel_deg(theta_deg: float, center_deg: float) -> float:
     return rel
 
 def _sector_name(rel_deg: float) -> Optional[str]:
-    # only use front half for k=3 decision
     if abs(rel_deg) > FRONT_HALF_DEG:
         return None
     c = float(SECTOR_CENTER_DEG)
@@ -205,6 +194,46 @@ def _sector_name(rel_deg: float) -> Optional[str]:
     if rel_deg > c:
         return "LEFT"
     return "CENTER"
+
+
+# =======================
+# STOP->TURN helpers (one-shot stop)
+# =======================
+def _start_stop_then_turn(turn_label: str, reason: str):
+    """Arm a sequence: STOP (only once) then TURN in subsequent ticks."""
+    global _stopturn_active, _stopturn_next, _stopturn_stop_issued, _stopturn_reason, _hard_stop_armed
+    with _stopturn_lock:
+        _stopturn_active = True
+        _stopturn_next = turn_label
+        _stopturn_stop_issued = False
+        _stopturn_reason = reason
+        _hard_stop_armed = False  # disarm until cleared
+
+def _stopturn_clear():
+    global _stopturn_active, _stopturn_next, _stopturn_stop_issued, _stopturn_reason
+    with _stopturn_lock:
+        _stopturn_active = False
+        _stopturn_next = None
+        _stopturn_stop_issued = False
+        _stopturn_reason = ""
+
+def _stopturn_get_state() -> Tuple[bool, Optional[str], bool, str]:
+    with _stopturn_lock:
+        return _stopturn_active, _stopturn_next, _stopturn_stop_issued, _stopturn_reason
+
+def _stopturn_mark_stop_issued():
+    global _stopturn_stop_issued
+    with _stopturn_lock:
+        _stopturn_stop_issued = True
+
+def _is_hard_stop_armed() -> bool:
+    with _stopturn_lock:
+        return bool(_hard_stop_armed)
+
+def _rearm_hard_stop():
+    global _hard_stop_armed
+    with _stopturn_lock:
+        _hard_stop_armed = True
 
 
 # =======================
@@ -295,7 +324,7 @@ def lidar_thread_main():
 
 
 # =======================
-# Auto FRONT calibration (back wall -> front)
+# Auto FRONT calibration
 # =======================
 def _estimate_back_direction_percentile(
     pts: List[Tuple[float, float, int, float, float, float]],
@@ -305,7 +334,8 @@ def _estimate_back_direction_percentile(
     bin_deg = max(2.0, float(AUTO_CALIB_BIN_DEG))
     bins = max(12, int(round(360.0 / bin_deg)))
 
-    recent = [(theta, dist_m, ts) for (theta, dist_m, q, x, y, ts) in pts if (now - ts) <= recent_sec and dist_m > 0.02]
+    recent = [(theta, dist_m, ts) for (theta, dist_m, q, x, y, ts) in pts
+              if (now - ts) <= recent_sec and dist_m > 0.02]
     if len(recent) < 50:
         return None
 
@@ -422,74 +452,33 @@ def _choose_direction_from_sectors(secs: Dict[str, Dict[str, float]]) -> Tuple[s
         return ("TURN_LEFT", "k3_best_left", {"counts": {"L": lc, "C": cc, "R": rc}})
     return ("TURN_RIGHT", "k3_best_right", {"counts": {"L": lc, "C": cc, "R": rc}})
 
-def _apply_sticky_turn(desired_label: str, center_min: float, now: float) -> Tuple[str, str, Dict[str, Any]]:
-    global _sticky_label, _sticky_since, _sticky_clear_start
-
-    with _sticky_lock:
-        cur = _sticky_label
-
-        if cur in ("TURN_LEFT", "TURN_RIGHT"):
-            held_for = now - _sticky_since
-
-            if held_for < TURN_STICKY_MIN_SEC:
-                return (cur, "sticky_min_hold", {"held_for": held_for})
-
-            if center_min > CLEAR_RELEASE_M:
-                if _sticky_clear_start is None:
-                    _sticky_clear_start = now
-                if (now - _sticky_clear_start) >= CLEAR_CONFIRM_SEC:
-                    _sticky_label = None
-                    _sticky_clear_start = None
-                    cur = None
-                else:
-                    return (cur, "sticky_wait_clear_confirm", {"center_min": center_min, "clear_for": now - _sticky_clear_start})
-            else:
-                _sticky_clear_start = None
-                return (cur, "sticky_turn_until_front_clear", {"center_min": center_min, "clear_release_m": CLEAR_RELEASE_M})
-
-        if cur is None and desired_label in ("TURN_LEFT", "TURN_RIGHT"):
-            _sticky_label = desired_label
-            _sticky_since = now
-            _sticky_clear_start = None
-            return (desired_label, "set_sticky_turn", {"center_min": center_min})
-
-    return (desired_label, "not_sticky", {"center_min": center_min})
-
-def _clear_sticky_now():
-    global _sticky_label, _sticky_since, _sticky_clear_start
-    with _sticky_lock:
-        _sticky_label = None
-        _sticky_since = 0.0
-        _sticky_clear_start = None
-
 def _choose_turn_to_open_side(secs: Dict[str, Dict[str, float]]) -> Tuple[str, Dict[str, Any]]:
     """
-    Chọn hướng TURN theo phía trống hơn.
-    Ưu tiên min_dist lớn hơn; nếu bằng nhau thì ưu tiên count ít hơn.
+    Choose TURN based on openness.
+    Prefer larger min_dist; tie-break by smaller count.
     """
     lmin = float(secs["LEFT"]["min_dist"])
     rmin = float(secs["RIGHT"]["min_dist"])
     lc = float(secs["LEFT"]["count"])
     rc = float(secs["RIGHT"]["count"])
 
-    # min_dist thắng
-    if math.isfinite(lmin) and math.isfinite(rmin):
-        if lmin > rmin + 1e-6:
-            return "TURN_LEFT", {"pick": "min_dist", "lmin": lmin, "rmin": rmin, "lc": lc, "rc": rc}
-        if rmin > lmin + 1e-6:
-            return "TURN_RIGHT", {"pick": "min_dist", "lmin": lmin, "rmin": rmin, "lc": lc, "rc": rc}
+    # If one side has inf (no points), treat as very open.
+    L = 999.0 if not math.isfinite(lmin) else lmin
+    R = 999.0 if not math.isfinite(rmin) else rmin
 
-    # fallback: count ít hơn
-    if lc <= rc:
-        return "TURN_LEFT", {"pick": "count", "lmin": lmin, "rmin": rmin, "lc": lc, "rc": rc}
-    return "TURN_RIGHT", {"pick": "count", "lmin": lmin, "rmin": rmin, "lc": lc, "rc": rc}
+    if abs(L - R) > 1e-6:
+        lbl = "TURN_LEFT" if L > R else "TURN_RIGHT"
+    else:
+        lbl = "TURN_LEFT" if lc <= rc else "TURN_RIGHT"
+
+    return lbl, {"left": {"min": lmin, "count": lc}, "right": {"min": rmin, "count": rc}}
 
 def _front_arc_min(
     pts: List[Tuple[float, float, int, float, float, float]],
     front_abs: float
 ) -> Tuple[float, Optional[float]]:
     """
-    Return (min_dist, min_rel_deg) in front arc ±FRONT_ARC_DEG within RECENT_SEC.
+    Scan points in front arc ±FRONT_ARC_DEG, return (min_dist, min_rel_deg)
     """
     now = time.time()
     best_d = float("inf")
@@ -510,33 +499,10 @@ def _front_arc_min(
 
     return best_d, best_rel
 
-def _set_stop_then_turn(now: float, turn_label: str, reason: str):
-    global _stop_hold_until, _pending_turn_label, _pending_turn_reason
-    with _stop_turn_lock:
-        _stop_hold_until = now + float(STOP_THEN_TURN_HOLD_SEC)
-        _pending_turn_label = turn_label
-        _pending_turn_reason = reason
 
-def _consume_pending_turn_if_ready(now: float) -> Tuple[bool, Optional[str], str]:
-    """
-    Nếu đang ở chế độ STOP->TURN và đã hết hold time => trả (True, label, reason) và clear pending.
-    """
-    global _stop_hold_until, _pending_turn_label, _pending_turn_reason
-    with _stop_turn_lock:
-        if _pending_turn_label and now >= _stop_hold_until:
-            lbl = _pending_turn_label
-            rs = _pending_turn_reason
-            _pending_turn_label = None
-            _pending_turn_reason = ""
-            _stop_hold_until = 0.0
-            return True, lbl, rs
-    return False, None, ""
-
-def _is_in_stop_hold(now: float) -> bool:
-    with _stop_turn_lock:
-        return (_pending_turn_label is not None) and (now < _stop_hold_until)
-
-
+# =======================
+# Decision
+# =======================
 def _compute_decision() -> Dict[str, Any]:
     with lock:
         pts = list(latest_points)
@@ -552,66 +518,73 @@ def _compute_decision() -> Dict[str, Any]:
     secs = _sector_stats(pts, front_abs)
     center_min = float(secs["CENTER"]["min_dist"])
 
-    # ===== front arc check =====
     fa_min, fa_rel = _front_arc_min(pts, front_abs)
     hard_stop = (fa_min <= float(FRONT_ARC_HARD_STOP_M))
-    block_go  = (fa_min <= float(FRONT_ARC_BLOCK_M))
+    block_go = (fa_min <= float(FRONT_ARC_BLOCK_M))
 
-    # ===== STOP->TURN hold: nếu đang hold thì luôn STOP =====
-    if _is_in_stop_hold(now):
-        predict_dist = (ROBOT_SPEED_MPS * PREDICT_T_SEC) + SAFETY_MARGIN_M
-        return {
-            "ok": True,
-            "label": "STOP",
-            "reason": "stop_then_turn_hold",
-            "ts": now,
-            "debug": {
-                "front_center_deg_used": float(front_abs),
-                "back_deg_est": float(_last_back_deg) if _last_back_deg is not None else None,
-                "sectors": {
-                    "LEFT":   {"count": int(secs["LEFT"]["count"]),   "min_dist": float(secs["LEFT"]["min_dist"])},
-                    "CENTER": {"count": int(secs["CENTER"]["count"]), "min_dist": float(secs["CENTER"]["min_dist"])},
-                    "RIGHT":  {"count": int(secs["RIGHT"]["count"]),  "min_dist": float(secs["RIGHT"]["min_dist"])},
-                },
-                "predict_dist_m": float(predict_dist),
-                "front_arc": {
-                    "deg": float(FRONT_ARC_DEG),
-                    "min_dist": float(fa_min),
-                    "min_rel_deg": float(fa_rel) if fa_rel is not None else None,
-                    "block_m": float(FRONT_ARC_BLOCK_M),
-                    "hard_stop_m": float(FRONT_ARC_HARD_STOP_M),
-                },
+    # re-arm when clearly safe again
+    if (not hard_stop) and (fa_min > float(HARD_STOP_REARM_M)):
+        if not _is_hard_stop_armed():
+            _rearm_hard_stop()
+
+    # 1) If we are in STOP->TURN sequence:
+    st_active, st_next, st_stop_issued, st_reason = _stopturn_get_state()
+    if st_active and st_next in ("TURN_LEFT", "TURN_RIGHT"):
+        # If already clear enough (not blocking go), exit sequence
+        if (fa_min > float(FRONT_ARC_BLOCK_M)) and (center_min > float(STOP_NEAR_M)):
+            _stopturn_clear()
+        else:
+            # STOP only once, then always TURN
+            if not st_stop_issued:
+                _stopturn_mark_stop_issued()
+                label = "STOP"
+                reason = f"stop_once_then_turn | {st_reason}"
+            else:
+                label = st_next
+                reason = f"turn_after_stop_once | {st_reason}"
+
+            predict_dist = (ROBOT_SPEED_MPS * PREDICT_T_SEC) + SAFETY_MARGIN_M
+            return {
+                "ok": True,
+                "label": label,
+                "reason": reason,
+                "ts": now,
+                "debug": {
+                    "front_center_deg_used": float(front_abs),
+                    "back_deg_est": float(_last_back_deg) if _last_back_deg is not None else None,
+                    "sectors": {
+                        "LEFT":   {"count": int(secs["LEFT"]["count"]),   "min_dist": float(secs["LEFT"]["min_dist"])},
+                        "CENTER": {"count": int(secs["CENTER"]["count"]), "min_dist": float(secs["CENTER"]["min_dist"])},
+                        "RIGHT":  {"count": int(secs["RIGHT"]["count"]),  "min_dist": float(secs["RIGHT"]["min_dist"])},
+                    },
+                    "predict_dist_m": float(predict_dist),
+                    "front_arc": {
+                        "deg": float(FRONT_ARC_DEG),
+                        "block_m": float(FRONT_ARC_BLOCK_M),
+                        "hard_stop_m": float(FRONT_ARC_HARD_STOP_M),
+                        "rearm_m": float(HARD_STOP_REARM_M),
+                        "min_dist": float(fa_min),
+                        "min_rel_deg": float(fa_rel) if fa_rel is not None else None,
+                    },
+                    "stop_then_turn": {
+                        "active": True,
+                        "stop_issued": bool(st_stop_issued),
+                        "next": st_next,
+                        "armed": _is_hard_stop_armed(),
+                    }
+                }
             }
-        }
 
-    # ===== nếu hết hold => phải TURN (pending) =====
-    pending_active = False
-    ready, pending_lbl, pending_reason = _consume_pending_turn_if_ready(now)
-    if ready and pending_lbl in ("TURN_LEFT", "TURN_RIGHT"):
-        desired_label = pending_lbl
-        desired_reason = f"post_stop_turn | {pending_reason}"
-        desired_dbg = {"post_stop_turn": True, "pending": pending_lbl}
-        pending_active = True
-    else:
-        desired_label, desired_reason, desired_dbg = _choose_direction_from_sectors(secs)
-
-    # ===== KEY FIX: hard_stop KHÔNG được chặn TURN =====
-    # Nếu hard_stop mà desired hiện tại là TURN (do pending hoặc k3), thì cứ cho TURN chạy.
-    if hard_stop and desired_label not in ("TURN_LEFT", "TURN_RIGHT"):
-        # phải STOP trước 1 nhịp, rồi TURN theo phía trống
+    # 2) Start STOP->TURN if hard_stop AND armed
+    if hard_stop and _is_hard_stop_armed():
         turn_lbl, turn_dbg = _choose_turn_to_open_side(secs)
-        _set_stop_then_turn(
-            now,
-            turn_lbl,
-            reason=f"hard_stop(min={fa_min:.3f}, rel={fa_rel}) -> {turn_lbl}"
-        )
-        _clear_sticky_now()  # an toàn: reset sticky khi hard_stop kick-in
+        _start_stop_then_turn(turn_lbl, f"front_arc_hard_stop(min={fa_min:.3f}, rel={fa_rel}) -> {turn_lbl}")
 
         predict_dist = (ROBOT_SPEED_MPS * PREDICT_T_SEC) + SAFETY_MARGIN_M
         return {
             "ok": True,
             "label": "STOP",
-            "reason": "front_arc_hard_stop_then_turn",
+            "reason": "front_arc_hard_stop_stop_once_then_turn",
             "ts": now,
             "debug": {
                 "front_center_deg_used": float(front_abs),
@@ -624,34 +597,77 @@ def _compute_decision() -> Dict[str, Any]:
                 "predict_dist_m": float(predict_dist),
                 "front_arc": {
                     "deg": float(FRONT_ARC_DEG),
-                    "min_dist": float(fa_min),
-                    "min_rel_deg": float(fa_rel) if fa_rel is not None else None,
                     "block_m": float(FRONT_ARC_BLOCK_M),
                     "hard_stop_m": float(FRONT_ARC_HARD_STOP_M),
+                    "rearm_m": float(HARD_STOP_REARM_M),
+                    "min_dist": float(fa_min),
+                    "min_rel_deg": float(fa_rel) if fa_rel is not None else None,
                 },
                 "stop_then_turn": {
-                    "hold_sec": float(STOP_THEN_TURN_HOLD_SEC),
-                    "next_turn": turn_lbl,
+                    "active": True,
+                    "stop_issued": False,
+                    "next": turn_lbl,
                     "turn_debug": turn_dbg,
+                    "armed": _is_hard_stop_armed(),
                 }
             }
         }
 
-    # ===== block GO_STRAIGHT trong front arc =====
+    # 3) Normal k3 decision
+    desired_label, desired_reason, desired_dbg = _choose_direction_from_sectors(secs)
+
+    # If k3 says STOP, convert to STOP-once-then-turn too (safety)
+    if desired_label == "STOP":
+        # only start if armed (avoid spam)
+        if _is_hard_stop_armed():
+            turn_lbl, turn_dbg = _choose_turn_to_open_side(secs)
+            _start_stop_then_turn(turn_lbl, f"k3_stop(center_min={center_min:.3f}) -> {turn_lbl}")
+
+        predict_dist = (ROBOT_SPEED_MPS * PREDICT_T_SEC) + SAFETY_MARGIN_M
+        return {
+            "ok": True,
+            "label": "STOP",
+            "reason": "k3_stop_stop_once_then_turn",
+            "ts": now,
+            "debug": {
+                "front_center_deg_used": float(front_abs),
+                "back_deg_est": float(_last_back_deg) if _last_back_deg is not None else None,
+                "sectors": {
+                    "LEFT":   {"count": int(secs["LEFT"]["count"]),   "min_dist": float(secs["LEFT"]["min_dist"])},
+                    "CENTER": {"count": int(secs["CENTER"]["count"]), "min_dist": float(secs["CENTER"]["min_dist"])},
+                    "RIGHT":  {"count": int(secs["RIGHT"]["count"]),  "min_dist": float(secs["RIGHT"]["min_dist"])},
+                },
+                "predict_dist_m": float(predict_dist),
+                "front_arc": {
+                    "deg": float(FRONT_ARC_DEG),
+                    "block_m": float(FRONT_ARC_BLOCK_M),
+                    "hard_stop_m": float(FRONT_ARC_HARD_STOP_M),
+                    "rearm_m": float(HARD_STOP_REARM_M),
+                    "min_dist": float(fa_min),
+                    "min_rel_deg": float(fa_rel) if fa_rel is not None else None,
+                },
+                "desired": {"label": desired_label, "reason": desired_reason, **desired_dbg},
+                "stop_then_turn": {
+                    "active": True,
+                    "stop_issued": False,
+                    "next": _stopturn_get_state()[1],
+                    "armed": _is_hard_stop_armed(),
+                }
+            }
+        }
+
+    # 4) Block GO_STRAIGHT by front arc (<= 0.55m)
     if block_go and desired_label == "GO_STRAIGHT":
         turn_lbl, turn_dbg = _choose_turn_to_open_side(secs)
         desired_label = turn_lbl
-        desired_reason = f"front_arc_block_go_straight(min={fa_min:.3f}, rel={fa_rel}) -> {turn_lbl}"
+        desired_reason = f"front_arc_block_go(min={fa_min:.3f}, rel={fa_rel}) -> {turn_lbl}"
         desired_dbg = {**(desired_dbg or {}), "front_arc_override": True, "turn_debug": turn_dbg}
-
-    # ===== Sticky (giữ nguyên) =====
-    final_label, sticky_reason, sticky_dbg = _apply_sticky_turn(desired_label, center_min, now)
 
     predict_dist = (ROBOT_SPEED_MPS * PREDICT_T_SEC) + SAFETY_MARGIN_M
     return {
         "ok": True,
-        "label": final_label,
-        "reason": f"{desired_reason} | {sticky_reason}",
+        "label": desired_label,
+        "reason": desired_reason,
         "ts": now,
         "debug": {
             "front_center_deg_used": float(front_abs),
@@ -664,13 +680,17 @@ def _compute_decision() -> Dict[str, Any]:
             "predict_dist_m": float(predict_dist),
             "front_arc": {
                 "deg": float(FRONT_ARC_DEG),
-                "min_dist": float(fa_min),
-                "min_rel_deg": float(fa_rel) if fa_rel is not None else None,
                 "block_m": float(FRONT_ARC_BLOCK_M),
                 "hard_stop_m": float(FRONT_ARC_HARD_STOP_M),
+                "rearm_m": float(HARD_STOP_REARM_M),
+                "min_dist": float(fa_min),
+                "min_rel_deg": float(fa_rel) if fa_rel is not None else None,
             },
             "desired": {"label": desired_label, "reason": desired_reason, **(desired_dbg or {})},
-            "sticky": {"label": final_label, "reason": sticky_reason, **(sticky_dbg or {})},
+            "stop_then_turn": {
+                "active": False,
+                "armed": _is_hard_stop_armed(),
+            }
         }
     }
 
@@ -679,11 +699,6 @@ def _compute_decision() -> Dict[str, Any]:
 # Pose + Map update
 # =======================
 def _decision_to_twist(label: str) -> Tuple[float, float]:
-    """
-    returns (v, w) in robot local frame:
-      v: m/s forward
-      w: rad/s positive = turn left
-    """
     w = math.radians(TURN_RATE_DEG_S)
     if label == "GO_STRAIGHT":
         return (ROBOT_SPEED_MPS, 0.0)
@@ -735,7 +750,6 @@ def _grid_decay_and_hit(hit_cells: List[Tuple[int, int]]):
 
 def _update_map_from_lidar(pts: List[Tuple[float, float, int, float, float, float]], front_abs: float):
     now = time.time()
-
     with _pose_lock:
         rx = pose_x
         ry = pose_y
@@ -745,7 +759,6 @@ def _update_map_from_lidar(pts: List[Tuple[float, float, int, float, float, floa
     s = math.sin(yaw)
 
     hit_cells: List[Tuple[int, int]] = []
-
     for (theta, dist_m, q, x, y, ts) in pts:
         if now - ts > RECENT_SEC:
             continue
@@ -900,13 +913,11 @@ def _render_map_png(decision: Dict[str, Any]) -> bytes:
 
     for name, (a0, a1) in sector_defs.items():
         start = rel_to_pil_deg(a1)
-        end   = rel_to_pil_deg(a0)
-
+        end = rel_to_pil_deg(a0)
         if selected_sector == name:
             fill = (0, 255, 0, SECTOR_ALPHA)
         else:
             fill = (255, 0, 0, SECTOR_ALPHA)
-
         od.pieslice(bbox, start=start, end=end, fill=fill)
 
     img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
@@ -980,11 +991,11 @@ def points_worker():
 
 
 # =======================
-# Points payload (360° + extra info)
+# Points payload
 # =======================
 def _front_angles_for_plot(theta_raw: float, front_center_abs: float) -> Dict[str, Any]:
     rel = _rel_deg(theta_raw, front_center_abs)
-    angle_front_360 = _wrap_deg(rel)  # 0..360 where 0=front
+    angle_front_360 = _wrap_deg(rel)
     sec = _sector_name(rel)
     return {
         "rel_deg": float(rel),
@@ -1041,13 +1052,10 @@ def api_status():
         lbl = latest_decision_label
         dec = dict(latest_decision_full)
 
-    with _sticky_lock:
-        sticky = _sticky_label
-        sticky_since = _sticky_since
-        clear_start = _sticky_clear_start
-
     with _pose_lock:
         rx, ry, yaw = pose_x, pose_y, pose_yaw
+
+    st_active, st_next, st_stop_issued, st_reason = _stopturn_get_state()
 
     now = time.time()
     return jsonify({
@@ -1073,24 +1081,26 @@ def api_status():
             "stop_near_m": float(STOP_NEAR_M),
         },
 
+        # keep endpoint but disable sticky (payload compatibility)
         "sticky_turn": {
-            "sticky_label": sticky,
-            "held_for_sec": (now - sticky_since) if sticky else None,
-            "clear_for_sec": (now - clear_start) if clear_start else None,
-            "clear_release_m": float(CLEAR_RELEASE_M),
-            "clear_confirm_sec": float(CLEAR_CONFIRM_SEC),
-            "turn_sticky_min_sec": float(TURN_STICKY_MIN_SEC),
+            "enabled": False,
+            "sticky_label": None,
+        },
+
+        "stop_then_turn": {
+            "active": bool(st_active),
+            "stop_issued": bool(st_stop_issued),
+            "next": st_next,
+            "reason": st_reason,
+            "hard_stop_armed": _is_hard_stop_armed(),
+            "front_arc_deg": float(FRONT_ARC_DEG),
+            "block_m": float(FRONT_ARC_BLOCK_M),
+            "hard_stop_m": float(FRONT_ARC_HARD_STOP_M),
+            "rearm_m": float(HARD_STOP_REARM_M),
         },
 
         "pose": {
             "x": rx, "y": ry, "yaw_deg": math.degrees(yaw)
-        },
-
-        "front_arc_rule": {
-            "deg": float(FRONT_ARC_DEG),
-            "block_m": float(FRONT_ARC_BLOCK_M),
-            "hard_stop_m": float(FRONT_ARC_HARD_STOP_M),
-            "stop_then_turn_hold_sec": float(STOP_THEN_TURN_HOLD_SEC),
         },
 
         "decision": dec,
@@ -1176,9 +1186,9 @@ def dashboard():
               const d = await fetch('/api/decision').then(r=>r.json());
               const s = await fetch('/api/status').then(r=>r.json());
               document.getElementById('label').textContent =
-                JSON.stringify({{label: d.label, reason: d.reason, sectors: (d.debug||{{}}).sectors, front_arc: (d.debug||{{}}).front_arc}}, null, 2);
+                JSON.stringify({{label: d.label, reason: d.reason, sectors: (d.debug||{{}}).sectors, front_arc: (d.debug||{{}}).front_arc, stop_then_turn:(d.debug||{{}}).stop_then_turn}}, null, 2);
               document.getElementById('status').textContent =
-                JSON.stringify({{running: s.running, age_s: s.age_s, pose: s.pose, front_center: s.front_center_deg_used}}, null, 2);
+                JSON.stringify({{running: s.running, age_s: s.age_s, pose: s.pose, front_center: s.front_center_deg_used, stop_then_turn: s.stop_then_turn}}, null, 2);
 
               const img = document.getElementById('map');
               img.src = '/api/map.png?ts=' + Date.now();
@@ -1221,6 +1231,8 @@ def api_map_reset():
         pose_x = pose_y = 0.0
         pose_yaw = 0.0
         _pose_last_ts = 0.0
+    _stopturn_clear()
+    _rearm_hard_stop()
     return jsonify({"ok": True})
 
 @app.get("/")
