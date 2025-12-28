@@ -33,7 +33,7 @@ class MotionController:
         p1_invert=True,
         # ===== head controller =====
         head_p8_idle=65,        # idle/stop angle for P8
-        head_p9_fixed=-60,
+        head_p9_fixed=-68,
         head_p10_a=90,
         head_p10_b=90,
     ):
