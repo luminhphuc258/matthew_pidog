@@ -540,6 +540,202 @@ def _turn_label_from_heading(h: float) -> str:
 # Decision (NEW: front-180 + clustering gaps)
 # =======================
 def _compute_decision_snapshot() -> Dict[str, Any]:
+    global latest_front_obstacles  # ✅ MUST be at top (before any assignment)
+
+    with lock:
+        pts = list(latest_points)
+        last_ts = latest_ts
+
+    now = time.time()
+    if not pts or (now - last_ts) > 2.0:
+        # reset phase
+        with _turn_lock:
+            global _phase, _phase_until, _turn_label
+            _phase = "NORMAL"
+            _phase_until = 0.0
+            _turn_label = ""
+
+        # ✅ update obstacle endpoint safely
+        with obstacle_state_lock:
+            latest_front_obstacles = {"ok": False, "reason": "no_recent_lidar", "ts": now}
+
+        return {"ok": False, "label": "STOP", "reason": "no_recent_lidar", "ts": now}
+
+    # obey phase first (prevents flip-flop)
+    ph = _get_phase_label(now)
+
+    # still compute front obstacles for debug + endpoint
+    front_pts = _front_points_only(pts, recent_sec=RECENT_SEC)
+    obstacles = _cluster_obstacles_auto_k(front_pts)
+    gap_info = _rank_gaps_and_pick_safe_heading(obstacles)
+
+    # ✅ update obstacle endpoint safely
+    with obstacle_state_lock:
+        latest_front_obstacles = {
+            "ok": True,
+            "ts": now,
+            "k": gap_info.get("k", 0),
+            "obstacle_count": gap_info.get("obstacle_count", 0),
+            "safe_heading_deg": gap_info.get("safe_heading_deg", 0.0),
+            "required_width_m": gap_info.get("required_width_m", _required_gap_width_m()),
+            "best_gap": gap_info.get("best_gap", None),
+            "note": "front-only 180deg (rel [-90..+90]) clustering auto-K; safe_heading is center of best gap.",
+        }
+
+    predict_dist = (ROBOT_SPEED_MPS * PREDICT_T_SEC) + SAFETY_MARGIN_M
+    block_th = max(STOP_NEAR_M, predict_dist)
+
+    # Debug distances pack (keep old keys)
+    front_abs = _wrap_deg(FRONT_CENTER_DEG)
+    left_abs  = _wrap_deg(front_abs + 90.0)
+    right_abs = _wrap_deg(front_abs - 90.0)
+    diag_l    = _wrap_deg(front_abs + 45.0)
+    diag_r    = _wrap_deg(front_abs - 45.0)
+
+    d_front_narrow = _min_dist_in_sector(pts, front_abs, FRONT_WIDTH_DEG)
+    d_front_wide   = _min_dist_in_sector(pts, front_abs, WIDE_WIDTH_DEG)
+    d_left_wide    = _min_dist_in_sector(pts, left_abs,  WIDE_WIDTH_DEG)
+    d_right_wide   = _min_dist_in_sector(pts, right_abs, WIDE_WIDTH_DEG)
+    d_diag_l       = _min_dist_in_sector(pts, diag_l, 35.0)
+    d_diag_r       = _min_dist_in_sector(pts, diag_r, 35.0)
+
+    dist_pack = {
+        "front_narrow": d_front_narrow,
+        "front_wide": d_front_wide,
+        "left": d_left_wide,
+        "right": d_right_wide,
+        "diag_left": d_diag_l,
+        "diag_right": d_diag_r,
+    }
+
+    thresh_pack = {
+        "stop_near_m": STOP_NEAR_M,
+        "predict_dist_m": predict_dist,
+        "predict_t_sec": PREDICT_T_SEC,
+        "robot_speed_mps": ROBOT_SPEED_MPS,
+        "safety_margin_m": SAFETY_MARGIN_M,
+        "block_th_m": block_th,
+        "robot_width_m": ROBOT_WIDTH_M,
+        "clearance_margin_m": CLEARANCE_MARGIN_M,
+        "lookahead_m": LOOKAHEAD_M,
+        "stop_hold_sec": STOP_HOLD_SEC,
+        "turn_hold_sec": TURN_HOLD_SEC,
+        "front_half_deg": FRONT_HALF_DEG,
+        "cluster_ang_gap_deg": CLUSTER_ANG_GAP_DEG,
+        "cluster_dist_jump_m": CLUSTER_DIST_JUMP_M,
+        "cluster_min_pts": CLUSTER_MIN_PTS,
+        "recent_sec": RECENT_SEC,
+    }
+
+    # If in phase, return label from phase (but keep debug info)
+    if ph:
+        lbl, rs, until = ph
+        thresh_pack["phase_until"] = until
+        return {
+            "ok": True,
+            "label": lbl,
+            "reason": rs,
+            "ts": now,
+            "dist": dist_pack,
+            "threshold": thresh_pack,
+            "corridor": {
+                "best_heading_deg": float(gap_info.get("safe_heading_deg", 0.0)),
+                "best_clearance_m": float((gap_info.get("best_gap") or {}).get("width_m", 0.0)),
+                "method": "gap_cluster_front180",
+            },
+            "cluster": gap_info,
+        }
+
+    # ===== normal evaluation with gap_info =====
+    safe_h = float(gap_info.get("safe_heading_deg", 0.0))
+    best_gap = gap_info.get("best_gap", None) or {}
+    best_w = float(best_gap.get("width_m", 0.0) or 0.0)
+    passable = bool(best_gap.get("passable", False))
+
+    # Very near check: if nearest front point is too close -> STOP then TURN
+    nearest_front = float("inf")
+    for (_, dist_m, *_rest) in front_pts:
+        if dist_m > 0 and dist_m < nearest_front:
+            nearest_front = dist_m
+
+    if nearest_front <= STOP_NEAR_M:
+        if passable:
+            turn_lbl = _turn_label_from_heading(safe_h)
+        else:
+            turn_lbl = "TURN_LEFT" if d_left_wide >= d_right_wide else "TURN_RIGHT"
+        _set_phase_stop_then_turn(now, turn_lbl)
+        return {
+            "ok": True,
+            "label": "STOP",
+            "reason": "very_near_stop_then_turn(gap_cluster)",
+            "ts": now,
+            "dist": dist_pack,
+            "threshold": thresh_pack,
+            "corridor": {
+                "best_heading_deg": safe_h,
+                "best_clearance_m": best_w,
+                "method": "gap_cluster_front180",
+            },
+            "cluster": gap_info,
+        }
+
+    if passable and (best_w >= block_th * 0.5):
+        if abs(safe_h) <= 12.0:
+            return {
+                "ok": True,
+                "label": "GO_STRAIGHT",
+                "reason": "safe_gap_center_near_forward",
+                "ts": now,
+                "dist": dist_pack,
+                "threshold": thresh_pack,
+                "corridor": {
+                    "best_heading_deg": safe_h,
+                    "best_clearance_m": best_w,
+                    "method": "gap_cluster_front180",
+                },
+                "cluster": gap_info,
+            }
+
+        lbl = _turn_label_from_heading(safe_h)
+        _set_phase_turn(now, lbl)
+        return {
+            "ok": True,
+            "label": lbl,
+            "reason": "turn_to_safe_gap_hold_2s(gap_cluster)",
+            "ts": now,
+            "dist": dist_pack,
+            "threshold": thresh_pack,
+            "corridor": {
+                "best_heading_deg": safe_h,
+                "best_clearance_m": best_w,
+                "method": "gap_cluster_front180",
+            },
+            "cluster": gap_info,
+        }
+
+    gaps = (gap_info.get("gaps") or [])
+    best_any = gaps[0] if gaps else None
+    if best_any:
+        lbl = _turn_label_from_heading(float(best_any.get("center_deg", 0.0)))
+    else:
+        lbl = "TURN_LEFT" if d_left_wide >= d_right_wide else "TURN_RIGHT"
+
+    _set_phase_stop_then_turn(now, lbl)
+    return {
+        "ok": True,
+        "label": "STOP",
+        "reason": "no_passable_gap_stop_then_turn_search(gap_cluster)",
+        "ts": now,
+        "dist": dist_pack,
+        "threshold": thresh_pack,
+        "corridor": {
+            "best_heading_deg": safe_h,
+            "best_clearance_m": best_w,
+            "method": "gap_cluster_front180",
+        },
+        "cluster": gap_info
+    }
+
     with lock:
         pts = list(latest_points)
         last_ts = latest_ts
