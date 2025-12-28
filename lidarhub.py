@@ -57,7 +57,11 @@ MIN_SECTOR_POINTS = int(os.environ.get("MIN_SECTOR_POINTS", "20"))
 CLEAR_GO_M = float(os.environ.get("CLEAR_GO_M", "0.95"))  # clear để đi thẳng
 CLEAR_STREAK_N = int(os.environ.get("CLEAR_STREAK_N", "2"))
 
-# Emergency STOP one-shot
+# ✅ NEW: nếu bất kỳ sector nào quá gần -> STOP rồi TURN
+# mặc định 0.70m giống “obstacle_near=0.70m” bạn đang dùng
+OBSTACLE_NEAR_M = float(os.environ.get("OBSTACLE_NEAR_M", "0.70"))
+
+# Emergency STOP one-shot (siêu sát)
 EMERGENCY_STOP_M = float(os.environ.get("EMERGENCY_STOP_M", "0.25"))
 EMERGENCY_REARM_M = float(os.environ.get("EMERGENCY_REARM_M", "0.45"))
 
@@ -400,35 +404,101 @@ def _unknown(sec: Dict[str, Any]) -> bool:
     return int(sec.get("count", 0)) < int(MIN_SECTOR_POINTS)
 
 def _is_clear_forward(C: Dict[str, Any], min_front: float) -> bool:
-    # Bình thường: cần CENTER đủ điểm để tin
+    # cần CENTER đủ điểm để tin
     if _unknown(C):
         return False
     return (float(C["kmean_near"]) > float(CLEAR_GO_M)) and (float(min_front) > float(CLEAR_GO_M))
 
 def _is_clear_forward_relaxed(C: Dict[str, Any], min_front: float) -> bool:
     """
-    FIX kẹt turn:
     Trong avoid mode, nếu min_front đã > CLEAR_GO_M thì coi như clear,
     KHÔNG bị kẹt vì thiếu điểm CENTER.
     """
     if float(min_front) <= float(CLEAR_GO_M):
         return False
-    # nếu CENTER có đủ điểm thì check thêm kmean; còn không thì cho qua
     if not _unknown(C):
         return float(C["kmean_near"]) > float(CLEAR_GO_M)
     return True
 
-def _choose_turn_dir(L: Dict[str, Any], R: Dict[str, Any]) -> str:
-    # chọn hướng thoáng hơn dựa trên kmean_near (unknown coi là xấu)
-    l_ok = not _unknown(L)
-    r_ok = not _unknown(R)
 
-    l_val = float(L["kmean_near"]) if l_ok else -1.0
-    r_val = float(R["kmean_near"]) if r_ok else -1.0
+# =======================
+# ✅ NEW: ranking / scoring directions
+# =======================
+def _clamp(x: float, a: float, b: float) -> float:
+    return max(a, min(b, x))
 
-    if l_val < 0 and r_val < 0:
+def _sector_score(sec: Dict[str, Any]) -> float:
+    """
+    Score càng cao càng tốt.
+    - min_dist: quan trọng nhất (độ an toàn)
+    - kmean_near: ổn định hơn min_dist
+    - count: tăng độ tin cậy (ít điểm -> phạt)
+    """
+    cnt = int(sec.get("count", 0))
+    min_d = float(sec.get("min_dist", float("inf")))
+    kmean = float(sec.get("kmean_near", float("inf")))
+
+    if not math.isfinite(min_d) or not math.isfinite(kmean) or cnt <= 0:
+        return -1e9
+
+    # chuẩn hoá theo VIEW_RANGE_M để score không quá lớn
+    base_min = _clamp(min_d / max(0.5, VIEW_RANGE_M), 0.0, 2.0)
+    base_km  = _clamp(kmean / max(0.5, VIEW_RANGE_M), 0.0, 2.0)
+
+    # count confidence: >= MIN_SECTOR_POINTS -> 1.0, ít hơn -> giảm
+    conf = _clamp(cnt / float(MIN_SECTOR_POINTS), 0.0, 1.5)
+
+    # trọng số: min_dist > kmean > count
+    score = (0.70 * base_min + 0.25 * base_km + 0.05 * conf)
+    return score
+
+def _pick_best_turn_dir(L: Dict[str, Any], R: Dict[str, Any]) -> str:
+    ls = _sector_score(L) if not _unknown(L) else -1e9
+    rs = _sector_score(R) if not _unknown(R) else -1e9
+    if ls <= -1e8 and rs <= -1e8:
         return "TURN_RIGHT"
-    return "TURN_LEFT" if l_val > r_val else "TURN_RIGHT"
+    return "TURN_LEFT" if ls > rs else "TURN_RIGHT"
+
+def _pick_best_direction(secs: Dict[str, Dict[str, Any]], min_front: float) -> Tuple[str, str]:
+    """
+    Return (label, reason)
+    Normal mode rule:
+    - Nếu forward clear => GO_STRAIGHT
+    - Nếu không clear => chọn TURN_LEFT / TURN_RIGHT theo score (min_dist+count)
+    - Nếu cả 2 bên unknown => STOP
+    """
+    L = secs["LEFT"]; C = secs["CENTER"]; R = secs["RIGHT"]
+
+    if _is_clear_forward(C, min_front):
+        return "GO_STRAIGHT", "rank: forward_clear -> go_straight"
+
+    # forward không clear => không cho đi thẳng, phải chọn turn
+    td = _pick_best_turn_dir(L, R)
+    if td:
+        return td, f"rank: forward_not_clear -> choose {td} by score(min_dist+kmean+count)"
+    return "STOP", "rank: unknown_sides -> stop"
+
+
+# =======================
+# ✅ NEW: near-obstacle detection (3 sectors)
+# =======================
+def _too_close_any_sector(secs: Dict[str, Dict[str, Any]], min_front: float) -> Tuple[bool, str]:
+    """
+    Nếu bất kỳ vùng nào quá gần (<= OBSTACLE_NEAR_M) -> stop then turn.
+    Ưu tiên min_front vì nó là min của toàn front180.
+    """
+    if math.isfinite(min_front) and float(min_front) <= float(OBSTACLE_NEAR_M):
+        return True, f"min_front<=OBSTACLE_NEAR({min_front:.3f}<={OBSTACLE_NEAR_M:.2f})"
+
+    # thêm check theo từng sector (có đủ điểm thì tin hơn)
+    for name in ("CENTER", "LEFT", "RIGHT"):
+        s = secs[name]
+        if _unknown(s):
+            continue
+        md = float(s.get("min_dist", float("inf")))
+        if math.isfinite(md) and md <= float(OBSTACLE_NEAR_M):
+            return True, f"{name}.min_dist<=OBSTACLE_NEAR({md:.3f}<={OBSTACLE_NEAR_M:.2f})"
+    return False, ""
 
 
 # =======================
@@ -459,10 +529,11 @@ def _smooth_label(raw: str) -> str:
 
 
 # =======================
-# Decision logic
-# - STOP (one-shot) -> enter avoid (turn L/R)
-# - Avoid: nếu clear -> RESET ALL LOGIC rồi GO_STRAIGHT
-# - Không còn kẹt TURN do thiếu điểm CENTER
+# Decision logic (FIX)
+# - Emergency stop (0.25m): STOP one-shot -> avoid turn
+# - Obstacle near (0.70m default): STOP one-shot -> avoid turn  ✅ FIX BUG
+# - Avoid mode: turn until clear -> RESET ALL -> GO_STRAIGHT
+# - Normal: forward clear => GO_STRAIGHT else TURN based on ranking (min_dist+count)
 # =======================
 def _pack_decision(label: str, reason: str, secs: Dict[str, Dict[str, Any]], min_front: float,
                    avoid_active: bool, clear_streak: int, avoid_dir: str, avoid_age: float) -> Dict[str, Any]:
@@ -494,6 +565,7 @@ def _pack_decision(label: str, reason: str, secs: Dict[str, Dict[str, Any]], min
             "emergency": {"armed": _em_is_armed(), "issued_this_event": _em_was_issued_this_event()},
             "thresholds": {
                 "clear_go_m": float(CLEAR_GO_M),
+                "obstacle_near_m": float(OBSTACLE_NEAR_M),
                 "clear_streak_n": int(CLEAR_STREAK_N),
                 "min_sector_points": int(MIN_SECTOR_POINTS),
                 "k_near": int(K_NEAR),
@@ -517,14 +589,12 @@ def _compute_decision() -> Dict[str, Any]:
     secs = _sector_metrics(front_pts)
     min_front = _min_front_any(front_pts)
 
-    L = secs["LEFT"]
-    C = secs["CENTER"]
-    R = secs["RIGHT"]
+    L = secs["LEFT"]; C = secs["CENTER"]; R = secs["RIGHT"]
 
-    # 1) Emergency STOP one-shot
+    # 1) Emergency STOP one-shot (siêu sát)
     if (min_front <= float(EMERGENCY_STOP_M)) and _em_is_armed():
         _em_disarm_after_issue()
-        turn_dir = _choose_turn_dir(L, R)
+        turn_dir = _pick_best_turn_dir(L, R)
         _avoid_set(True, turn_dir)
 
         avoid_active, streak, avoid_dir, start_ts = _avoid_get()
@@ -555,7 +625,6 @@ def _compute_decision() -> Dict[str, Any]:
         # timeout safety: tránh bị kẹt vô hạn
         if avoid_age >= float(AVOID_MAX_SEC):
             _reset_all_logic()
-            # tính lại fresh ngay lập tức (fallthrough)
             avoid_active, streak, avoid_dir, start_ts = _avoid_get()
             avoid_age = 0.0
 
@@ -569,7 +638,7 @@ def _compute_decision() -> Dict[str, Any]:
         avoid_age2 = (time.time() - start_ts2) if start_ts2 > 0 else 0.0
 
         if streak2 >= int(CLEAR_STREAK_N):
-            # ✅ FIX chính: thoát avoid xong là RESET toàn bộ state để tính lại từ đầu
+            # ✅ FIX: thoát avoid là RESET state để tính lại từ đầu
             _reset_all_logic()
             raw = _pack_decision(
                 label="GO_STRAIGHT",
@@ -584,7 +653,6 @@ def _compute_decision() -> Dict[str, Any]:
             raw["label"] = _smooth_label(raw["label"])
             return raw
 
-        # Continue turning theo hướng đã chọn
         raw = _pack_decision(
             label=avoid_dir2,
             reason="avoid_mode_turn_until_clear (triggered_by_stop)",
@@ -598,25 +666,34 @@ def _compute_decision() -> Dict[str, Any]:
         raw["label"] = _smooth_label(raw["label"])
         return raw
 
-    # 3) Normal mode: ưu tiên GO_STRAIGHT nếu clear
-    if _is_clear_forward(C, min_front):
+    # 3) ✅ NEW: obstacle too near anywhere -> STOP 1 nhịp rồi TURN
+    too_close, why_close = _too_close_any_sector(secs, min_front)
+    if too_close:
+        # STOP one-shot -> enter avoid
+        turn_dir = _pick_best_turn_dir(L, R)
+        _avoid_set(True, turn_dir)
+
+        avoid_active, streak, avoid_dir, start_ts = _avoid_get()
+        avoid_age = (time.time() - start_ts) if start_ts > 0 else 0.0
+
         raw = _pack_decision(
-            label="GO_STRAIGHT",
-            reason="front_clear -> go_straight",
+            label="STOP",
+            reason=f"obstacle_near -> STOP then enter_avoid({turn_dir}) | {why_close}",
             secs=secs,
             min_front=min_front,
-            avoid_active=False,
+            avoid_active=True,
             clear_streak=0,
-            avoid_dir="TURN_RIGHT",
-            avoid_age=0.0,
+            avoid_dir=turn_dir,
+            avoid_age=avoid_age,
         )
         raw["label"] = _smooth_label(raw["label"])
         return raw
 
-    # 4) Không clear nhưng chưa emergency stop => theo policy của bạn vẫn GO_STRAIGHT
+    # 4) Normal mode: xếp hạng hướng đi (min_dist + count)
+    best_label, why = _pick_best_direction(secs, min_front)
     raw = _pack_decision(
-        label="GO_STRAIGHT",
-        reason="not_clear_but_no_emergency_stop -> still_go_straight (per_policy)",
+        label=best_label,
+        reason=why,
         secs=secs,
         min_front=min_front,
         avoid_active=False,
@@ -633,7 +710,6 @@ def _compute_decision() -> Dict[str, Any]:
 # =======================
 def _render_map_png(decision: Dict[str, Any], front_points: List[Dict[str, Any]]) -> bytes:
     from PIL import Image, ImageDraw, ImageFont
-    import io
 
     W = H = int(VIEW_SIZE_PX)
     img = Image.new("RGB", (W, H), (240, 240, 240))
@@ -736,10 +812,10 @@ def _render_map_png(decision: Dict[str, Any], front_points: List[Dict[str, Any]]
         f"label: {label}",
         f"front_center={FRONT_CENTER_DEG_HARD:.1f} mirror={FRONT_MIRROR_HARD} flip={FRONT_FLIP_HARD}",
         f"frame_sec={FRAME_SEC:.2f} k_near={K_NEAR} confirm_n={LABEL_CONFIRM_N}",
-        f"clear_go={CLEAR_GO_M:.2f}m em_stop={EMERGENCY_STOP_M:.2f}m avoid_max={AVOID_MAX_SEC:.1f}s",
+        f"clear_go={CLEAR_GO_M:.2f}m obstacle_near={OBSTACLE_NEAR_M:.2f}m em_stop={EMERGENCY_STOP_M:.2f}m",
         f"avoid: active={avoid_dbg.get('active')} dir={avoid_dbg.get('dir')} streak={avoid_dbg.get('clear_streak')} age={avoid_dbg.get('age_s')}",
         f"L={fmt_dist(dL)} C={fmt_dist(dC)} R={fmt_dist(dR)}",
-        f"reason: {str(decision.get('reason',''))[:90]}",
+        f"reason: {str(decision.get('reason',''))[:110]}",
     ]
     y0 = 10
     for s in hud:
@@ -852,6 +928,7 @@ def api_status():
 
         "thresholds": {
             "clear_go_m": float(CLEAR_GO_M),
+            "obstacle_near_m": float(OBSTACLE_NEAR_M),
             "clear_streak_n": int(CLEAR_STREAK_N),
             "min_sector_points": int(MIN_SECTOR_POINTS),
             "k_near": int(K_NEAR),
@@ -917,13 +994,13 @@ def dashboard():
           body {{ font-family: Arial; margin: 12px; }}
           .row {{ display:flex; gap:12px; align-items:flex-start; }}
           img {{ border:1px solid #ccc; border-radius:8px; }}
-          .box {{ padding:10px; border:1px solid #ddd; border-radius:8px; min-width: 420px; }}
+          .box {{ padding:10px; border:1px solid #ddd; border-radius:8px; min-width: 460px; }}
           .mono {{ font-family: monospace; white-space: pre; }}
           button {{ padding:6px 10px; }}
         </style>
       </head>
       <body>
-        <h3>LiDAR Front-180 Map (STOP -> TURN, clear -> RESET STATE)</h3>
+        <h3>LiDAR Front-180 Map (NEAR -> STOP then TURN, clear -> RESET STATE)</h3>
         <div class="row">
           <img id="map" src="/api/map.png?ts={time.time()}" width="{VIEW_SIZE_PX}" height="{VIEW_SIZE_PX}"/>
           <div class="box">
@@ -991,7 +1068,7 @@ def dashboard():
 @app.get("/")
 def home():
     return Response(
-        "<h3>lidarhub_front180_stop_then_turn_reset running</h3>"
+        "<h3>lidarhub_front180_ranked_stop_then_turn running</h3>"
         "<ul>"
         "<li><a href='/dashboard'>/dashboard</a></li>"
         "<li>/api/map.png</li>"
