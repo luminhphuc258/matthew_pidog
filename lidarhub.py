@@ -40,7 +40,7 @@ SAFETY_MARGIN_M = float(os.environ.get("SAFETY_MARGIN_M", "0.10"))
 # Angle calibration
 FRONT_CENTER_DEG = float(os.environ.get("FRONT_CENTER_DEG", "0.0"))
 
-# Sectors (debug only)
+# Sectors (debug only, for backward compatibility)
 FRONT_WIDTH_DEG = float(os.environ.get("FRONT_WIDTH_DEG", "30.0"))
 WIDE_WIDTH_DEG  = float(os.environ.get("WIDE_WIDTH_DEG", "70.0"))
 
@@ -260,7 +260,7 @@ def _front_points_only(
         rel = _rel_deg(theta, FRONT_CENTER_DEG)
         if abs(rel) <= FRONT_HALF_DEG:
             out.append((theta, dist_m, q, x, y, ts, rel))
-    # sort by rel angle (left->right)
+    # sort by rel angle (right(-) -> left(+))
     out.sort(key=lambda t: t[6])
     return out
 
@@ -307,7 +307,6 @@ def _cluster_obstacles_auto_k(
     if cur:
         clusters.append(cur)
 
-    # build obstacle dicts
     obstacles: List[Dict[str, Any]] = []
     oid = 0
     for c in clusters:
@@ -329,117 +328,91 @@ def _cluster_obstacles_auto_k(
         obstacles.append(ob)
         oid += 1
 
-    # sort by rel_mean_deg
     obstacles.sort(key=lambda o: o["rel_mean_deg"])
-    # re-id in order
     for i, o in enumerate(obstacles):
         o["id"] = i
     return obstacles
 
 def _gap_width_m(gap_deg: float, pass_dist_m: float) -> float:
     """
-    Approximate width of free space for an angular gap at distance pass_dist_m:
+    Approx width of free space for angular gap at distance d:
       width = 2 * d * sin(gap/2)
     """
     if gap_deg <= 0 or pass_dist_m <= 0:
         return 0.0
     return 2.0 * float(pass_dist_m) * math.sin(math.radians(gap_deg) * 0.5)
 
-def _rank_gaps_and_pick_safe_heading(
-    obstacles: List[Dict[str, Any]]
-) -> Dict[str, Any]:
+def _rank_gaps_and_pick_safe_heading(obstacles: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Build gaps between obstacles + boundaries (-90, +90),
     rank by passable width, choose best safe heading.
     """
     req_w = _required_gap_width_m()
-
-    # boundaries in rel-deg
     left_bound = +FRONT_HALF_DEG
     right_bound = -FRONT_HALF_DEG
 
-    # for consistent left->right ordering, we treat:
-    # rel increases to the left, decreases to the right
-    # but our obstacles sorted by rel_mean ascending (right -> left if FRONT_HALF=90?)
-    # Actually rel range is [-90..+90]. ascending means right(-90) -> left(+90).
-    # We'll compute gaps in that ascending order.
     obs = list(obstacles)
     gaps: List[Dict[str, Any]] = []
 
-    # Helper: pass distance uses nearer obstacle(s)
     def pass_dist_between(d1: Optional[float], d2: Optional[float]) -> float:
         ds = []
         if d1 is not None and d1 > 0: ds.append(float(d1))
         if d2 is not None and d2 > 0: ds.append(float(d2))
         if not ds:
             return float(LOOKAHEAD_M)
-        # use nearer one, capped by lookahead
         return float(min(LOOKAHEAD_M, max(0.25, min(ds))))
 
-    # Add boundary gaps:
-    # Right boundary (-90) -> first obstacle edge
-    # Left boundary (+90)  -> last obstacle edge
-    # And between obstacles.
-
-    # If no obstacles: whole front is free
     if not obs:
         full_gap_deg = (left_bound - right_bound)  # 180
         pass_d = float(LOOKAHEAD_M)
         w = _gap_width_m(full_gap_deg, pass_d)
         safe = 0.0
+        g = {
+            "type": "boundary",
+            "from_deg": right_bound,
+            "to_deg": left_bound,
+            "gap_deg": full_gap_deg,
+            "center_deg": safe,
+            "pass_dist_m": pass_d,
+            "width_m": w,
+            "passable": (w >= req_w),
+        }
         return {
             "ok": True,
             "k": 0,
             "obstacle_count": 0,
             "required_width_m": req_w,
             "safe_heading_deg": safe,
-            "best_gap": {
-                "type": "boundary",
-                "gap_deg": full_gap_deg,
-                "width_m": w,
-                "center_deg": safe,
-                "pass_dist_m": pass_d,
-                "passable": (w >= req_w),
-            },
-            "gaps": [{
-                "type": "boundary",
-                "from_deg": right_bound,
-                "to_deg": left_bound,
-                "gap_deg": full_gap_deg,
-                "center_deg": safe,
-                "pass_dist_m": pass_d,
-                "width_m": w,
-                "passable": (w >= req_w),
-            }],
+            "best_gap": g,
+            "gaps": [g],
+            "obstacles": [],
         }
 
-    # gap: right boundary -> first obstacle (lowest rel)
     first = obs[0]
-    gap1_from = right_bound
-    gap1_to = float(first["rel_min_deg"])
-    gap1_deg = max(0.0, gap1_to - gap1_from)
-    pass_d1 = pass_dist_between(first["dist_min_m"], None)
-    w1 = _gap_width_m(gap1_deg, pass_d1)
-    c1 = (gap1_from + gap1_to) * 0.5
+    g_from = right_bound
+    g_to = float(first["rel_min_deg"])
+    g_deg = max(0.0, g_to - g_from)
+    pass_d = pass_dist_between(first.get("dist_min_m"), None)
+    w = _gap_width_m(g_deg, pass_d)
+    c = (g_from + g_to) * 0.5
     gaps.append({
         "type": "boundary_right",
-        "from_deg": gap1_from,
-        "to_deg": gap1_to,
-        "gap_deg": gap1_deg,
-        "center_deg": c1,
-        "pass_dist_m": pass_d1,
-        "width_m": w1,
-        "passable": (w1 >= req_w),
+        "from_deg": g_from,
+        "to_deg": g_to,
+        "gap_deg": g_deg,
+        "center_deg": c,
+        "pass_dist_m": pass_d,
+        "width_m": w,
+        "passable": (w >= req_w),
     })
 
-    # gaps between obstacles
     for i in range(len(obs) - 1):
         a = obs[i]
         b = obs[i + 1]
         g_from = float(a["rel_max_deg"])
         g_to = float(b["rel_min_deg"])
         g_deg = max(0.0, g_to - g_from)
-        pass_d = pass_dist_between(a["dist_min_m"], b["dist_min_m"])
+        pass_d = pass_dist_between(a.get("dist_min_m"), b.get("dist_min_m"))
         w = _gap_width_m(g_deg, pass_d)
         c = (g_from + g_to) * 0.5
         gaps.append({
@@ -455,38 +428,34 @@ def _rank_gaps_and_pick_safe_heading(
             "passable": (w >= req_w),
         })
 
-    # gap: last obstacle -> left boundary
     last = obs[-1]
-    gapL_from = float(last["rel_max_deg"])
-    gapL_to = left_bound
-    gapL_deg = max(0.0, gapL_to - gapL_from)
-    pass_dL = pass_dist_between(last["dist_min_m"], None)
-    wL = _gap_width_m(gapL_deg, pass_dL)
-    cL = (gapL_from + gapL_to) * 0.5
+    g_from = float(last["rel_max_deg"])
+    g_to = left_bound
+    g_deg = max(0.0, g_to - g_from)
+    pass_d = pass_dist_between(last.get("dist_min_m"), None)
+    w = _gap_width_m(g_deg, pass_d)
+    c = (g_from + g_to) * 0.5
     gaps.append({
         "type": "boundary_left",
-        "from_deg": gapL_from,
-        "to_deg": gapL_to,
-        "gap_deg": gapL_deg,
-        "center_deg": cL,
-        "pass_dist_m": pass_dL,
-        "width_m": wL,
-        "passable": (wL >= req_w),
+        "from_deg": g_from,
+        "to_deg": g_to,
+        "gap_deg": g_deg,
+        "center_deg": c,
+        "pass_dist_m": pass_d,
+        "width_m": w,
+        "passable": (w >= req_w),
     })
 
-    # rank gaps
-    # score: prioritize passable width, then prefer smaller steering (|center|)
     def score(g):
         w = float(g.get("width_m", 0.0))
-        # cap so very large width won't dominate too much
         wc = min(w, 2.0)
-        steer_pen = 0.01 * abs(float(g.get("center_deg", 0.0)))  # 0..0.9
+        steer_pen = 0.01 * abs(float(g.get("center_deg", 0.0)))
         return wc - steer_pen
 
     gaps_sorted = sorted(gaps, key=score, reverse=True)
-
     best = gaps_sorted[0] if gaps_sorted else None
     safe_heading = float(best["center_deg"]) if best else 0.0
+
     return {
         "ok": True,
         "k": len(obs),
@@ -533,55 +502,51 @@ def _get_phase_label(now: float) -> Optional[Tuple[str, str, float]]:
         return None
 
 def _turn_label_from_heading(h: float) -> str:
-    # positive heading => left
     return "TURN_LEFT" if float(h) > 0 else "TURN_RIGHT"
 
 # =======================
-# Decision (NEW: front-180 + clustering gaps)
+# Decision (front-180 + clustering gaps)
 # =======================
 def _compute_decision_snapshot() -> Dict[str, Any]:
-    global latest_front_obstacles  # ✅ MUST be at top (before any assignment)
+    global latest_front_obstacles
+    global _phase, _phase_until, _turn_label
 
     with lock:
         pts = list(latest_points)
         last_ts = latest_ts
 
     now = time.time()
-    if not pts or (now - last_ts) > 2.0:
-        # reset phase
+    if (not pts) or ((now - last_ts) > 2.0):
         with _turn_lock:
-            global _phase, _phase_until, _turn_label
             _phase = "NORMAL"
             _phase_until = 0.0
             _turn_label = ""
-
-        # ✅ update obstacle endpoint safely
         with obstacle_state_lock:
             latest_front_obstacles = {"ok": False, "reason": "no_recent_lidar", "ts": now}
-
         return {"ok": False, "label": "STOP", "reason": "no_recent_lidar", "ts": now}
 
-    # obey phase first (prevents flip-flop)
+    # phase enforce first
     ph = _get_phase_label(now)
 
-    # still compute front obstacles for debug + endpoint
+    # front-only clustering + gap ranking
     front_pts = _front_points_only(pts, recent_sec=RECENT_SEC)
     obstacles = _cluster_obstacles_auto_k(front_pts)
     gap_info = _rank_gaps_and_pick_safe_heading(obstacles)
 
-    # ✅ update obstacle endpoint safely
+    # update new endpoint state
     with obstacle_state_lock:
         latest_front_obstacles = {
             "ok": True,
             "ts": now,
-            "k": gap_info.get("k", 0),
-            "obstacle_count": gap_info.get("obstacle_count", 0),
-            "safe_heading_deg": gap_info.get("safe_heading_deg", 0.0),
-            "required_width_m": gap_info.get("required_width_m", _required_gap_width_m()),
+            "k": int(gap_info.get("k", 0) or 0),
+            "obstacle_count": int(gap_info.get("obstacle_count", 0) or 0),
+            "safe_heading_deg": float(gap_info.get("safe_heading_deg", 0.0) or 0.0),
+            "required_width_m": float(gap_info.get("required_width_m", _required_gap_width_m()) or 0.0),
             "best_gap": gap_info.get("best_gap", None),
-            "note": "front-only 180deg (rel [-90..+90]) clustering auto-K; safe_heading is center of best gap.",
+            "note": "front-only 180deg clustering(auto-K) + gap ranking; safe_heading is center of best gap.",
         }
 
+    # thresholds
     predict_dist = (ROBOT_SPEED_MPS * PREDICT_T_SEC) + SAFETY_MARGIN_M
     block_th = max(STOP_NEAR_M, predict_dist)
 
@@ -627,7 +592,7 @@ def _compute_decision_snapshot() -> Dict[str, Any]:
         "recent_sec": RECENT_SEC,
     }
 
-    # If in phase, return label from phase (but keep debug info)
+    # if in phase: obey label, still return debug info
     if ph:
         lbl, rs, until = ph
         thresh_pack["phase_until"] = until
@@ -640,24 +605,24 @@ def _compute_decision_snapshot() -> Dict[str, Any]:
             "threshold": thresh_pack,
             "corridor": {
                 "best_heading_deg": float(gap_info.get("safe_heading_deg", 0.0)),
-                "best_clearance_m": float((gap_info.get("best_gap") or {}).get("width_m", 0.0)),
+                "best_clearance_m": float((gap_info.get("best_gap") or {}).get("width_m", 0.0) or 0.0),
                 "method": "gap_cluster_front180",
             },
             "cluster": gap_info,
         }
 
-    # ===== normal evaluation with gap_info =====
-    safe_h = float(gap_info.get("safe_heading_deg", 0.0))
+    safe_h = float(gap_info.get("safe_heading_deg", 0.0) or 0.0)
     best_gap = gap_info.get("best_gap", None) or {}
     best_w = float(best_gap.get("width_m", 0.0) or 0.0)
     passable = bool(best_gap.get("passable", False))
 
-    # Very near check: if nearest front point is too close -> STOP then TURN
+    # nearest front point for STOP_NEAR decision
     nearest_front = float("inf")
-    for (_, dist_m, *_rest) in front_pts:
+    for (_theta, dist_m, *_rest) in front_pts:
         if dist_m > 0 and dist_m < nearest_front:
             nearest_front = dist_m
 
+    # 1) very near => STOP then TURN 2s
     if nearest_front <= STOP_NEAR_M:
         if passable:
             turn_lbl = _turn_label_from_heading(safe_h)
@@ -679,7 +644,9 @@ def _compute_decision_snapshot() -> Dict[str, Any]:
             "cluster": gap_info,
         }
 
-    if passable and (best_w >= block_th * 0.5):
+    # 2) if have passable gap => decide go/turn
+    if passable and (best_w >= _required_gap_width_m()):
+        # prefer straight if safe heading small
         if abs(safe_h) <= 12.0:
             return {
                 "ok": True,
@@ -713,205 +680,7 @@ def _compute_decision_snapshot() -> Dict[str, Any]:
             "cluster": gap_info,
         }
 
-    gaps = (gap_info.get("gaps") or [])
-    best_any = gaps[0] if gaps else None
-    if best_any:
-        lbl = _turn_label_from_heading(float(best_any.get("center_deg", 0.0)))
-    else:
-        lbl = "TURN_LEFT" if d_left_wide >= d_right_wide else "TURN_RIGHT"
-
-    _set_phase_stop_then_turn(now, lbl)
-    return {
-        "ok": True,
-        "label": "STOP",
-        "reason": "no_passable_gap_stop_then_turn_search(gap_cluster)",
-        "ts": now,
-        "dist": dist_pack,
-        "threshold": thresh_pack,
-        "corridor": {
-            "best_heading_deg": safe_h,
-            "best_clearance_m": best_w,
-            "method": "gap_cluster_front180",
-        },
-        "cluster": gap_info
-    }
-
-    with lock:
-        pts = list(latest_points)
-        last_ts = latest_ts
-
-    now = time.time()
-    if not pts or (now - last_ts) > 2.0:
-        # reset phase
-        with _turn_lock:
-            global _phase, _phase_until, _turn_label
-            _phase = "NORMAL"
-            _phase_until = 0.0
-            _turn_label = ""
-        # also update obstacle endpoint
-        with obstacle_state_lock:
-            global latest_front_obstacles
-            latest_front_obstacles = {"ok": False, "reason": "no_recent_lidar", "ts": now}
-        return {"ok": False, "label": "STOP", "reason": "no_recent_lidar", "ts": now}
-
-    # obey phase first (prevents flip-flop)
-    ph = _get_phase_label(now)
-    # still compute front obstacles for debug + endpoint
-    front_pts = _front_points_only(pts, recent_sec=RECENT_SEC)
-    obstacles = _cluster_obstacles_auto_k(front_pts)
-    gap_info = _rank_gaps_and_pick_safe_heading(obstacles)
-
-    with obstacle_state_lock:
-        global latest_front_obstacles
-        latest_front_obstacles = {
-            "ok": True,
-            "ts": now,
-            "k": gap_info.get("k", 0),
-            "obstacle_count": gap_info.get("obstacle_count", 0),
-            "safe_heading_deg": gap_info.get("safe_heading_deg", 0.0),
-            "required_width_m": gap_info.get("required_width_m", _required_gap_width_m()),
-            "best_gap": gap_info.get("best_gap", None),
-            "note": "front-only 180deg (rel [-90..+90]) clustering auto-K; safe_heading is center of best gap.",
-        }
-
-    predict_dist = (ROBOT_SPEED_MPS * PREDICT_T_SEC) + SAFETY_MARGIN_M
-    block_th = max(STOP_NEAR_M, predict_dist)
-
-    # Debug distances pack (keep old keys)
-    front_abs = _wrap_deg(FRONT_CENTER_DEG)
-    left_abs  = _wrap_deg(front_abs + 90.0)
-    right_abs = _wrap_deg(front_abs - 90.0)
-    diag_l    = _wrap_deg(front_abs + 45.0)
-    diag_r    = _wrap_deg(front_abs - 45.0)
-
-    d_front_narrow = _min_dist_in_sector(pts, front_abs, FRONT_WIDTH_DEG)
-    d_front_wide   = _min_dist_in_sector(pts, front_abs, WIDE_WIDTH_DEG)
-    d_left_wide    = _min_dist_in_sector(pts, left_abs,  WIDE_WIDTH_DEG)
-    d_right_wide   = _min_dist_in_sector(pts, right_abs, WIDE_WIDTH_DEG)
-    d_diag_l       = _min_dist_in_sector(pts, diag_l, 35.0)
-    d_diag_r       = _min_dist_in_sector(pts, diag_r, 35.0)
-
-    dist_pack = {
-        "front_narrow": d_front_narrow,
-        "front_wide": d_front_wide,
-        "left": d_left_wide,
-        "right": d_right_wide,
-        "diag_left": d_diag_l,
-        "diag_right": d_diag_r,
-    }
-
-    thresh_pack = {
-        "stop_near_m": STOP_NEAR_M,
-        "predict_dist_m": predict_dist,
-        "predict_t_sec": PREDICT_T_SEC,
-        "robot_speed_mps": ROBOT_SPEED_MPS,
-        "safety_margin_m": SAFETY_MARGIN_M,
-        "block_th_m": block_th,
-        "robot_width_m": ROBOT_WIDTH_M,
-        "clearance_margin_m": CLEARANCE_MARGIN_M,
-        "lookahead_m": LOOKAHEAD_M,
-        "stop_hold_sec": STOP_HOLD_SEC,
-        "turn_hold_sec": TURN_HOLD_SEC,
-        "front_half_deg": FRONT_HALF_DEG,
-        "cluster_ang_gap_deg": CLUSTER_ANG_GAP_DEG,
-        "cluster_dist_jump_m": CLUSTER_DIST_JUMP_M,
-        "cluster_min_pts": CLUSTER_MIN_PTS,
-        "recent_sec": RECENT_SEC,
-    }
-
-    # If in phase, return label from phase (but keep debug info)
-    if ph:
-        lbl, rs, until = ph
-        thresh_pack["phase_until"] = until
-        return {
-            "ok": True,
-            "label": lbl,
-            "reason": rs,
-            "ts": now,
-            "dist": dist_pack,
-            "threshold": thresh_pack,
-            # keep key "corridor" for compatibility; now we put gap-based data inside
-            "corridor": {
-                "best_heading_deg": float(gap_info.get("safe_heading_deg", 0.0)),
-                "best_clearance_m": float((gap_info.get("best_gap") or {}).get("width_m", 0.0)),
-                "method": "gap_cluster_front180",
-            },
-            "cluster": gap_info,  # new debug field (doesn't break old consumers)
-        }
-
-    # ===== normal evaluation with gap_info =====
-    safe_h = float(gap_info.get("safe_heading_deg", 0.0))
-    best_gap = gap_info.get("best_gap", None) or {}
-    best_w = float(best_gap.get("width_m", 0.0) or 0.0)
-    passable = bool(best_gap.get("passable", False))
-
-    # Very near check: if nearest front point is too close -> STOP then TURN
-    nearest_front = float("inf")
-    for (_, dist_m, *_rest) in front_pts:
-        if dist_m > 0 and dist_m < nearest_front:
-            nearest_front = dist_m
-
-    if nearest_front <= STOP_NEAR_M:
-        # choose turn toward safe heading, fallback to side with more clearance
-        if passable:
-            turn_lbl = _turn_label_from_heading(safe_h)
-        else:
-            turn_lbl = "TURN_LEFT" if d_left_wide >= d_right_wide else "TURN_RIGHT"
-        _set_phase_stop_then_turn(now, turn_lbl)
-        return {
-            "ok": True,
-            "label": "STOP",
-            "reason": "very_near_stop_then_turn(gap_cluster)",
-            "ts": now,
-            "dist": dist_pack,
-            "threshold": thresh_pack,
-            "corridor": {
-                "best_heading_deg": safe_h,
-                "best_clearance_m": best_w,
-                "method": "gap_cluster_front180",
-            },
-            "cluster": gap_info,
-        }
-
-    # If best gap is passable and width is good enough -> decide heading
-    if passable and (best_w >= block_th * 0.5):  # width criterion already passable; this just prevents weird tiny widths
-        # if heading small => go straight
-        if abs(safe_h) <= 12.0:
-            return {
-                "ok": True,
-                "label": "GO_STRAIGHT",
-                "reason": "safe_gap_center_near_forward",
-                "ts": now,
-                "dist": dist_pack,
-                "threshold": thresh_pack,
-                "corridor": {
-                    "best_heading_deg": safe_h,
-                    "best_clearance_m": best_w,
-                    "method": "gap_cluster_front180",
-                },
-                "cluster": gap_info,
-            }
-
-        # Turn for 2 seconds then re-check (anti jitter)
-        lbl = _turn_label_from_heading(safe_h)
-        _set_phase_turn(now, lbl)
-        return {
-            "ok": True,
-            "label": lbl,
-            "reason": "turn_to_safe_gap_hold_2s(gap_cluster)",
-            "ts": now,
-            "dist": dist_pack,
-            "threshold": thresh_pack,
-            "corridor": {
-                "best_heading_deg": safe_h,
-                "best_clearance_m": best_w,
-                "method": "gap_cluster_front180",
-            },
-            "cluster": gap_info,
-        }
-
-    # No passable gap: stop then turn to search side with better gap (or sector fallback)
-    # pick best side by comparing widest gap center sign
+    # 3) no passable gap => STOP then TURN to search
     gaps = (gap_info.get("gaps") or [])
     best_any = gaps[0] if gaps else None
     if best_any:
@@ -1008,11 +777,7 @@ def api_status():
     with decision_state_lock:
         lbl = latest_decision_label
     with _turn_lock:
-        phase = {
-            "phase": _phase,
-            "phase_until": _phase_until,
-            "turn_label": _turn_label
-        }
+        phase = {"phase": _phase, "phase_until": _phase_until, "turn_label": _turn_label}
     with obstacle_state_lock:
         ob = dict(latest_front_obstacles)
 
@@ -1034,7 +799,7 @@ def api_status():
         "front_half_deg": FRONT_HALF_DEG,
         "phase_state": phase,
         "front_obstacles": ob,
-        "note": "Decision uses front-only 180deg + clustering auto-K + gap ranking. Endpoints compatible with old format.",
+        "note": "Decision uses front-only 180deg + clustering(auto-K) + gap ranking. Endpoints compatible with old format.",
     })
 
 @app.get("/take_lidar_data")
@@ -1075,7 +840,7 @@ def api_decision():
         payload = dict(latest_decision_full)
     return jsonify(payload)
 
-# ✅ NEW endpoint: obstacles + K + safe angle
+# NEW endpoint: obstacles + K + safe angle
 @app.get("/api/front_obstacles")
 def api_front_obstacles():
     with obstacle_state_lock:
@@ -1118,7 +883,6 @@ def main():
     threading.Thread(target=lidar_thread_main, daemon=True).start()
     threading.Thread(target=points_worker, daemon=True).start()
     threading.Thread(target=decision_worker, daemon=True).start()
-
     app.run(host=HTTP_HOST, port=HTTP_PORT, debug=False, threaded=True)
 
 if __name__ == "__main__":
