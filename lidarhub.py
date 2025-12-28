@@ -50,7 +50,7 @@ K_NEAR = int(os.environ.get("K_NEAR", "6"))
 MIN_SECTOR_POINTS = int(os.environ.get("MIN_SECTOR_POINTS", "20"))
 
 # ===== Thresholds =====
-CLEAR_GO_M = float(os.environ.get("CLEAR_GO_M", "0.95"))        # clear để đi thẳng (hành lang)
+CLEAR_GO_M = float(os.environ.get("CLEAR_GO_M", "0.95"))            # clear để đi thẳng (hành lang)
 OBSTACLE_NEAR_M = float(os.environ.get("OBSTACLE_NEAR_M", "0.70"))  # nếu bất kỳ vùng nào quá gần => STOP rồi TURN
 CLEAR_STREAK_N = int(os.environ.get("CLEAR_STREAK_N", "2"))
 
@@ -64,14 +64,22 @@ LABEL_CONFIRM_N = int(os.environ.get("LABEL_CONFIRM_N", "2"))
 AVOID_MAX_SEC = float(os.environ.get("AVOID_MAX_SEC", "5.0"))
 
 # ===== Gap Planner / Corridor =====
-# Robot rộng 15cm (theo bạn)
-ROBOT_WIDTH_M = float(os.environ.get("ROBOT_WIDTH_M", "0.15"))  # 15cm
-# Margin để không cạ chân ghế (tăng chút cho chắc)
+# >>> UPDATE: Robot rộng 40cm (theo bạn) <<<
+ROBOT_WIDTH_M = float(os.environ.get("ROBOT_WIDTH_M", "0.40"))  # 40cm
+
+# Margin để không cạ (giữ như bạn; nếu muốn "vừa khít" hơn thì có thể giảm env xuống 0.02~0.03)
 CORRIDOR_MARGIN_M = float(os.environ.get("CORRIDOR_MARGIN_M", "0.04"))
+
+# Extra safety (nếu muốn cho "lọt vừa", set = 0.0 hoặc 0.01)
+GAP_EXTRA_M = float(os.environ.get("GAP_EXTRA_M", "0.00"))
+
 LOOKAHEAD_M = float(os.environ.get("LOOKAHEAD_M", "0.80"))
 
 BIN_DEG = float(os.environ.get("BIN_DEG", "5.0"))  # 5 độ/bin
-GAP_MIN_WIDTH_DEG = float(os.environ.get("GAP_MIN_WIDTH_DEG", "12.0"))
+
+# (giữ lại như "floor" tối thiểu theo độ để tránh gap cực nhỏ do nhiễu)
+GAP_MIN_WIDTH_DEG = float(os.environ.get("GAP_MIN_WIDTH_DEG", "10.0"))
+
 TURN_DEADBAND_DEG = float(os.environ.get("TURN_DEADBAND_DEG", "12.0"))
 
 # chống lắc trái/phải
@@ -132,6 +140,34 @@ _label_lock = threading.Lock()
 _out_label: str = "STOP"
 _pending_label: str = ""
 _pending_n: int = 0
+
+
+# =======================
+# Geometry helpers for "khe hẹp"
+# =======================
+def _required_clear_width_m() -> float:
+    # khoảng trống cần để robot chui qua (vừa thân + 2 bên margin + extra)
+    return float(ROBOT_WIDTH_M) + 2.0 * float(CORRIDOR_MARGIN_M) + float(GAP_EXTRA_M)
+
+def _gap_width_m(width_deg: float, dist_m: float) -> float:
+    # width (m) của khe ở khoảng cách dist_m
+    if not math.isfinite(dist_m) or dist_m <= 0:
+        return 0.0
+    a = math.radians(max(0.0, float(width_deg)) * 0.5)
+    return 2.0 * float(dist_m) * math.tan(a)
+
+def _min_gap_width_deg(dist_m: float) -> float:
+    # minimum degrees để đạt required width tại dist_m
+    req = _required_clear_width_m()
+    if not math.isfinite(dist_m) or dist_m <= 0:
+        return 180.0
+    # avoid zero division
+    x = req / (2.0 * float(dist_m))
+    if x <= 0:
+        return 0.0
+    # clamp x to avoid atan inf weirdness (still fine if large -> near 180)
+    a = math.degrees(2.0 * math.atan(x))
+    return float(max(0.0, min(180.0, a)))
 
 
 # =======================
@@ -523,16 +559,21 @@ def _build_bins(front_points: List[Dict[str, Any]]) -> Tuple[List[float], List[f
 def _find_gaps(dists: List[float], centers: List[float]) -> List[Dict[str, Any]]:
     """
     Gap = đoạn liên tục các bin "free".
+
     Free condition: dist >= OBSTACLE_NEAR_M (đủ xa để đi qua khe).
+    Nhưng "khe hẹp" sẽ được lọc theo chiều ngang robot:
+      - ước lượng width_m tại dist_ref (điểm thắt gần nhất trong gap, nhưng không vượt LOOKAHEAD_M)
+      - yêu cầu width_m >= (robot_width + 2*margin + extra)
     """
     free_th = float(OBSTACLE_NEAR_M)
     bin_deg = float(BIN_DEG)
+    req_w = _required_clear_width_m()
 
     gaps: List[Dict[str, Any]] = []
     i = 0
     n = len(dists)
     while i < n:
-        if not math.isfinite(dists[i]) or dists[i] < free_th:
+        if (not math.isfinite(dists[i])) or (dists[i] < free_th):
             i += 1
             continue
         j = i
@@ -543,17 +584,33 @@ def _find_gaps(dists: List[float], centers: List[float]) -> List[Dict[str, Any]]
         end_deg = centers[j - 1] + 0.5 * bin_deg
         width_deg = end_deg - start_deg
 
-        if width_deg >= float(GAP_MIN_WIDTH_DEG):
-            # best heading = trung tâm gap, ưu tiên gần 0
+        # clearance đại diện = min(dist) trong gap (điểm thắt gần nhất)
+        clearance = min(dists[i:j]) if i < j else float("inf")
+
+        # dist_ref = điểm thắt gần nhất, nhưng không vượt lookahead
+        dist_ref = float(min(float(LOOKAHEAD_M), float(clearance if math.isfinite(clearance) else float(LOOKAHEAD_M))))
+
+        # min deg để đạt req_w tại dist_ref
+        need_deg_dyn = _min_gap_width_deg(dist_ref)
+        need_deg = float(max(float(GAP_MIN_WIDTH_DEG), need_deg_dyn))
+
+        # width_m tại dist_ref
+        width_m = _gap_width_m(width_deg, dist_ref)
+
+        # pass if đủ độ và đủ mét
+        if (width_deg >= need_deg) and (width_m >= req_w):
             best_deg = (start_deg + end_deg) * 0.5
-            # clearance đại diện = min(dist) trong gap (cẩn thận)
-            clearance = min(dists[i:j]) if i < j else float("inf")
             gaps.append({
                 "start_deg": float(start_deg),
                 "end_deg": float(end_deg),
                 "width_deg": float(width_deg),
                 "best_deg": float(best_deg),
                 "clearance_m": float(clearance),
+                "dist_ref_m": float(dist_ref),
+                "gap_width_m": float(width_m),
+                "required_width_m": float(req_w),
+                "need_deg": float(need_deg),
+                "need_deg_dyn": float(need_deg_dyn),
                 "i0": int(i),
                 "i1": int(j - 1),
             })
@@ -565,20 +622,21 @@ def _find_gaps(dists: List[float], centers: List[float]) -> List[Dict[str, Any]]
 def _score_gap(g: Dict[str, Any]) -> float:
     """
     Score heuristic:
-    - khe rộng hơn tốt hơn
+    - khe rộng theo mét (ở dist_ref) tốt hơn
     - clearance lớn tốt hơn
     - gần hướng thẳng (0 độ) tốt hơn (đỡ lắc)
     """
-    width = float(g.get("width_deg", 0.0))
+    width_m = float(g.get("gap_width_m", 0.0))
+    req_w = float(g.get("required_width_m", _required_clear_width_m()))
     clear = float(g.get("clearance_m", 0.0))
     best = float(g.get("best_deg", 0.0))
 
-    # normalize
-    w_n = max(0.0, min(1.0, width / 60.0))              # >=60deg coi như max
-    c_n = max(0.0, min(1.0, clear / max(1.0, CLEAR_GO_M)))  # >=CLEAR_GO ~ max
-    s_n = 1.0 - max(0.0, min(1.0, abs(best) / 90.0))    # 0deg best
+    # normalize width: >= 2*req_w coi như max
+    w_n = max(0.0, min(1.0, width_m / max(1e-6, (2.0 * req_w))))
+    c_n = max(0.0, min(1.0, clear / max(1.0, CLEAR_GO_M)))
+    s_n = 1.0 - max(0.0, min(1.0, abs(best) / 90.0))
 
-    return 0.45 * w_n + 0.35 * c_n + 0.20 * s_n
+    return 0.50 * w_n + 0.30 * c_n + 0.20 * s_n
 
 def _pick_best_heading(front_points: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
@@ -600,10 +658,15 @@ def _pick_best_heading(front_points: List[Dict[str, Any]]) -> Dict[str, Any]:
         return {
             "best_heading_deg": float(best["best_deg"]),
             "best_score": float(best["score"]),
+            "required_width_m": float(_required_clear_width_m()),
             "candidates": [{
                 "best_deg": float(x["best_deg"]),
                 "score": float(x["score"]),
                 "width_deg": float(x["width_deg"]),
+                "gap_width_m": float(x.get("gap_width_m", 0.0)),
+                "required_width_m": float(x.get("required_width_m", _required_clear_width_m())),
+                "need_deg": float(x.get("need_deg", 0.0)),
+                "dist_ref_m": float(x.get("dist_ref_m", 0.0)),
                 "clearance_m": float(x["clearance_m"]),
                 "start_deg": float(x["start_deg"]),
                 "end_deg": float(x["end_deg"]),
@@ -630,6 +693,7 @@ def _pick_best_heading(front_points: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "best_heading_deg": float(best_h),
         "best_score": float(best_s),
+        "required_width_m": float(_required_clear_width_m()),
         "candidates": [],
         "bins": {
             "bin_deg": float(BIN_DEG),
@@ -719,8 +783,11 @@ def _pack_decision(label: str, reason: str, secs: Dict[str, Dict[str, Any]], min
                 "emergency_rearm_m": float(EMERGENCY_REARM_M),
                 "robot_width_m": float(ROBOT_WIDTH_M),
                 "corridor_margin_m": float(CORRIDOR_MARGIN_M),
+                "gap_extra_m": float(GAP_EXTRA_M),
+                "required_clear_width_m": float(_required_clear_width_m()),
                 "lookahead_m": float(LOOKAHEAD_M),
                 "bin_deg": float(BIN_DEG),
+                "gap_min_width_deg_floor": float(GAP_MIN_WIDTH_DEG),
             },
             "planner": planner_dbg or {},
         }
@@ -738,9 +805,6 @@ def _compute_decision() -> Dict[str, Any]:
 
     secs = _sector_metrics(front_pts)
     min_front = _min_front_any(front_pts)
-    L = secs["LEFT"]
-    C = secs["CENTER"]
-    R = secs["RIGHT"]
 
     # planner snapshot
     plan = _pick_best_heading(front_pts)
@@ -750,14 +814,12 @@ def _compute_decision() -> Dict[str, Any]:
 
     # corridors debug (planned + others)
     cand_headings = [best_heading]
-    # thêm 2 corridor khác (nếu có candidates)
     for c in (plan.get("candidates") or []):
         hd = float(c.get("best_deg", 0.0))
         if hd not in cand_headings:
             cand_headings.append(hd)
         if len(cand_headings) >= 3:
             break
-    # luôn show straight corridor
     if 0.0 not in cand_headings:
         cand_headings.append(0.0)
 
@@ -775,7 +837,6 @@ def _compute_decision() -> Dict[str, Any]:
     # ========== Emergency STOP one-shot ==========
     if (min_front <= float(EMERGENCY_STOP_M)) and _em_is_armed():
         _em_disarm_after_issue()
-        # vào avoid, chọn hướng turn theo best_heading (nhưng không cho GO_STRAIGHT)
         turn_dir = "TURN_LEFT" if best_heading > 0 else "TURN_RIGHT"
         _avoid_set(True, turn_dir)
 
@@ -790,6 +851,7 @@ def _compute_decision() -> Dict[str, Any]:
             "near_min_m": float(near_min),
             "corridors": corridors_dbg,
             "candidates": plan.get("candidates", []),
+            "required_clear_width_m": float(_required_clear_width_m()),
         }
 
         raw = _pack_decision(
@@ -810,12 +872,11 @@ def _compute_decision() -> Dict[str, Any]:
     if (min_front > float(EMERGENCY_REARM_M)) and (not _em_is_armed()):
         _em_arm()
 
-    # ========== Rule mới: NEAR ở bất kỳ vùng nào => STOP rồi TURN ==========
+    # ========== Rule: NEAR ở bất kỳ vùng nào => STOP rồi TURN ==========
     avoid_active, streak, avoid_dir, start_ts, last_sw = _avoid_get()
     avoid_age = (time.time() - start_ts) if start_ts > 0 else 0.0
 
     if (not avoid_active) and near_any:
-        # vào avoid + phát STOP trước
         turn_dir = "TURN_LEFT" if best_heading > 0 else "TURN_RIGHT"
         _avoid_set(True, turn_dir)
 
@@ -827,6 +888,7 @@ def _compute_decision() -> Dict[str, Any]:
             "near_min_m": float(near_min),
             "corridors": corridors_dbg,
             "candidates": plan.get("candidates", []),
+            "required_clear_width_m": float(_required_clear_width_m()),
         }
 
         raw = _pack_decision(
@@ -847,19 +909,16 @@ def _compute_decision() -> Dict[str, Any]:
     avoid_active, streak, avoid_dir, start_ts, last_sw = _avoid_get()
     avoid_age = (time.time() - start_ts) if start_ts > 0 else 0.0
 
-    # timeout safety: tránh kẹt
     if avoid_active and avoid_age >= float(AVOID_MAX_SEC):
         _reset_all_logic()
         avoid_active, streak, avoid_dir, start_ts, last_sw = _avoid_get()
         avoid_age = 0.0
 
-    # kiểm tra clear corridor thẳng để thoát avoid
     cmin0 = _corridor_min_x(front_pts, 0.0)
     corridor_clear0 = (not math.isfinite(cmin0)) or (cmin0 >= float(CLEAR_GO_M))
     clear_now = corridor_clear0 and (float(min_front) >= float(CLEAR_GO_M))
 
     if avoid_active:
-        # nếu clear -> đếm streak
         if clear_now:
             _avoid_streak_inc()
         else:
@@ -879,6 +938,7 @@ def _compute_decision() -> Dict[str, Any]:
             "clear_now": bool(clear_now),
             "corridors": corridors_dbg,
             "candidates": plan.get("candidates", []),
+            "required_clear_width_m": float(_required_clear_width_m()),
         }
 
         if streak2 >= int(CLEAR_STREAK_N):
@@ -897,10 +957,7 @@ def _compute_decision() -> Dict[str, Any]:
             raw["label"] = _smooth_label(raw["label"])
             return raw
 
-        # update hướng turn (nhưng chống lắc: commit time)
         desired_turn = "TURN_LEFT" if best_heading > 0 else "TURN_RIGHT"
-        # chỉ đổi hướng khi heading mới "khác" và thực sự đáng đổi (score đủ cao)
-        # (giữ đơn giản: nếu best_score lớn hơn một ngưỡng và best_heading đổi bên)
         if desired_turn != avoid_dir2 and best_score >= float(AVOID_SWITCH_HYST):
             _avoid_maybe_switch(desired_turn)
             avoid_active2, streak2, avoid_dir2, start_ts2, last_sw2 = _avoid_get()
@@ -930,9 +987,9 @@ def _compute_decision() -> Dict[str, Any]:
         "corridor_clear0": bool(corridor_clear0),
         "corridors": corridors_dbg,
         "candidates": plan.get("candidates", []),
+        "required_clear_width_m": float(_required_clear_width_m()),
     }
 
-    # ưu tiên đi thẳng nếu corridor thẳng clear
     if corridor_clear0 and (float(min_front) >= float(CLEAR_GO_M)):
         raw = _pack_decision(
             label="GO_STRAIGHT",
@@ -948,10 +1005,8 @@ def _compute_decision() -> Dict[str, Any]:
         raw["label"] = _smooth_label(raw["label"])
         return raw
 
-    # nếu không clear: steer theo best gap (không cần STOP trừ khi NEAR)
     steer = best_label
     if steer == "GO_STRAIGHT":
-        # không clear mà best vẫn straight: chọn bên corridor tốt hơn
         cl = _corridor_min_x(front_pts, +35.0)
         cr = _corridor_min_x(front_pts, -35.0)
         steer = "TURN_LEFT" if cl >= cr else "TURN_RIGHT"
@@ -986,12 +1041,10 @@ def _render_map_png(decision: Dict[str, Any], front_points: List[Dict[str, Any]]
     cx, cy = W // 2, H // 2
     ppm = (W * 0.45) / max(0.5, float(VIEW_RANGE_M))
 
-    # semi arc boundary
     rr = int(VIEW_RANGE_M * ppm)
     bbox = (cx - rr, cy - rr, cx + rr, cy + rr)
     draw.arc(bbox, start=0, end=180, fill=(160, 160, 160), width=3)
 
-    # robot center
     draw.ellipse((cx - 7, cy - 7, cx + 7, cy + 7), fill=(20, 20, 20))
 
     def xy_to_px(x_fwd: float, y_left: float) -> Tuple[int, int]:
@@ -1005,7 +1058,6 @@ def _render_map_png(decision: Dict[str, Any], front_points: List[Dict[str, Any]]
         y_left = dist_m * math.sin(r)
         return xy_to_px(x_fwd, y_left)
 
-    # --- sector overlay (giữ giống bản cũ)
     overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     od = ImageDraw.Draw(overlay)
     ring_px = int(SECTOR_RING_M * ppm)
@@ -1038,7 +1090,6 @@ def _render_map_png(decision: Dict[str, Any], front_points: List[Dict[str, Any]]
     img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
     draw = ImageDraw.Draw(img)
 
-    # --- draw points
     for p in front_points:
         d = float(p["dist_m"])
         rel = float(p["rel_deg"])
@@ -1048,7 +1099,6 @@ def _render_map_png(decision: Dict[str, Any], front_points: List[Dict[str, Any]]
         if 0 <= px < W and 0 <= py < H:
             img.putpixel((px, py), (80, 80, 80))
 
-    # --- Corridor overlays (màu theo yêu cầu)
     dbg = decision.get("debug", {}) if isinstance(decision, dict) else {}
     planner = dbg.get("planner", {}) if isinstance(dbg, dict) else {}
     corridors = planner.get("corridors", []) if isinstance(planner, dict) else []
@@ -1057,7 +1107,6 @@ def _render_map_png(decision: Dict[str, Any], front_points: List[Dict[str, Any]]
     look = float(LOOKAHEAD_M)
 
     def corridor_poly(heading_deg: float) -> List[Tuple[int, int]]:
-        # rectangle in corridor frame: x in [0, look], y in [-half_w, +half_w]
         corners = [
             (0.0, -half_w),
             (look, -half_w),
@@ -1066,13 +1115,10 @@ def _render_map_png(decision: Dict[str, Any], front_points: List[Dict[str, Any]]
         ]
         pts = []
         for (xh, yh) in corners:
-            x, y = _rotate_xy(xh, yh, heading_deg)  # rotate into robot frame
+            x, y = _rotate_xy(xh, yh, heading_deg)
             pts.append(xy_to_px(x, y))
         return pts
 
-    # planned corridor = heading của best (corridors[0] thường là best)
-    # vẽ các corridor khác vàng nhạt
-    # dùng overlay RGBA để alpha đẹp
     cor_ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     cd = ImageDraw.Draw(cor_ov)
 
@@ -1092,7 +1138,6 @@ def _render_map_png(decision: Dict[str, Any], front_points: List[Dict[str, Any]]
     img = Image.alpha_composite(img.convert("RGBA"), cor_ov).convert("RGB")
     draw = ImageDraw.Draw(img)
 
-    # --- draw arrow theo label
     if label == "GO_STRAIGHT":
         ax, ay = rel_to_px(0.0, min(1.0, VIEW_RANGE_M * 0.9))
         draw.line((cx, cy, ax, ay), fill=(0, 0, 0), width=4)
@@ -1103,7 +1148,6 @@ def _render_map_png(decision: Dict[str, Any], front_points: List[Dict[str, Any]]
         ax, ay = rel_to_px(+45.0, min(1.0, VIEW_RANGE_M * 0.9))
         draw.line((cx, cy, ax, ay), fill=(0, 0, 0), width=4)
 
-    # fonts
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
         font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
@@ -1129,12 +1173,14 @@ def _render_map_png(decision: Dict[str, Any], front_points: List[Dict[str, Any]]
     avoid_dbg = dbg.get("avoid", {}) if isinstance(dbg, dict) else {}
     cor0 = planner.get("corridor_min_x0_m", None) if isinstance(planner, dict) else None
 
+    req_w = _required_clear_width_m()
+
     hud = [
         f"label: {label}",
         f"front_center={FRONT_CENTER_DEG_HARD:.1f} mirror={FRONT_MIRROR_HARD} flip={FRONT_FLIP_HARD}",
         f"frame_sec={FRAME_SEC:.2f} bin={BIN_DEG:.1f}deg lookahead={LOOKAHEAD_M:.2f}m",
         f"clear_go={CLEAR_GO_M:.2f}m obstacle_near={OBSTACLE_NEAR_M:.2f}m em_stop={EMERGENCY_STOP_M:.2f}m",
-        f"robot_w={ROBOT_WIDTH_M*100:.0f}cm margin={CORRIDOR_MARGIN_M*100:.0f}cm",
+        f"robot_w={ROBOT_WIDTH_M*100:.0f}cm margin={CORRIDOR_MARGIN_M*100:.0f}cm extra={GAP_EXTRA_M*100:.0f}cm req_gap={req_w*100:.0f}cm",
         f"avoid: active={avoid_dbg.get('active')} dir={avoid_dbg.get('dir')} streak={avoid_dbg.get('clear_streak')} age={avoid_dbg.get('age_s')}",
         f"L={fmt_dist(dL)} C={fmt_dist(dC)} R={fmt_dist(dR)} min_front={fmt_dist(float(dbg.get('min_front', float('inf'))))}",
         f"best_heading={planner.get('best_heading_deg', 0.0)} deg score={planner.get('best_score', 0.0)}",
@@ -1261,8 +1307,11 @@ def api_status():
             "emergency_rearm_m": float(EMERGENCY_REARM_M),
             "robot_width_m": float(ROBOT_WIDTH_M),
             "corridor_margin_m": float(CORRIDOR_MARGIN_M),
+            "gap_extra_m": float(GAP_EXTRA_M),
+            "required_clear_width_m": float(_required_clear_width_m()),
             "lookahead_m": float(LOOKAHEAD_M),
             "bin_deg": float(BIN_DEG),
+            "gap_min_width_deg_floor": float(GAP_MIN_WIDTH_DEG),
         },
 
         "latest_label": lbl,
