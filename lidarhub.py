@@ -552,11 +552,12 @@ def _compute_decision() -> Dict[str, Any]:
     secs = _sector_stats(pts, front_abs)
     center_min = float(secs["CENTER"]["min_dist"])
 
-    # ===== NEW: front arc check (fix GO_STRAIGHT) =====
+    # ===== front arc check =====
     fa_min, fa_rel = _front_arc_min(pts, front_abs)
+    hard_stop = (fa_min <= float(FRONT_ARC_HARD_STOP_M))
+    block_go  = (fa_min <= float(FRONT_ARC_BLOCK_M))
 
-    # ===== NEW: STOP->TURN state machine =====
-    # Nếu đang hold STOP thì luôn STOP (không cho sticky override)
+    # ===== STOP->TURN hold: nếu đang hold thì luôn STOP =====
     if _is_in_stop_hold(now):
         predict_dist = (ROBOT_SPEED_MPS * PREDICT_T_SEC) + SAFETY_MARGIN_M
         return {
@@ -583,26 +584,28 @@ def _compute_decision() -> Dict[str, Any]:
             }
         }
 
-    # Nếu hết hold => phải TURN theo hướng trống (label này sẽ đi qua sticky để giữ turn)
+    # ===== nếu hết hold => phải TURN (pending) =====
+    pending_active = False
     ready, pending_lbl, pending_reason = _consume_pending_turn_if_ready(now)
     if ready and pending_lbl in ("TURN_LEFT", "TURN_RIGHT"):
         desired_label = pending_lbl
         desired_reason = f"post_stop_turn | {pending_reason}"
         desired_dbg = {"post_stop_turn": True, "pending": pending_lbl}
+        pending_active = True
     else:
         desired_label, desired_reason, desired_dbg = _choose_direction_from_sectors(secs)
 
-    # ===== NEW: Apply front-arc rule to BLOCK GO_STRAIGHT =====
-    # Case A: Hard stop => STOP first, then schedule TURN next tick
-    hard_stop = (fa_min <= float(FRONT_ARC_HARD_STOP_M))
-    block_go = (fa_min <= float(FRONT_ARC_BLOCK_M))
-
-    if hard_stop:
-        # chọn hướng turn trống hơn rồi schedule
+    # ===== KEY FIX: hard_stop KHÔNG được chặn TURN =====
+    # Nếu hard_stop mà desired hiện tại là TURN (do pending hoặc k3), thì cứ cho TURN chạy.
+    if hard_stop and desired_label not in ("TURN_LEFT", "TURN_RIGHT"):
+        # phải STOP trước 1 nhịp, rồi TURN theo phía trống
         turn_lbl, turn_dbg = _choose_turn_to_open_side(secs)
-        _set_stop_then_turn(now, turn_lbl, reason=f"front_arc_hard_stop(min={fa_min:.3f}, rel={fa_rel}) -> {turn_lbl}")
-        # hard stop override sticky (an toàn)
-        _clear_sticky_now()
+        _set_stop_then_turn(
+            now,
+            turn_lbl,
+            reason=f"hard_stop(min={fa_min:.3f}, rel={fa_rel}) -> {turn_lbl}"
+        )
+        _clear_sticky_now()  # an toàn: reset sticky khi hard_stop kick-in
 
         predict_dist = (ROBOT_SPEED_MPS * PREDICT_T_SEC) + SAFETY_MARGIN_M
         return {
@@ -634,18 +637,17 @@ def _compute_decision() -> Dict[str, Any]:
             }
         }
 
-    # Case B: block GO_STRAIGHT => nếu desired là GO_STRAIGHT thì đổi sang TURN theo hướng trống
+    # ===== block GO_STRAIGHT trong front arc =====
     if block_go and desired_label == "GO_STRAIGHT":
         turn_lbl, turn_dbg = _choose_turn_to_open_side(secs)
         desired_label = turn_lbl
         desired_reason = f"front_arc_block_go_straight(min={fa_min:.3f}, rel={fa_rel}) -> {turn_lbl}"
-        desired_dbg = {**desired_dbg, "front_arc_override": True, "turn_debug": turn_dbg}
+        desired_dbg = {**(desired_dbg or {}), "front_arc_override": True, "turn_debug": turn_dbg}
 
-    # Sticky (GIỮ NGUYÊN)
+    # ===== Sticky (giữ nguyên) =====
     final_label, sticky_reason, sticky_dbg = _apply_sticky_turn(desired_label, center_min, now)
 
     predict_dist = (ROBOT_SPEED_MPS * PREDICT_T_SEC) + SAFETY_MARGIN_M
-
     return {
         "ok": True,
         "label": final_label,
