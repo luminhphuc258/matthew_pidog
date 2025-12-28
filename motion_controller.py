@@ -247,7 +247,7 @@ class MotionController:
             return stop_evt, None
 
         # configurable by ENV
-        sweep_min = float(__import__("os").environ.get("HEAD_SWEEP_MIN", "40.0"))
+        sweep_min = float(__import__("os").environ.get("HEAD_SWEEP_MIN", "70.0"))
         sweep_max = float(__import__("os").environ.get("HEAD_SWEEP_MAX", "70.0"))
         speed_dps = float(__import__("os").environ.get("HEAD_SWEEP_SPEED_DPS", "55.0"))  # deg/sec
         tick_sec  = float(__import__("os").environ.get("HEAD_TICK_SEC", "0.03"))         # 30ms
