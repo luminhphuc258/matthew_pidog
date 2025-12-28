@@ -30,39 +30,37 @@ POINT_LIMIT = int(os.environ.get("POINT_LIMIT", "2500"))
 THROTTLE_MS = int(os.environ.get("THROTTLE_MS", "250"))
 THROTTLE_S = THROTTLE_MS / 1000.0
 
-STOP_NEAR_M = float(os.environ.get("STOP_NEAR_M", "0.30"))
+# Safety / motion model
+STOP_NEAR_M = float(os.environ.get("STOP_NEAR_M", "0.30"))      # stop if center < 30cm
+LOOKAHEAD_M = float(os.environ.get("LOOKAHEAD_M", "1.20"))      # obstacle counting range
 PREDICT_T_SEC = float(os.environ.get("PREDICT_T_SEC", "1.0"))
 ROBOT_SPEED_MPS = float(os.environ.get("ROBOT_SPEED_MPS", "0.35"))
 SAFETY_MARGIN_M = float(os.environ.get("SAFETY_MARGIN_M", "0.10"))
 
+# Plot frame / heading
 FRONT_CENTER_DEG = float(os.environ.get("FRONT_CENTER_DEG", "0.0"))
-FRONT_MIRROR = int(os.environ.get("FRONT_MIRROR", "0"))
+FRONT_MIRROR = int(os.environ.get("FRONT_MIRROR", "0"))  # set 1 if left/right inverted
 
-FRONT_WIDTH_DEG = float(os.environ.get("FRONT_WIDTH_DEG", "30.0"))
-WIDE_WIDTH_DEG  = float(os.environ.get("WIDE_WIDTH_DEG", "70.0"))
+RECENT_SEC = float(os.environ.get("RECENT_SEC", "0.7"))
 
-ROBOT_WIDTH_M = float(os.environ.get("ROBOT_WIDTH_M", "0.15"))
-CLEARANCE_MARGIN_M = float(os.environ.get("CLEARANCE_MARGIN_M", "0.03"))
-LOOKAHEAD_M = float(os.environ.get("LOOKAHEAD_M", "1.20"))
+# ===== Auto front calib (back wall -> front = back + 180) =====
+AUTO_FRONT_CALIB = int(os.environ.get("AUTO_FRONT_CALIB", "1"))
+AUTO_CALIB_BIN_DEG = float(os.environ.get("AUTO_CALIB_BIN_DEG", "10.0"))
+AUTO_CALIB_SMOOTH = float(os.environ.get("AUTO_CALIB_SMOOTH", "0.35"))
+AUTO_CALIB_NEAR_CAP_M = float(os.environ.get("AUTO_CALIB_NEAR_CAP_M", "2.0"))
+AUTO_CALIB_PERCENTILE = float(os.environ.get("AUTO_CALIB_PERCENTILE", "20.0"))
+
+# ===== k=3 sectors in FRONT 180 =====
+SECTOR_CENTER_DEG = float(os.environ.get("SECTOR_CENTER_DEG", "30.0"))  # center half-width (default +-30)
+# RIGHT: [-90..-SECTOR_CENTER_DEG), CENTER: [-SECTOR_CENTER_DEG..+SECTOR_CENTER_DEG], LEFT: (+SECTOR_CENTER_DEG..+90]
 
 FRONT_HALF_DEG = float(os.environ.get("FRONT_HALF_DEG", "90.0"))  # front 180 = [-90..+90]
 
-CLUSTER_ANG_GAP_DEG = float(os.environ.get("CLUSTER_ANG_GAP_DEG", "2.5"))
-CLUSTER_DIST_JUMP_M = float(os.environ.get("CLUSTER_DIST_JUMP_M", "0.25"))
-CLUSTER_MIN_PTS     = int(os.environ.get("CLUSTER_MIN_PTS", "4"))
-RECENT_SEC          = float(os.environ.get("RECENT_SEC", "0.7"))
-
-# ===== Auto front calib (FIXED) =====
-AUTO_FRONT_CALIB    = int(os.environ.get("AUTO_FRONT_CALIB", "1"))
-AUTO_CALIB_BIN_DEG  = float(os.environ.get("AUTO_CALIB_BIN_DEG", "10.0"))
-AUTO_CALIB_SMOOTH   = float(os.environ.get("AUTO_CALIB_SMOOTH", "0.35"))
-# IMPORTANT: dùng percentile nên ngưỡng này chỉ là cap, đặt lớn 1 chút cho chắc
-AUTO_CALIB_NEAR_CAP_M = float(os.environ.get("AUTO_CALIB_NEAR_CAP_M", "2.0"))
-AUTO_CALIB_PERCENTILE = float(os.environ.get("AUTO_CALIB_PERCENTILE", "20.0"))  # 20% điểm gần nhất
-
-STOP_HOLD_SEC = float(os.environ.get("STOP_HOLD_SEC", "0.35"))
-TURN_HOLD_SEC = float(os.environ.get("TURN_HOLD_SEC", "2.0"))
-TURN_HOLD_SEC = max(2.0, TURN_HOLD_SEC)
+# ===== Sticky turn behavior =====
+# giữ TURN đến khi phía trước không còn vật cản < 40cm
+CLEAR_RELEASE_M = float(os.environ.get("CLEAR_RELEASE_M", "0.40"))      # release when center_min > 40cm
+CLEAR_CONFIRM_SEC = float(os.environ.get("CLEAR_CONFIRM_SEC", "0.25"))  # require stable clear a bit
+TURN_STICKY_MIN_SEC = float(os.environ.get("TURN_STICKY_MIN_SEC", "0.35"))  # minimal hold to avoid flicker
 
 LINE_RE = re.compile(r"theta:\s*([0-9.]+)\s+Dist:\s*([0-9.]+)\s+Q:\s*(\d+)")
 
@@ -91,14 +89,15 @@ decision_state_lock = threading.Lock()
 latest_decision_label: str = "STOP"
 latest_decision_full: Dict[str, Any] = {"ok": False, "label": "STOP", "reason": "init", "ts": 0.0}
 
-_turn_lock = threading.Lock()
-_phase: str = "NORMAL"
-_phase_until: float = 0.0
-_turn_label: str = ""
-
 _front_center_lock = threading.Lock()
 _front_center_est_deg: float = FRONT_CENTER_DEG
 _last_back_deg: Optional[float] = None
+
+# Sticky turn state
+_sticky_lock = threading.Lock()
+_sticky_label: Optional[str] = None            # "TURN_LEFT" / "TURN_RIGHT" / None
+_sticky_since: float = 0.0
+_sticky_clear_start: Optional[float] = None
 
 
 # =======================
@@ -141,9 +140,6 @@ def _percentile(sorted_vals: List[float], p: float) -> float:
         return sorted_vals[int(k)]
     return sorted_vals[f] * (c - k) + sorted_vals[c] * (k - f)
 
-def _required_gap_width_m() -> float:
-    return float(ROBOT_WIDTH_M + 2.0 * CLEARANCE_MARGIN_M)
-
 def _get_front_center_deg() -> float:
     with _front_center_lock:
         return float(_front_center_est_deg)
@@ -154,7 +150,7 @@ def _set_front_center_deg(v: float):
         _front_center_est_deg = float(_wrap_deg(v))
 
 def _rel_deg(theta_deg: float, center_deg: float) -> float:
-    rel = _wrap_rel_deg(theta_deg - center_deg)
+    rel = _wrap_rel_deg(theta_deg - center_deg)  # [-180..180], + is left
     if FRONT_MIRROR == 1:
         rel = -rel
     return rel
@@ -248,18 +244,12 @@ def lidar_thread_main():
 
 
 # =======================
-# Auto FRONT calibration (FIXED for your data)
+# Auto FRONT calibration (back wall -> front)
 # =======================
 def _estimate_back_direction_percentile(
     pts: List[Tuple[float, float, int, float, float, float]],
     recent_sec: float
 ) -> Optional[float]:
-    """
-    - Lấy các điểm recent
-    - Lấy distance cutoff = percentile(P) (vd 20%) và cap bởi AUTO_CALIB_NEAR_CAP_M
-    - Histogram theo theta bin
-    - Bin có nhiều điểm gần nhất + mean_d nhỏ => back (tường)
-    """
     now = time.time()
     bin_deg = max(2.0, float(AUTO_CALIB_BIN_DEG))
     bins = max(12, int(round(360.0 / bin_deg)))
@@ -271,7 +261,6 @@ def _estimate_back_direction_percentile(
     dists = sorted([d for (_, d, _) in recent])
     cutoff = _percentile(dists, float(AUTO_CALIB_PERCENTILE))
     cutoff = min(float(AUTO_CALIB_NEAR_CAP_M), cutoff)
-    # Nếu cutoff quá nhỏ (trường hợp dữ liệu sạch), nâng lên chút cho chắc
     cutoff = max(0.35, cutoff)
 
     counts = [0] * bins
@@ -290,7 +279,6 @@ def _estimate_back_direction_percentile(
         if counts[i] < 6:
             continue
         mean_d = dist_sums[i] / max(1, counts[i])
-        # score: ưu tiên gần + nhiều điểm
         score = (counts[i] * 1.0) + (2.0 - mean_d) * 6.0
         if score > best_score:
             best_score = score
@@ -323,23 +311,148 @@ def _auto_calibrate_front_center(pts: List[Tuple[float, float, int, float, float
 
 
 # =======================
-# Sector + Decision (simple + reliable)
+# k=3 sector clustering in FRONT 180
 # =======================
-def _min_dist_sector_abs(
+def _sector_name(rel_deg: float) -> Optional[str]:
+    if abs(rel_deg) > FRONT_HALF_DEG:
+        return None  # ignore back half
+    c = float(SECTOR_CENTER_DEG)
+    if rel_deg < -c:
+        return "RIGHT"
+    if rel_deg > c:
+        return "LEFT"
+    return "CENTER"
+
+def _sector_stats(
     pts: List[Tuple[float, float, int, float, float, float]],
-    center_abs_deg: float,
-    width_deg: float
-) -> float:
+    front_abs: float
+) -> Dict[str, Dict[str, float]]:
+    """
+    Returns:
+      {
+        "LEFT":   {"count": int, "min_dist": float},
+        "CENTER": {"count": int, "min_dist": float},
+        "RIGHT":  {"count": int, "min_dist": float},
+      }
+    count = number of points with dist < LOOKAHEAD_M
+    min_dist = minimum distance seen in that sector (front half only)
+    """
     now = time.time()
-    half = width_deg / 2.0
-    best = float("inf")
+    out = {
+        "LEFT":   {"count": 0.0, "min_dist": float("inf")},
+        "CENTER": {"count": 0.0, "min_dist": float("inf")},
+        "RIGHT":  {"count": 0.0, "min_dist": float("inf")},
+    }
+
     for (theta, dist_m, q, x, y, ts) in pts:
         if now - ts > RECENT_SEC:
             continue
-        if _ang_dist_deg(theta, center_abs_deg) <= half:
-            if dist_m < best:
-                best = dist_m
-    return best
+        if dist_m <= 0.02:
+            continue
+
+        rel = _rel_deg(theta, front_abs)
+        sec = _sector_name(rel)
+        if sec is None:
+            continue
+
+        if dist_m < out[sec]["min_dist"]:
+            out[sec]["min_dist"] = dist_m
+
+        if dist_m <= LOOKAHEAD_M:
+            out[sec]["count"] += 1.0
+
+    return out
+
+
+# =======================
+# Decision + Sticky Turn
+# =======================
+def _choose_direction_from_sectors(secs: Dict[str, Dict[str, float]]) -> Tuple[str, str, Dict[str, Any]]:
+    """
+    Logic:
+      - If CENTER min_dist <= STOP_NEAR_M => STOP
+      - Else choose sector with smallest count. Tie-break:
+          prefer CENTER, then the side with larger min_dist.
+    """
+    cmin = float(secs["CENTER"]["min_dist"])
+    if cmin <= STOP_NEAR_M:
+        return ("STOP", "center_too_close", {"center_min": cmin, "stop_near_m": STOP_NEAR_M})
+
+    # counts
+    lc = secs["LEFT"]["count"]
+    cc = secs["CENTER"]["count"]
+    rc = secs["RIGHT"]["count"]
+
+    # find min count
+    m = min(lc, cc, rc)
+    candidates = []
+    if lc == m: candidates.append("LEFT")
+    if cc == m: candidates.append("CENTER")
+    if rc == m: candidates.append("RIGHT")
+
+    # prefer CENTER if tie
+    if "CENTER" in candidates:
+        best = "CENTER"
+    else:
+        # tie between LEFT/RIGHT => pick larger min_dist
+        lmin = float(secs["LEFT"]["min_dist"])
+        rmin = float(secs["RIGHT"]["min_dist"])
+        best = "LEFT" if lmin >= rmin else "RIGHT"
+
+    if best == "CENTER":
+        return ("GO_STRAIGHT", "k3_sector_best_center", {"counts": {"L": lc, "C": cc, "R": rc}})
+    if best == "LEFT":
+        return ("TURN_LEFT", "k3_sector_best_left", {"counts": {"L": lc, "C": cc, "R": rc}})
+    return ("TURN_RIGHT", "k3_sector_best_right", {"counts": {"L": lc, "C": cc, "R": rc}})
+
+def _apply_sticky_turn(
+    desired_label: str,
+    center_min: float,
+    now: float
+) -> Tuple[str, str, Dict[str, Any]]:
+    """
+    Sticky rule:
+      - If currently sticky TURN_LEFT/RIGHT => keep it
+        until center_min > CLEAR_RELEASE_M continuously for CLEAR_CONFIRM_SEC
+      - Also enforce minimum hold time TURN_STICKY_MIN_SEC
+    """
+    global _sticky_label, _sticky_since, _sticky_clear_start
+
+    with _sticky_lock:
+        cur = _sticky_label
+
+        # If currently sticky turn
+        if cur in ("TURN_LEFT", "TURN_RIGHT"):
+            held_for = now - _sticky_since
+
+            # require min hold time
+            if held_for < TURN_STICKY_MIN_SEC:
+                return (cur, "sticky_min_hold", {"held_for": held_for})
+
+            # check clear condition (center has no obstacle < 40cm)
+            if center_min > CLEAR_RELEASE_M:
+                if _sticky_clear_start is None:
+                    _sticky_clear_start = now
+                if (now - _sticky_clear_start) >= CLEAR_CONFIRM_SEC:
+                    # release sticky
+                    _sticky_label = None
+                    _sticky_clear_start = None
+                    cur = None
+                else:
+                    return (cur, "sticky_wait_clear_confirm", {"center_min": center_min, "clear_for": now - _sticky_clear_start})
+            else:
+                _sticky_clear_start = None
+                return (cur, "sticky_turn_until_front_clear", {"center_min": center_min, "clear_release_m": CLEAR_RELEASE_M})
+
+        # No sticky currently => if desired is a turn, set sticky
+        if cur is None and desired_label in ("TURN_LEFT", "TURN_RIGHT"):
+            _sticky_label = desired_label
+            _sticky_since = now
+            _sticky_clear_start = None
+            return (desired_label, "set_sticky_turn", {"center_min": center_min})
+
+    # default: allow desired
+    return (desired_label, "not_sticky", {"center_min": center_min})
 
 def _compute_decision() -> Dict[str, Any]:
     with lock:
@@ -350,113 +463,66 @@ def _compute_decision() -> Dict[str, Any]:
     if (not pts) or ((now - last_ts) > 2.0):
         return {"ok": False, "label": "STOP", "reason": "no_recent_lidar", "ts": now}
 
-    # 1) FIX FRONT from your scenario (back wall)
+    # 1) auto calibrate front
     _auto_calibrate_front_center(pts)
     front_abs = _get_front_center_deg()
-    back_abs = _wrap_deg(front_abs + 180.0)  # just for debug
 
-    # 2) check front distances
-    front_narrow = _min_dist_sector_abs(pts, front_abs, FRONT_WIDTH_DEG)
-    front_wide   = _min_dist_sector_abs(pts, front_abs, WIDE_WIDTH_DEG)
+    # 2) build k=3 sector stats
+    secs = _sector_stats(pts, front_abs)
+    center_min = float(secs["CENTER"]["min_dist"])
 
+    # 3) choose desired based on counts
+    desired_label, desired_reason, desired_dbg = _choose_direction_from_sectors(secs)
+
+    # 4) sticky turn apply
+    final_label, sticky_reason, sticky_dbg = _apply_sticky_turn(desired_label, center_min, now)
+
+    # 5) add predict threshold info (optional debug)
     predict_dist = (ROBOT_SPEED_MPS * PREDICT_T_SEC) + SAFETY_MARGIN_M
-    block_th = max(STOP_NEAR_M, predict_dist)
 
-    # RULE A: nếu phía trước rộng & hẹp đều xa hơn LOOKAHEAD => GO_STRAIGHT
-    # (trường hợp của bạn: trước trống)
-    if (front_narrow > LOOKAHEAD_M) and (front_wide > LOOKAHEAD_M):
-        return {
-            "ok": True,
-            "label": "GO_STRAIGHT",
-            "reason": "front_clear_by_sector(auto_front_calib)",
-            "ts": now,
-            "debug": {
-                "front_center_deg_used": float(front_abs),
-                "back_deg_est": float(_last_back_deg) if _last_back_deg is not None else None,
-                "front_narrow_m": float(front_narrow),
-                "front_wide_m": float(front_wide),
-                "lookahead_m": float(LOOKAHEAD_M),
-            }
-        }
-
-    # RULE B: quá gần => STOP
-    if front_narrow <= STOP_NEAR_M:
-        return {
-            "ok": True,
-            "label": "STOP",
-            "reason": "very_near_obstacle_front",
-            "ts": now,
-            "debug": {
-                "front_center_deg_used": float(front_abs),
-                "front_narrow_m": float(front_narrow),
-                "stop_near_m": float(STOP_NEAR_M),
-            }
-        }
-
-    # RULE C: có vật cản trong tầm block => TURN theo bên nào thoáng hơn
-    if front_narrow <= block_th or front_wide <= block_th:
-        left_abs  = _wrap_deg(front_abs + 90.0)
-        right_abs = _wrap_deg(front_abs - 90.0)
-        left_d  = _min_dist_sector_abs(pts, left_abs,  WIDE_WIDTH_DEG)
-        right_d = _min_dist_sector_abs(pts, right_abs, WIDE_WIDTH_DEG)
-        lbl = "TURN_LEFT" if left_d >= right_d else "TURN_RIGHT"
-        return {
-            "ok": True,
-            "label": lbl,
-            "reason": "blocked_front_turn_to_clearer_side",
-            "ts": now,
-            "debug": {
-                "front_center_deg_used": float(front_abs),
-                "front_narrow_m": float(front_narrow),
-                "front_wide_m": float(front_wide),
-                "block_th_m": float(block_th),
-                "left_m": float(left_d),
-                "right_m": float(right_d),
-            }
-        }
-
-    # default
     return {
         "ok": True,
-        "label": "GO_STRAIGHT",
-        "reason": "default_forward",
+        "label": final_label,
+        "reason": f"{desired_reason} | {sticky_reason}",
         "ts": now,
         "debug": {
             "front_center_deg_used": float(front_abs),
-            "front_narrow_m": float(front_narrow),
-            "front_wide_m": float(front_wide),
+            "back_deg_est": float(_last_back_deg) if _last_back_deg is not None else None,
+            "sector_center_deg": float(SECTOR_CENTER_DEG),
+            "lookahead_m": float(LOOKAHEAD_M),
+            "stop_near_m": float(STOP_NEAR_M),
+            "clear_release_m": float(CLEAR_RELEASE_M),
+            "clear_confirm_sec": float(CLEAR_CONFIRM_SEC),
+            "turn_sticky_min_sec": float(TURN_STICKY_MIN_SEC),
+            "predict_dist_m": float(predict_dist),
+            "sectors": {
+                "LEFT":   {"count": int(secs["LEFT"]["count"]),   "min_dist": float(secs["LEFT"]["min_dist"])},
+                "CENTER": {"count": int(secs["CENTER"]["count"]), "min_dist": float(secs["CENTER"]["min_dist"])},
+                "RIGHT":  {"count": int(secs["RIGHT"]["count"]),  "min_dist": float(secs["RIGHT"]["min_dist"])},
+            },
+            "desired": {"label": desired_label, "reason": desired_reason, **desired_dbg},
+            "sticky": {"label": final_label, "reason": sticky_reason, **sticky_dbg},
         }
     }
 
 
 # =======================
-# Points payload (adds angles for your 0-180 plot)
+# Points payload (adds angles for plotting)
 # =======================
 def _front_angles_for_plot(theta_raw: float, front_center_abs: float) -> Dict[str, Any]:
-    """
-    angle_front_360:
-      0   = FRONT
-      90  = LEFT
-      180 = BACK
-      270 = RIGHT
-
-    front_0_180 (only if in front 180deg):
-      0   = RIGHT
-      90  = FRONT
-      180 = LEFT
-    """
-    rel = _rel_deg(theta_raw, front_center_abs)  # [-180..180], + is left
-    angle_front_360 = _wrap_deg(rel)             # 0..360 where 0=front
+    rel = _rel_deg(theta_raw, front_center_abs)
+    angle_front_360 = _wrap_deg(rel)  # 0..360 where 0=front
     out = {
         "rel_deg": float(rel),
         "angle_front_360": float(angle_front_360),
         "front_0_180": None,
         "is_front_180": bool(abs(rel) <= FRONT_HALF_DEG),
+        "k3_sector": None,
     }
+    sec = _sector_name(rel)
+    out["k3_sector"] = sec
     if abs(rel) <= FRONT_HALF_DEG:
-        # map rel [-90..+90] -> front_0_180 [0..180] with 90=front
-        # rel=-90 (right) -> 0, rel=0 -> 90, rel=+90 (left) -> 180
-        out["front_0_180"] = float(rel + 90.0)
+        out["front_0_180"] = float(rel + 90.0)  # -90..+90 -> 0..180 (90=front)
     return out
 
 def _build_points_payload(limit: int = 1600) -> Dict[str, Any]:
@@ -471,14 +537,13 @@ def _build_points_payload(limit: int = 1600) -> Dict[str, Any]:
         ang = _front_angles_for_plot(theta, front_abs)
         out.append({
             "theta": theta,
-            "angle": theta,               # compat
+            "angle": theta,
             "dist_m": dist_m,
-            "dist_cm": dist_m * 100.0,    # compat
+            "dist_cm": dist_m * 100.0,
             "q": q,
             "x": x,
             "y": y,
             "ts": t,
-            # new for plotting / debug
             **ang
         })
 
@@ -533,6 +598,12 @@ def api_status():
         lbl = latest_decision_label
         dec = dict(latest_decision_full)
 
+    with _sticky_lock:
+        sticky = _sticky_label
+        sticky_since = _sticky_since
+        clear_start = _sticky_clear_start
+
+    now = time.time()
     return jsonify({
         "running": status["running"],
         "port": status["port"],
@@ -540,9 +611,10 @@ def api_status():
         "bin": status["bin"],
         "points_buffered": pts_n,
         "last_point_ts": ts,
-        "age_s": (time.time() - ts) if ts else None,
+        "age_s": (now - ts) if ts else None,
         "last_error": status["last_error"],
         "pid": proc.pid if proc else None,
+
         "latest_label": lbl,
         "front_center_deg_used": float(_get_front_center_deg()),
         "back_deg_est": float(_last_back_deg) if _last_back_deg is not None else None,
@@ -550,8 +622,23 @@ def api_status():
         "auto_percentile": float(AUTO_CALIB_PERCENTILE),
         "auto_cap_m": float(AUTO_CALIB_NEAR_CAP_M),
         "front_mirror": int(FRONT_MIRROR),
+
+        "k3": {
+            "sector_center_deg": float(SECTOR_CENTER_DEG),
+            "lookahead_m": float(LOOKAHEAD_M),
+            "stop_near_m": float(STOP_NEAR_M),
+        },
+
+        "sticky_turn": {
+            "sticky_label": sticky,
+            "held_for_sec": (now - sticky_since) if sticky else None,
+            "clear_for_sec": (now - clear_start) if clear_start else None,
+            "clear_release_m": float(CLEAR_RELEASE_M),
+            "clear_confirm_sec": float(CLEAR_CONFIRM_SEC),
+            "turn_sticky_min_sec": float(TURN_STICKY_MIN_SEC),
+        },
+
         "decision": dec,
-        "note": "Auto front calib uses nearest-distance percentile (fixes your case: back wall ~0.9m). 0deg is FRONT after calib.",
     })
 
 @app.get("/take_lidar_data")
