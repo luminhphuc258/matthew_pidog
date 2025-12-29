@@ -5,20 +5,20 @@ from smbus2 import SMBus
 from time import sleep, time
 import math
 import statistics as stats
+from collections import deque
 from typing import Optional, Dict, Any, Tuple, List
 
 
 class CollisionDetector:
     """
-    CollisionDetector for SH3001-like IMU (raw I2C registers).
+    Anti-false-positive collision detector (good for walking robots).
 
-    - Only logs/returns event when collision happens
-    - Uses sudden acceleration change (delta-a / jerk) + gyro magnitude as signals
-    - Calibrates auto thresholds while robot is still
+    Key changes vs "too sensitive" version:
+    - Adaptive thresholds using rolling robust stats (median + K * MAD)
+    - Impulse (spike) condition: must rise suddenly across threshold
+    - Require >=2 signals by default: jerk + (dA or gyro)
 
-    NOTE:
-    - Raw units are sensor-dependent. This class is for hunting thresholds.
-    - Later you can convert to g, m/s^2 if you know sensor scale.
+    It only prints/logs when COLLISION happens.
     """
 
     def __init__(
@@ -33,21 +33,26 @@ class CollisionDetector:
         reg_gy: int = 0x09,
         reg_gz: int = 0x0B,
         # sampling
-        dt: float = 0.02,             # 50Hz
+        dt: float = 0.02,           # 50Hz
         calib_s: float = 3.0,
-        cooldown_s: float = 0.8,
-        # sensitivity
-        k_dA: float = 8.0,            # delta-a threshold = mean + k*std
-        k_jerk: float = 8.0,          # jerk threshold = mean + k*std
-        k_gyro: float = 8.0,          # gyro magnitude threshold
-        # minimum thresholds (anti-noise)
-        min_dA_th: float = 30.0,
-        min_jerk_th: float = 1500.0,  # note: jerk is dA/DT, so typical number bigger
-        min_gyro_th: float = 10.0,
-        # event rule
-        require_two_signals: bool = False,  # True = phải có >=2 điều kiện mới crash
+        cooldown_s: float = 1.0,
+        # rolling window for adaptive thresholds
+        win_s: float = 1.0,         # 1.0s window (recommend 0.8~1.5s)
+        # robust K (bigger = less sensitive)
+        k_dA: float = 10.0,
+        k_jerk: float = 10.0,
+        k_gyro: float = 10.0,
+        # minimum thresholds (anti-noise floor)
+        min_dA_th: float = 60.0,
+        min_jerk_th: float = 2500.0,
+        min_gyro_th: float = 25.0,
+        # impulse condition
+        spike_ratio_prev: float = 0.70,  # prev must be < 0.70*TH
+        rearm_ratio: float = 0.45,       # must drop below 0.45*TH to re-arm
+        # decision rule
+        require_two_signals: bool = True,
         print_events: bool = True,
-        name: str = "IMU",
+        name: str = "SH3001",
     ):
         self.bus_id = bus_id
         self.addr = addr
@@ -59,43 +64,55 @@ class CollisionDetector:
         self.REG_GY = reg_gy
         self.REG_GZ = reg_gz
 
-        self.DT = dt
-        self.CALIB_S = calib_s
-        self.COOLDOWN_S = cooldown_s
+        self.DT = float(dt)
+        self.CALIB_S = float(calib_s)
+        self.COOLDOWN_S = float(cooldown_s)
 
-        self.K_dA = k_dA
-        self.K_jerk = k_jerk
-        self.K_gyro = k_gyro
+        self.win_s = float(win_s)
+        self.win_n = max(10, int(self.win_s / max(self.DT, 1e-6)))  # at least 10 samples
 
-        self.MIN_dA_TH = min_dA_th
-        self.MIN_JERK_TH = min_jerk_th
-        self.MIN_GYRO_TH = min_gyro_th
+        self.K_dA = float(k_dA)
+        self.K_jerk = float(k_jerk)
+        self.K_gyro = float(k_gyro)
 
-        self.require_two_signals = require_two_signals
-        self.print_events = print_events
+        self.MIN_dA_TH = float(min_dA_th)
+        self.MIN_JERK_TH = float(min_jerk_th)
+        self.MIN_GYRO_TH = float(min_gyro_th)
+
+        self.spike_ratio_prev = float(spike_ratio_prev)
+        self.rearm_ratio = float(rearm_ratio)
+
+        self.require_two_signals = bool(require_two_signals)
+        self.print_events = bool(print_events)
         self.name = name
 
         self.bus = SMBus(self.bus_id)
 
-        # state
+        # biases
         self.bias_gx = 0.0
         self.bias_gy = 0.0
         self.bias_gz = 0.0
 
-        self.dA_th = self.MIN_dA_TH
-        self.jerk_th = self.MIN_JERK_TH
-        self.gyro_th = self.MIN_GYRO_TH
-
+        # state
         self.last_ax = None
         self.last_ay = None
         self.last_az = None
-        self.last_t = None
+        self.prev_dA = 0.0
+        self.prev_gyro = 0.0
         self.last_event_t = 0.0
+
+        # rolling buffers (adaptive thresholds)
+        self.buf_dA = deque(maxlen=self.win_n)
+        self.buf_jerk = deque(maxlen=self.win_n)
+        self.buf_gyro = deque(maxlen=self.win_n)
+
+        # re-arm flags (avoid retrigger during continuous shaking)
+        self.armed = True
 
         self.ready = False
 
     # --------------------------
-    # Low-level IMU read helpers
+    # Low-level helpers
     # --------------------------
     def _read_word(self, reg: int) -> int:
         hi = self.bus.read_byte_data(self.addr, reg)
@@ -122,104 +139,127 @@ class CollisionDetector:
         return math.sqrt(x * x + y * y + z * z)
 
     @staticmethod
-    def _mean_std(xs: List[float]) -> Tuple[float, float]:
+    def _median(xs: List[float]) -> float:
+        return stats.median(xs) if xs else 0.0
+
+    @staticmethod
+    def _mad(xs: List[float], med: float) -> float:
+        """Median Absolute Deviation."""
         if not xs:
-            return 0.0, 0.0
-        if len(xs) < 2:
-            return xs[0], 0.0
-        return stats.mean(xs), stats.pstdev(xs)
+            return 0.0
+        devs = [abs(x - med) for x in xs]
+        return stats.median(devs) if devs else 0.0
+
+    def _robust_threshold(self, xs: deque, k: float, min_th: float) -> float:
+        """
+        Robust threshold: median + k * (1.4826 * MAD)
+        1.4826 converts MAD to std-like scale under normal noise.
+        """
+        if len(xs) < 8:
+            return float(min_th)
+        arr = list(xs)
+        med = self._median(arr)
+        mad = self._mad(arr, med)
+        sigma = 1.4826 * mad
+        th = med + k * sigma
+        return float(max(min_th, th))
 
     # --------------------------
-    # Calibrate thresholds
+    # Calibration
     # --------------------------
     def calibrate(self) -> None:
         """
-        Keep robot still for CALIB_S seconds.
-        Estimates gyro bias and noise distribution to auto-set thresholds.
+        Keep still to estimate gyro bias.
+        (Thresholds are adaptive later, so we mainly need bias.)
         """
         print(f"[{self.name}] CALIB: keep still {self.CALIB_S:.1f}s (dt={self.DT}s) ...")
 
         t0 = time()
-
         gxs, gys, gzs = [], [], []
-        dA_samples = []
-        jerk_samples = []
-        gyro_mag_samples = []
 
+        # init last accel
         ax0, ay0, az0 = self.read_accel_raw()
-        last_ax, last_ay, last_az = ax0, ay0, az0
+        self.last_ax, self.last_ay, self.last_az = ax0, ay0, az0
+        self.prev_dA = 0.0
+        self.prev_gyro = 0.0
 
         while time() - t0 < self.CALIB_S:
-            ax, ay, az = self.read_accel_raw()
             gx, gy, gz = self.read_gyro_raw()
-
-            gxs.append(gx)
-            gys.append(gy)
-            gzs.append(gz)
-
-            d_ax = ax - last_ax
-            d_ay = ay - last_ay
-            d_az = az - last_az
-            dA = self.mag3(d_ax, d_ay, d_az)
-            dA_samples.append(dA)
-
-            jerk = dA / max(self.DT, 1e-6)
-            jerk_samples.append(jerk)
-
-            gyro_mag_samples.append(self.mag3(gx, gy, gz))
-
-            last_ax, last_ay, last_az = ax, ay, az
+            gxs.append(gx); gys.append(gy); gzs.append(gz)
             sleep(self.DT)
 
         self.bias_gx = stats.mean(gxs) if gxs else 0.0
         self.bias_gy = stats.mean(gys) if gys else 0.0
         self.bias_gz = stats.mean(gzs) if gzs else 0.0
 
-        dA_mu, dA_sd = self._mean_std(dA_samples)
-        jerk_mu, jerk_sd = self._mean_std(jerk_samples)
-        gyro_mu, gyro_sd = self._mean_std(gyro_mag_samples)
+        # Warm-up buffers a bit (so adaptive TH starts stable)
+        self.buf_dA.clear()
+        self.buf_jerk.clear()
+        self.buf_gyro.clear()
 
-        self.dA_th = max(self.MIN_dA_TH, dA_mu + self.K_dA * dA_sd)
-        self.jerk_th = max(self.MIN_JERK_TH, jerk_mu + self.K_jerk * jerk_sd)
-        self.gyro_th = max(self.MIN_GYRO_TH, gyro_mu + self.K_gyro * gyro_sd)
+        for _ in range(self.win_n):
+            ax, ay, az = self.read_accel_raw()
+            gx, gy, gz = self.read_gyro_raw()
+            gx2 = gx - self.bias_gx
+            gy2 = gy - self.bias_gy
+            gz2 = gz - self.bias_gz
 
-        self.last_ax, self.last_ay, self.last_az = self.read_accel_raw()
-        self.last_t = time()
+            d_ax = ax - self.last_ax
+            d_ay = ay - self.last_ay
+            d_az = az - self.last_az
+
+            dA = self.mag3(d_ax, d_ay, d_az)
+            jerk = dA / max(self.DT, 1e-6)
+            gyro_mag = self.mag3(gx2, gy2, gz2)
+
+            self.buf_dA.append(dA)
+            self.buf_jerk.append(jerk)
+            self.buf_gyro.append(gyro_mag)
+
+            self.last_ax, self.last_ay, self.last_az = ax, ay, az
+            self.prev_dA = dA
+            self.prev_gyro = gyro_mag
+            sleep(self.DT)
+
         self.last_event_t = 0.0
+        self.armed = True
         self.ready = True
+
+        # show current estimated thresholds at end of calib
+        th_dA = self._robust_threshold(self.buf_dA, self.K_dA, self.MIN_dA_TH)
+        th_jerk = self._robust_threshold(self.buf_jerk, self.K_jerk, self.MIN_JERK_TH)
+        th_gyro = self._robust_threshold(self.buf_gyro, self.K_gyro, self.MIN_GYRO_TH)
 
         print(f"[{self.name}] CALIB done.")
         print(f"  gyro_bias=({self.bias_gx:.1f},{self.bias_gy:.1f},{self.bias_gz:.1f})")
-        print(f"  TH_dA   ={self.dA_th:.1f}   (mean={dA_mu:.1f}, sd={dA_sd:.1f}, K={self.K_dA})")
-        print(f"  TH_jerk ={self.jerk_th:.1f} (mean={jerk_mu:.1f}, sd={jerk_sd:.1f}, K={self.K_jerk})")
-        print(f"  TH_gyro ={self.gyro_th:.1f} (mean={gyro_mu:.1f}, sd={gyro_sd:.1f}, K={self.K_gyro})")
-        print(f"  rule: require_two_signals={self.require_two_signals}, cooldown={self.COOLDOWN_S}s\n")
+        print(f"  initial adaptive TH: dA={th_dA:.1f}  jerk={th_jerk:.1f}  gyro={th_gyro:.1f}")
+        print(f"  rule: require_two_signals={self.require_two_signals}, cooldown={self.COOLDOWN_S}s, window={self.win_n} samples\n")
 
     # --------------------------
-    # Event detection
+    # Direction label
     # --------------------------
     def _axis_label(self, vx: float, vy: float, vz: float) -> Tuple[str, float]:
-        """
-        Returns dominant axis direction string + dominance ratio.
-        Example: "+X" or "-Y"
-        """
         ax = abs(vx); ay = abs(vy); az = abs(vz)
+        s = ax + ay + az + 1e-9
         m = max(ax, ay, az, 1e-9)
-
         if m == ax:
-            return ("+X" if vx >= 0 else "-X"), ax / (ax + ay + az + 1e-9)
+            return ("+X" if vx >= 0 else "-X"), ax / s
         if m == ay:
-            return ("+Y" if vy >= 0 else "-Y"), ay / (ax + ay + az + 1e-9)
-        return ("+Z" if vz >= 0 else "-Z"), az / (ax + ay + az + 1e-9)
+            return ("+Y" if vy >= 0 else "-Y"), ay / s
+        return ("+Z" if vz >= 0 else "-Z"), az / s
 
+    # --------------------------
+    # Update / detect
+    # --------------------------
     def update(self) -> Optional[Dict[str, Any]]:
         """
-        Read one sample; return event dict when collision happens, else None.
+        Returns event dict only when collision is detected, else None.
         """
         if not self.ready:
-            raise RuntimeError("CollisionDetector not calibrated. Call calibrate() first.")
+            raise RuntimeError("Not calibrated. Call calibrate() first.")
 
         now = time()
+
         ax, ay, az = self.read_accel_raw()
         gx, gy, gz = self.read_gyro_raw()
 
@@ -228,94 +268,103 @@ class CollisionDetector:
         gy2 = gy - self.bias_gy
         gz2 = gz - self.bias_gz
 
-        # delta acceleration (raw)
+        # delta accel
         d_ax = ax - self.last_ax
         d_ay = ay - self.last_ay
         d_az = az - self.last_az
         dA = self.mag3(d_ax, d_ay, d_az)
-
-        # jerk (raw per second)
         jerk = dA / max(self.DT, 1e-6)
-
         gyro_mag = self.mag3(gx2, gy2, gz2)
 
-        # signals
-        sig_dA = (dA >= self.dA_th)
-        sig_jerk = (jerk >= self.jerk_th)
-        sig_gyro = (gyro_mag >= self.gyro_th)
+        # push to buffers (adaptive)
+        self.buf_dA.append(dA)
+        self.buf_jerk.append(jerk)
+        self.buf_gyro.append(gyro_mag)
 
-        # decision
-        sig_count = int(sig_dA) + int(sig_jerk) + int(sig_gyro)
-        crash = (sig_count >= 2) if self.require_two_signals else (sig_count >= 1)
+        # compute adaptive thresholds
+        th_dA = self._robust_threshold(self.buf_dA, self.K_dA, self.MIN_dA_TH)
+        th_jerk = self._robust_threshold(self.buf_jerk, self.K_jerk, self.MIN_JERK_TH)
+        th_gyro = self._robust_threshold(self.buf_gyro, self.K_gyro, self.MIN_GYRO_TH)
+
+        # impulse (spike) gating: must rise across threshold (avoid continuous movement)
+        spike_dA = (dA >= th_dA) and (self.prev_dA < self.spike_ratio_prev * th_dA)
+        spike_gyro = (gyro_mag >= th_gyro) and (self.prev_gyro < self.spike_ratio_prev * th_gyro)
+        spike_jerk = (jerk >= th_jerk)  # jerk already "spiky" by nature
+
+        # signals
+        sig_dA = spike_dA
+        sig_gyro = spike_gyro
+        sig_jerk = spike_jerk
+
+        # re-arm logic: after a trigger, wait until signals drop
+        if not self.armed:
+            if (dA < self.rearm_ratio * th_dA) and (gyro_mag < self.rearm_ratio * th_gyro):
+                self.armed = True
+
+        # decision: prefer jerk + (dA or gyro) to avoid walking noise
+        # If you want even stricter: require jerk + dA + gyro (3 signals)
+        if self.require_two_signals:
+            crash = self.armed and (sig_jerk and (sig_dA or sig_gyro))
+        else:
+            crash = self.armed and (sig_jerk or sig_dA or sig_gyro)
 
         # cooldown
         if crash and (now - self.last_event_t) >= self.COOLDOWN_S:
             axis_dir, dominance = self._axis_label(d_ax, d_ay, d_az)
-            # “force intensity” proxy:
-            # - impact_dA: how strong acceleration changed per sample
-            # - impact_jerk: per second
             event = {
                 "t": now,
-                "axis_dir": axis_dir,               # dominant change direction (+X/-X/+Y/-Y/+Z/-Z)
-                "dominance": dominance,             # 0..1 ratio (how dominant that axis is)
-                "dA_vec": (d_ax, d_ay, d_az),       # raw delta accel vector
-                "impact_dA": float(dA),             # raw magnitude per sample
-                "impact_jerk": float(jerk),         # raw magnitude per second
+                "axis_dir": axis_dir,
+                "dominance": dominance,
+                "dA_vec": (d_ax, d_ay, d_az),
+                "impact_dA": float(dA),
+                "impact_jerk": float(jerk),
                 "gyro_mag": float(gyro_mag),
-                "signals": {
-                    "dA": sig_dA,
-                    "jerk": sig_jerk,
-                    "gyro": sig_gyro,
-                },
-                "thresholds": {
-                    "dA_th": float(self.dA_th),
-                    "jerk_th": float(self.jerk_th),
-                    "gyro_th": float(self.gyro_th),
-                },
+                "signals": {"dA_spike": sig_dA, "jerk": sig_jerk, "gyro_spike": sig_gyro},
+                "thresholds": {"dA_th": float(th_dA), "jerk_th": float(th_jerk), "gyro_th": float(th_gyro)},
             }
 
             self.last_event_t = now
+            self.armed = False  # disarm until re-armed
 
             if self.print_events:
                 sigs = []
-                if sig_dA: sigs.append("dA")
                 if sig_jerk: sigs.append("jerk")
-                if sig_gyro: sigs.append("gyro")
-
+                if sig_dA: sigs.append("dA_spike")
+                if sig_gyro: sigs.append("gyro_spike")
                 print(
                     f"[{self.name}] COLLISION "
-                    f"t={event['t']:.3f}  dir={axis_dir} (dom={dominance:.2f})  "
-                    f"impact_dA={event['impact_dA']:.1f}  impact_jerk={event['impact_jerk']:.1f}  "
-                    f"gyro_mag={event['gyro_mag']:.1f}  signals={'+'.join(sigs)}"
+                    f"t={now:.3f} dir={axis_dir}(dom={dominance:.2f}) "
+                    f"impact_dA={dA:.1f} impact_jerk={jerk:.1f} gyro={gyro_mag:.1f} "
+                    f"TH(dA={th_dA:.1f}, jerk={th_jerk:.1f}, gyro={th_gyro:.1f}) "
+                    f"signals={'+'.join(sigs)}"
                 )
 
-            # update last sample
+            # update state
             self.last_ax, self.last_ay, self.last_az = ax, ay, az
-            self.last_t = now
+            self.prev_dA = dA
+            self.prev_gyro = gyro_mag
             return event
 
-        # update last sample
+        # update state
         self.last_ax, self.last_ay, self.last_az = ax, ay, az
-        self.last_t = now
+        self.prev_dA = dA
+        self.prev_gyro = gyro_mag
         return None
 
     def loop(self) -> None:
-        """
-        Simple loop for testing: only prints when collision occurs.
-        """
         if not self.ready:
             self.calibrate()
 
         while True:
             try:
-                _ = self.update()
+                _ = self.update()  # only logs when collision
             except Exception as e:
                 print(f"[{self.name}] ERROR: {e}")
             sleep(self.DT)
 
 
 # --------------------------
-# Example usage
+# Run directly
 # --------------------------
 if __name__ == "__main__":
     det = CollisionDetector(
@@ -323,15 +372,26 @@ if __name__ == "__main__":
         addr=0x36,
         dt=0.02,
         calib_s=3.0,
-        cooldown_s=0.8,
-        # sensitivity: tune later
-        k_dA=8.0,
-        k_jerk=8.0,
-        k_gyro=8.0,
-        min_dA_th=30.0,
-        min_jerk_th=1500.0,
-        min_gyro_th=10.0,
-        require_two_signals=False,  # True nếu bạn muốn “chắc ăn hơn”
+        cooldown_s=1.0,
+        win_s=1.0,
+
+        # less sensitive when moving:
+        k_dA=10.0,
+        k_jerk=10.0,
+        k_gyro=10.0,
+
+        # raise mins to avoid walking noise:
+        min_dA_th=60.0,
+        min_jerk_th=2500.0,
+        min_gyro_th=25.0,
+
+        # spike gating
+        spike_ratio_prev=0.70,
+        rearm_ratio=0.45,
+
+        # safest rule for moving robot
+        require_two_signals=True,
+
         print_events=True,
         name="SH3001",
     )
