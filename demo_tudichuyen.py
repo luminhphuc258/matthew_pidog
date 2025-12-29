@@ -28,15 +28,6 @@ URL_LIDAR_DATA         = f"{LIDAR_BASE}/take_lidar_data"
 CAM_BASE = os.environ.get("CAM_BASE", "http://127.0.0.1:8000")
 URL_CAMERA_DECISION = f"{CAM_BASE}/take_camera_decision"
 
-# Camera stream for web (small to avoid lag) - CHANGE if needed
-CAM_STREAM_URL = os.environ.get("CAM_STREAM_URL", f"{CAM_BASE}/mjpeg")
-
-# Collision service
-COLL_BASE = "http://127.0.0.1:9411"
-URL_COLLISION_TEXT = f"{COLL_BASE}/colissionstatus?format=text"
-COLL_TIMEOUT = 0.25
-COLL_COOLDOWN = 1.0   # tránh xử lý collision liên tục
-
 # Map web
 MAP_PORT = 5000
 
@@ -51,14 +42,12 @@ CMD_REFRESH_SEC = 0.35
 DBG_PRINT_EVERY_SEC = 1.0
 
 # ====== AVOIDANCE CONFIG ======
-LIDAR_FRONT_CLEAR_CM = float(os.environ.get("LIDAR_FRONT_CLEAR_CM", "80"))
-CAM_OBS_MIN_CONF     = float(os.environ.get("CAM_OBS_MIN_CONF", "0.35"))
-BACK_SEC             = float(os.environ.get("BACK_SEC", "1.0"))
-TURN_OVERRIDE_SEC    = float(os.environ.get("TURN_OVERRIDE_SEC", "1.1"))
-CAM_AVOID_COOLDOWN   = float(os.environ.get("CAM_AVOID_COOLDOWN", "1.0"))
-
-# Collision behavior
-COLLISION_BACK_SEC = 3.0
+# Nếu LiDAR CLEAR nhưng camera thấy obstacle -> STOP + BACK + TURN
+LIDAR_FRONT_CLEAR_CM = float(os.environ.get("LIDAR_FRONT_CLEAR_CM", "80"))  # front >= 80cm coi là khá clear
+CAM_OBS_MIN_CONF     = float(os.environ.get("CAM_OBS_MIN_CONF", "0.35"))     # camera conf tối thiểu để tin
+BACK_SEC             = float(os.environ.get("BACK_SEC", "1.0"))              # lùi lại bao lâu
+TURN_OVERRIDE_SEC    = float(os.environ.get("TURN_OVERRIDE_SEC", "1.1"))     # giữ lệnh rẽ bao lâu
+CAM_AVOID_COOLDOWN   = float(os.environ.get("CAM_AVOID_COOLDOWN", "1.0"))    # chống trigger liên tục
 
 # =========================
 # FACE UDP (optional)
@@ -101,26 +90,6 @@ def http_get_text(url: str, timeout: float = HTTP_TIMEOUT) -> Optional[str]:
         return None
 
 # =========================
-# Collision status (label yes/no)
-# =========================
-def collision_label() -> Tuple[bool, str]:
-    """
-    Returns (connect_ok, label)
-    - label: "yes" or "no"
-    - if any error: (False, "no")
-    """
-    try:
-        txt = http_get_text(URL_COLLISION_TEXT, timeout=COLL_TIMEOUT)
-        if not txt:
-            return False, "no"
-        t = txt.strip().lower()
-        if t == "yes":
-            return True, "yes"
-        return True, "no"
-    except Exception:
-        return False, "no"
-
-# =========================
 # Robot Status Manager
 # =========================
 class RobotState:
@@ -154,6 +123,7 @@ class RobotMotion:
         if not self.dog:
             return
 
+        # 1) rgb_strip.set_mode("breath", color, bps=?)
         try:
             rs = getattr(self.dog, "rgb_strip", None)
             if rs:
@@ -168,6 +138,7 @@ class RobotMotion:
         except Exception:
             pass
 
+        # 2) rgb_strip.set_color / fill / show
         try:
             rs = getattr(self.dog, "rgb_strip", None)
             if rs:
@@ -183,6 +154,7 @@ class RobotMotion:
         except Exception:
             pass
 
+        # 3) rgb_led.set_color / set_rgb
         try:
             rl = getattr(self.dog, "rgb_led", None)
             if rl:
@@ -205,10 +177,12 @@ class RobotMotion:
     def boot_stand(self):
         self.state.set("BOOT")
         self.motion.boot()
+
         try:
             self.motion.execute("STOP")
         except Exception:
             pass
+
         self.set_led("white", bps=0.35)
         self.state.set("STAND")
 
@@ -229,6 +203,7 @@ class RobotMotion:
             pass
 
     def back(self):
+        # thử nhiều label vì tuỳ MotionController bạn dùng
         self.set_led("purple", bps=0.6)
         self.state.set("MOVE", "BACK")
         for cmd in ("BACK", "BACKWARD", "REVERSE"):
@@ -264,8 +239,10 @@ def _to_cm(dist_any: Any) -> Optional[float]:
         return None
     if d <= 0:
         return None
+    # heuristics: m -> cm
     if d < 20.0:
         return d * 100.0
+    # mm-ish -> cm
     if d > 1000.0:
         return d / 10.0
     return d
@@ -411,6 +388,15 @@ def lidar_scan_points() -> Tuple[List[Tuple[float, float]], Optional[dict]]:
 # Camera decision
 # =========================
 def camera_decision() -> Dict[str, Any]:
+    """
+    Expect payload from /take_camera_decision (VisionObstacleFusion):
+    {
+      ok: bool,
+      ts: ...,
+      decision: { has_obstacle, zone, obstacle_type, confidence, source, ... },
+      boxes: [...]
+    }
+    """
     js = http_get_json(URL_CAMERA_DECISION, timeout=0.35)
     if not isinstance(js, dict) or not js.get("ok", False):
         return {"ok": False, "has_obstacle": False, "zone": "NONE", "confidence": 0.0, "obstacle_type": "none"}
@@ -421,6 +407,7 @@ def camera_decision() -> Dict[str, Any]:
 
     has_obs = bool(dec.get("has_obstacle", False))
     zone = str(dec.get("zone", "NONE") or "NONE").upper()
+    conf = 0.0
     try:
         conf = float(dec.get("confidence", 0.0) or 0.0)
     except Exception:
@@ -437,6 +424,11 @@ def camera_decision() -> Dict[str, Any]:
     }
 
 def pick_turn_direction(clearance: Dict[str, float], cam_zone: str) -> str:
+    """
+    Chọn hướng ít vật cản hơn:
+    - dựa trên LiDAR LEFT/RIGHT clearance
+    - tránh phía cam_zone báo có vật cản (penalty)
+    """
     L = float(clearance.get("LEFT", 9999.0) or 9999.0)
     R = float(clearance.get("RIGHT", 9999.0) or 9999.0)
 
@@ -452,6 +444,7 @@ def pick_turn_direction(clearance: Dict[str, float], cam_zone: str) -> str:
         scoreL -= 60.0
         scoreR -= 60.0
 
+    # nếu một bên cực gần thì phạt thêm
     if L < 60: scoreL -= 80
     if R < 60: scoreR -= 80
 
@@ -475,10 +468,6 @@ class MapServer:
         self.last_reason: str = ""
         self.last_pts_n: int = 0
 
-        # collision info
-        self.collision_ok: bool = False
-        self.collision_label: str = "no"
-
         @self.app.get("/map.json")
         def map_json():
             with self.lock:
@@ -488,11 +477,6 @@ class MapServer:
                     "clearance": self.last_clearance,
                     "cmd": self.last_cmd,
                     "robot_state": self.robot_state,
-                    "collision": {
-                        "connect_ok": self.collision_ok,
-                        "label": self.collision_label,
-                        "url": URL_COLLISION_TEXT,
-                    },
                     "dbg": {
                         "pts_n": self.last_pts_n,
                         "lidar_dec_raw": self.last_lidar_dec_raw,
@@ -516,32 +500,24 @@ class MapServer:
   <style>
     body { font-family: Arial, sans-serif; background:#0b0f14; color:#e7eef7; margin:0; }
     .bar { padding:10px 14px; background:#111827; position:sticky; top:0; border-bottom:1px solid #223; }
-    .wrap { display:flex; gap:14px; padding:14px; flex-wrap:wrap; }
+    .wrap { display:flex; gap:14px; padding:14px; }
     canvas { background:#05070a; border:1px solid #223; border-radius:10px; }
     .card { background:#0f172a; border:1px solid #223; border-radius:10px; padding:12px; min-width:340px; }
     .kv { margin:6px 0; }
     .k { color:#93c5fd; }
     .small { font-size: 12px; color:#aab; line-height: 1.35; }
-    .camwrap { background:#0f172a; border:1px solid #223; border-radius:10px; padding:10px; }
-    .camtitle { color:#93c5fd; font-weight:bold; margin:0 0 8px 0; }
-    /* make camera small to reduce lag */
-    #cam { width:320px; height:240px; border-radius:10px; border:1px solid #223; object-fit:cover; background:#05070a; display:block; }
   </style>
 </head>
 <body>
   <div class="bar">
-    <b>2D Lidar Map</b> — refresh 4 fps — URL: http://&lt;pi_ip&gt;:{MAP_PORT}/
+    <b>2D Lidar Map (simple)</b> — refresh 5 fps — URL: http://&lt;pi_ip&gt;:{MAP_PORT}/
   </div>
 
   <div class="wrap">
     <canvas id="cv" width="860" height="560"></canvas>
-
     <div class="card">
       <div class="kv"><span class="k">Robot State:</span> <span id="st">-</span></div>
       <div class="kv"><span class="k">Cmd:</span> <span id="cmd">-</span></div>
-
-      <div class="kv"><span class="k">Collision Connect:</span> <span id="cok">-</span></div>
-      <div class="kv"><span class="k">Collision Label:</span> <span id="clb">-</span></div>
 
       <div class="kv"><span class="k">FRONT:</span> <span id="f">-</span> cm</div>
       <div class="kv"><span class="k">LEFT:</span> <span id="l">-</span> cm</div>
@@ -557,17 +533,8 @@ class MapServer:
       <div class="kv"><span class="k">TS:</span> <span id="ts">-</span></div>
 
       <div class="small" style="margin-top:10px;">
-        Robot ở giữa (center), hướng tiến lên là phía trên.<br/>
+        Tip: Robot ở giữa (center), hướng tiến lên là phía trên.<br/>
         Vòng tròn: 50cm/vòng. Màu đỏ = vật cản gần.
-      </div>
-    </div>
-
-    <div class="camwrap">
-      <div class="camtitle">Live Camera (small)</div>
-      <img id="cam" src="{CAM_STREAM_URL}" />
-      <div class="small" style="margin-top:8px;">
-        Stream: {CAM_STREAM_URL}<br/>
-        Nếu không hiện, đổi CAM_STREAM_URL env.
       </div>
     </div>
   </div>
@@ -635,7 +602,6 @@ function drawPoints(data, ox, oy, pxPerCm, maxCm) {
     const sy = oy - y * pxPerCm;
 
     ctx.fillStyle = pointColorByDistance(d);
-    ctxx = Math.round(sx); Sy = Math.round(sy);
     ctx.fillRect(sx, sy, 2, 2);
   }
 }
@@ -655,10 +621,6 @@ function draw(data) {
   document.getElementById('st').textContent = data.robot_state || '-';
   document.getElementById('cmd').textContent = data.cmd || '-';
   document.getElementById('ts').textContent = String(data.ts || '-');
-
-  const coll = data.collision || {};
-  document.getElementById('cok').textContent = String(coll.connect_ok ?? '-');
-  document.getElementById('clb').textContent = String(coll.label ?? '-');
 
   const c = data.clearance || {};
   document.getElementById('f').textContent = (c.FRONT ?? '-');
@@ -681,16 +643,13 @@ async function tick() {
   } catch(e) {}
 }
 
-// giảm refresh xuống 250ms để nhẹ hơn
-setInterval(tick, 250);
+setInterval(tick, 200);
 tick();
 </script>
 </body>
 </html>
 """
-        html = html.replace("{MAP_PORT}", str(MAP_PORT))
-        html = html.replace("{CAM_STREAM_URL}", CAM_STREAM_URL)
-        return html
+        return html.replace("{MAP_PORT}", str(MAP_PORT))
 
     def update(
         self,
@@ -701,8 +660,6 @@ tick();
         lidar_dec_raw: str = "",
         lidar_dec_norm: str = "",
         reason: str = "",
-        collision_ok: bool = False,
-        collision_label: str = "no",
     ):
         with self.lock:
             self.last_points = points
@@ -714,8 +671,6 @@ tick();
             self.last_lidar_dec_norm = lidar_dec_norm or ""
             self.last_reason = reason or ""
             self.ts = time.time()
-            self.collision_ok = bool(collision_ok)
-            self.collision_label = str(collision_label or "no")
 
     def _port_available(self, port: int) -> bool:
         try:
@@ -764,36 +719,6 @@ def send_cmd_rate_limited(rm: RobotMotion, cmd: str, last_sent_cmd: str, last_se
     return cmd, now
 
 # =========================
-# Collision handler
-# =========================
-def handle_collision(rm: RobotMotion, clr: Dict[str, float], last_turn: str) -> Tuple[str, float, str]:
-    """
-    STOP -> BACK 3s -> STOP -> TURN other direction
-    returns (turn_cmd, override_until, new_last_turn)
-    """
-    rm.stop()
-    time.sleep(0.05)
-
-    rm.back()
-    time.sleep(max(0.2, COLLISION_BACK_SEC))
-
-    rm.stop()
-    time.sleep(0.05)
-
-    # pick turn by clearance, but try to change direction from last_turn
-    left_cm = float(clr.get("LEFT", 9999.0) or 9999.0)
-    right_cm = float(clr.get("RIGHT", 9999.0) or 9999.0)
-
-    preferred = "TURN_LEFT" if left_cm >= right_cm else "TURN_RIGHT"
-
-    # "rẽ hướng khác" => avoid repeating last_turn if possible
-    if last_turn in ("TURN_LEFT", "TURN_RIGHT") and preferred == last_turn:
-        preferred = "TURN_RIGHT" if preferred == "TURN_LEFT" else "TURN_LEFT"
-
-    override_until = time.time() + TURN_OVERRIDE_SEC
-    return preferred, override_until, preferred
-
-# =========================
 # Main
 # =========================
 def main():
@@ -834,78 +759,20 @@ def main():
     turn_override_cmd = "STOP"
     last_cam_avoid_ts = 0.0
 
-    # collision state
-    last_collision_ts = 0.0
-    last_collision_ok = False
-    last_collision_label = "no"
-    last_collision_action_ts = 0.0
-    last_turn_dir = ""   # remember last turn applied (TURN_LEFT / TURN_RIGHT)
-
     print(f"[DEMO] map web: http://<pi_ip>:{MAP_PORT}/", flush=True)
-    print("[DEMO] control mode: Collision -> LiDAR decision + camera override", flush=True)
-    print(f"[DEMO] collision endpoint: {URL_COLLISION_TEXT}", flush=True)
+    print("[DEMO] control mode: LiDAR decision + camera override (/take_camera_decision)", flush=True)
     print(f"[DEMO] camera endpoint: {URL_CAMERA_DECISION}", flush=True)
-    print(f"[DEMO] camera stream: {CAM_STREAM_URL}", flush=True)
 
     try:
         while True:
             now = time.time()
 
-            # --- read lidar points early (used for collision turn choosing too)
             pts, _scan_js = lidar_scan_points()
             clr = lidar_clearance(pts)
-            front_cm = float(clr.get("FRONT", 9999.0) or 9999.0)
 
-            # --- collision check (always first)
-            coll_ok, coll_lb = collision_label()
-            last_collision_ok = coll_ok
-            last_collision_label = coll_lb
-            last_collision_ts = now
-
-            # If collision "yes" -> handle immediately (with cooldown)
-            if (coll_lb == "yes") and ((now - last_collision_action_ts) >= COLL_COOLDOWN):
-                last_collision_action_ts = now
-
-                set_face("angry")
-
-                # stop/back/turn
-                turn_cmd, turn_override_until, last_turn_dir = handle_collision(
-                    rm=rm,
-                    clr=clr,
-                    last_turn=last_turn_dir
-                )
-                turn_override_cmd = turn_cmd
-                last_cmd = turn_cmd
-                reason = f"COLLISION=yes (connect_ok={coll_ok}) -> STOP+BACK({COLLISION_BACK_SEC}s)+{turn_cmd}"
-
-                # send immediately (force)
-                last_sent_cmd, last_sent_ts = send_cmd_rate_limited(
-                    rm=rm, cmd=last_cmd, last_sent_cmd=last_sent_cmd, last_sent_ts=0.0
-                )
-
-                # update map and continue loop
-                map_server.update(
-                    points=pts,
-                    clearance=clr,
-                    cmd=last_cmd,
-                    robot_state=str(state),
-                    lidar_dec_raw="",
-                    lidar_dec_norm="",
-                    reason=reason,
-                    collision_ok=last_collision_ok,
-                    collision_label=last_collision_label,
-                )
-
-                if (now - last_dbg_ts) >= DBG_PRINT_EVERY_SEC:
-                    last_dbg_ts = now
-                    print(f"[DBG] collision_ok={coll_ok} collision_label={coll_lb} -> ACTION {reason}", flush=True)
-
-                time.sleep(dt)
-                continue
-
-            # --- if no collision => then LiDAR + Camera logic
             lidar_dec_raw, lidar_dec_norm = lidar_decision_label_text()
 
+            # If LiDAR not reachable -> STOP
             if not lidar_dec_norm:
                 base_cmd = "STOP"
                 reason = "no_lidar_decision -> STOP"
@@ -913,21 +780,22 @@ def main():
                 base_cmd = lidar_dec_norm
                 reason = "lidar_decision_label"
 
-            # camera decision
+            # camera decision (optional)
             cam = camera_decision()
             cam_has = bool(cam.get("has_obstacle", False))
             cam_zone = str(cam.get("zone", "NONE"))
             cam_conf = float(cam.get("confidence", 0.0) or 0.0)
 
+            front_cm = float(clr.get("FRONT", 9999.0) or 9999.0)
             lidar_clear = (base_cmd == "FORWARD") and (front_cm >= LIDAR_FRONT_CLEAR_CM)
 
-            # 1) override window (from cam avoid / collision turn)
+            # 1) if we are in override window -> keep turning
             if now < turn_override_until:
                 last_cmd = turn_override_cmd
-                reason = f"override_window cmd={turn_override_cmd} | {reason}"
+                reason = f"cam_override_window cmd={turn_override_cmd}"
 
             else:
-                # 2) camera override
+                # 2) if lidar says clear but camera sees obstacle -> STOP + BACK + TURN
                 should_cam_avoid = (
                     lidar_clear
                     and cam.get("ok", False)
@@ -939,9 +807,11 @@ def main():
                 if should_cam_avoid:
                     last_cam_avoid_ts = now
 
+                    # STOP immediately (force)
                     rm.stop()
                     last_sent_cmd, last_sent_ts = "STOP", time.time()
 
+                    # BACK for BACK_SEC (force)
                     rm.back()
                     last_sent_cmd, last_sent_ts = "BACK", time.time()
                     time.sleep(max(0.1, BACK_SEC))
@@ -949,24 +819,26 @@ def main():
                     rm.stop()
                     last_sent_cmd, last_sent_ts = "STOP", time.time()
 
+                    # choose turn direction (least obstacles)
                     turn_cmd = pick_turn_direction(clr, cam_zone)
 
+                    # set override window
                     turn_override_cmd = turn_cmd
                     turn_override_until = time.time() + TURN_OVERRIDE_SEC
 
                     last_cmd = turn_cmd
-                    last_turn_dir = turn_cmd
-
                     reason = f"cam_detected({cam_zone},conf={cam_conf:.2f}) -> STOP+BACK -> {turn_cmd}"
 
-                    set_face("angry")
+                    # optional face feedback
+                    try:
+                        set_face("angry")
+                    except Exception:
+                        pass
 
                 else:
                     # 3) normal follow lidar
                     last_cmd = base_cmd
-                    if last_cmd in ("TURN_LEFT", "TURN_RIGHT"):
-                        last_turn_dir = last_cmd
-
+                    # attach camera info into reason (debug)
                     if cam.get("ok", False):
                         reason = f"{reason} | cam={('OBS' if cam_has else 'clear')} {cam_zone} c={cam_conf:.2f}"
 
@@ -978,7 +850,7 @@ def main():
                 last_sent_ts=last_sent_ts
             )
 
-            # Update map (include collision status)
+            # Update map
             map_server.update(
                 points=pts,
                 clearance=clr,
@@ -986,17 +858,14 @@ def main():
                 robot_state=str(state),
                 lidar_dec_raw=lidar_dec_raw or "",
                 lidar_dec_norm=lidar_dec_norm or "",
-                reason=f"{reason} | collision_ok={last_collision_ok} collision_label={last_collision_label}",
-                collision_ok=last_collision_ok,
-                collision_label=last_collision_label,
+                reason=reason,
             )
 
             # Debug log
             if (now - last_dbg_ts) >= DBG_PRINT_EVERY_SEC:
                 last_dbg_ts = now
                 print(
-                    f"[DBG] collision_ok={coll_ok} collision_label={coll_lb} | "
-                    f"front={front_cm:.1f} L={clr.get('LEFT',9999.0):.1f} R={clr.get('RIGHT',9999.0):.1f} "
+                    f"[DBG] front={front_cm:.1f} L={clr.get('LEFT',9999.0):.1f} R={clr.get('RIGHT',9999.0):.1f} "
                     f"lidar_raw={lidar_dec_raw} -> base={base_cmd} | cmd={last_cmd} | cam_ok={cam.get('ok',False)} "
                     f"cam_obs={cam_has} zone={cam_zone} conf={cam_conf:.2f} | state={state} | reason={reason}",
                     flush=True
