@@ -34,6 +34,9 @@ except Exception:
 from handcommand import HandCommand, HandCfg
 from web_dashboard import WebDashboard
 
+# ✅ NEW: import class fusion vừa tạo
+from vision_obstacle_fusion import VisionObstacleFusion
+
 
 # =========================
 # ROTATION POLICY
@@ -139,9 +142,8 @@ class Camera:
 
 
 # ============================================================
-# OBSTACLE detector
-# - Giữ stripe/hbar rules
-# - THÊM rule Edge density + Motion (so với background EMA)
+# (GIỮ NGUYÊN) ColorStripeObstacleDetector - bạn đang có
+# => mình giữ nguyên class này, nhưng từ giờ camera sẽ dùng Fusion class
 # ============================================================
 class ColorStripeObstacleDetector:
     def __init__(self,
@@ -150,7 +152,6 @@ class ColorStripeObstacleDetector:
                  roi_y1_ratio: float = 0.10,
                  roi_y2_ratio: float = 0.96,
 
-                 # stripe/hbar params (giữ như bạn)
                  min_vstripe_width_ratio: float = 0.08,
                  max_vstripe_width_ratio: float = 0.70,
                  min_hbar_height_ratio: float = 0.06,
@@ -164,12 +165,11 @@ class ColorStripeObstacleDetector:
                  hbar_min_width_ratio: float = 0.86,
                  neighbor_mean_delta_thr: float = 8.0,
 
-                 # ===== NEW: Edge + Motion =====
-                 motion_diff_thr: int = 28,           # pixel diff threshold
-                 motion_ratio_thr: float = 0.22,      # tỉ lệ pixel đổi lớn -> obstacle
-                 edge_ratio_thr: float = 0.055,       # tỉ lệ edges -> obstacle (case hoạ tiết)
-                 bg_alpha: float = 0.05,              # EMA update
-                 exposure_jump_v_thr: float = 18.0,   # nếu sáng thay đổi global mạnh -> skip update/bg
+                 motion_diff_thr: int = 28,
+                 motion_ratio_thr: float = 0.22,
+                 edge_ratio_thr: float = 0.055,
+                 bg_alpha: float = 0.05,
+                 exposure_jump_v_thr: float = 18.0,
                  ):
         self.interval = float(decision_interval_sec)
         self.window_sec = float(window_sec)
@@ -195,7 +195,6 @@ class ColorStripeObstacleDetector:
         self.hbar_min_width_ratio = float(hbar_min_width_ratio)
         self.neighbor_mean_delta_thr = float(neighbor_mean_delta_thr)
 
-        # NEW
         self.motion_diff_thr = int(motion_diff_thr)
         self.motion_ratio_thr = float(motion_ratio_thr)
         self.edge_ratio_thr = float(edge_ratio_thr)
@@ -205,17 +204,13 @@ class ColorStripeObstacleDetector:
         self._lock = threading.Lock()
         self._last_run = 0.0
 
-        # stripe/hbar history
         self._hist: deque = deque(maxlen=250)
-
-        # motion/edge history by zone: (ts, motion_ratio, edge_ratio)
         self._zone_hist = {
             "LEFT": deque(maxlen=250),
             "CENTER": deque(maxlen=250),
             "RIGHT": deque(maxlen=250),
         }
 
-        # background model (gray float32) for ROI small
         self._bg_gray: Optional[np.ndarray] = None
         self._last_global_v: Optional[float] = None
 
@@ -224,7 +219,7 @@ class ColorStripeObstacleDetector:
         self._orientation = "NONE"
         self._ts = 0.0
         self._shape: Optional[Dict[str, int]] = None
-        self._reason: str = ""   # debug: STRIPE / HBAR / MOTION
+        self._reason: str = ""
 
     @staticmethod
     def _zone_from_x(cx: int, w: int) -> str:
@@ -428,10 +423,6 @@ class ColorStripeObstacleDetector:
         return dv >= self.exposure_jump_v_thr
 
     def _update_motion_edge(self, roi_bgr: np.ndarray, now: float):
-        """
-        Compute motion vs background (EMA) + edge density for 3 zones.
-        Lưu hist trong window_sec để quyết định.
-        """
         small, _ = self._prep_small(roi_bgr, target_w=320)
         jump = self._global_exposure_jump(small)
 
@@ -439,24 +430,17 @@ class ColorStripeObstacleDetector:
         if self._bg_gray is None or self._bg_gray.shape != gray.shape:
             self._bg_gray = gray.copy()
 
-        # compute edge ratio using Canny on uint8
         g8 = np.clip(gray, 0, 255).astype(np.uint8)
         edges = cv2.Canny(g8, 60, 160)
         edges01 = (edges > 0).astype(np.float32)
 
         Hs, Ws = gray.shape[:2]
         zW = Ws // 3
-        zones = {
-            "LEFT": (0, zW),
-            "CENTER": (zW, 2 * zW),
-            "RIGHT": (2 * zW, Ws),
-        }
+        zones = {"LEFT": (0, zW), "CENTER": (zW, 2 * zW), "RIGHT": (2 * zW, Ws)}
 
-        # motion vs bg
         diff = np.abs(gray - self._bg_gray)
         motion_mask = (diff >= float(self.motion_diff_thr)).astype(np.float32)
 
-        # Update history per zone
         for zn, (x1, x2) in zones.items():
             m = motion_mask[:, x1:x2]
             e = edges01[:, x1:x2]
@@ -464,23 +448,15 @@ class ColorStripeObstacleDetector:
             edge_ratio = float(np.mean(e)) if e.size else 0.0
             self._zone_hist[zn].append((now, motion_ratio, edge_ratio))
 
-        # Update bg if not exposure jump and scene seems stable (no big motion overall)
-        # (chỉ update khi motion toàn ROI nhỏ)
         if not jump:
             overall_motion = float(np.mean(motion_mask)) if motion_mask.size else 0.0
-            # chỉ update bg khi khá yên (không có vật cản lớn)
             if overall_motion < (self.motion_ratio_thr * 0.55):
                 a = self.bg_alpha
                 self._bg_gray = (1.0 - a) * self._bg_gray + a * gray
 
     def _decide_motion_zone(self, now: float) -> Optional[Tuple[str, float, float]]:
-        """
-        Quyết định obstacle theo rule (Motion + Edge) trong window_sec.
-        Return: (zone, avg_motion, avg_edge) or None
-        """
         tmin = now - self.window_sec
         best = None
-
         for zn, dq in self._zone_hist.items():
             items = [it for it in dq if it[0] >= tmin]
             if len(items) < 6:
@@ -488,18 +464,14 @@ class ColorStripeObstacleDetector:
             good = [it for it in items if (it[1] >= self.motion_ratio_thr and it[2] >= self.edge_ratio_thr)]
             if len(good) / float(len(items)) < self.min_good_ratio_in_window:
                 continue
-
             avg_m = float(np.mean([it[1] for it in items]))
             avg_e = float(np.mean([it[2] for it in items]))
-
-            # chọn zone mạnh nhất theo motion trước, rồi edge
             cand = (zn, avg_m, avg_e)
             if best is None:
                 best = cand
             else:
                 if (cand[1] > best[1]) or (cand[1] == best[1] and cand[2] > best[2]):
                     best = cand
-
         return best
 
     def compute(self, frame_bgr: np.ndarray):
@@ -513,13 +485,10 @@ class ColorStripeObstacleDetector:
         ry2 = int(H * self.ry2)
         ry1 = max(0, min(H - 1, ry1))
         ry2 = max(ry1 + 10, min(H, ry2))
-
         roi = frame_bgr[ry1:ry2, :]
 
-        # update motion/edge first
         self._update_motion_edge(roi, now)
 
-        # detect stripe/hbar
         vok, vrun, vmean = self._find_vertical_stripe(roi)
         vx1 = vx2 = -1
         if vok and vrun:
@@ -530,11 +499,9 @@ class ColorStripeObstacleDetector:
         if hok and hrun:
             hy1, hy2 = hrun[0], hrun[1]
 
-        # store stripe/hbar history
         self._hist.append((now, bool(vok), "VERTICAL", vx1 if vok else -1, vx2 if vok else -1, ry1, ry2, vmean if vok else 0.0))
         self._hist.append((now, bool(hok), "HORIZONTAL", 0 if hok else -1, W if hok else -1, (ry1 + hy1) if hok else -1, (ry1 + hy2) if hok else -1, hmean if hok else 0.0))
 
-        # decide stripe/hbar in window
         tmin = now - self.window_sec
         items = [it for it in list(self._hist) if it[0] >= tmin]
         v_items = [it for it in items if it[2] == "VERTICAL"]
@@ -558,7 +525,6 @@ class ColorStripeObstacleDetector:
         chosen = None
         reason = ""
 
-        # ưu tiên hbar full width
         if best_h and (best_h[4] - best_h[3]) >= int(0.85 * W):
             chosen = best_h
             reason = "HBAR"
@@ -569,11 +535,9 @@ class ColorStripeObstacleDetector:
             chosen = best_h
             reason = "HBAR"
 
-        # nếu stripe/hbar fail -> dùng motion+edge
         motion_pick = self._decide_motion_zone(now)
         if chosen is None and motion_pick is not None:
             zn, avg_m, avg_e = motion_pick
-            # shape là full-height zone stripe
             if zn == "LEFT":
                 x1, x2 = 0, W // 3
             elif zn == "CENTER":
@@ -601,7 +565,6 @@ class ColorStripeObstacleDetector:
             return
 
         _, _, ori, x1, x2, y1, y2, _ = chosen
-
         if ori == "VERTICAL":
             cx = int((x1 + x2) / 2)
             zone = self._zone_from_x(cx, W)
@@ -699,30 +662,22 @@ def _looks_like_black_banner(img: np.ndarray, y1: int, y2: int) -> bool:
         strip = img[y1:y2, :, :]
         if strip.size < 10:
             return False
-        # banner đen: mean thấp + khá đều
         m = float(np.mean(strip))
         return m < 35.0
     except Exception:
         return False
 
 def _fix_double_banner(base_bgr: np.ndarray, drawn_bgr: np.ndarray) -> np.ndarray:
-    """
-    Nếu có banner đen ở TOP và BOTTOM cùng lúc => xoá banner dưới bằng cách restore từ base.
-    """
     if base_bgr is None or drawn_bgr is None:
         return drawn_bgr
-
     h = drawn_bgr.shape[0]
-    band = max(44, int(0.10 * h))  # ~10% height
-
+    band = max(44, int(0.10 * h))
     top_black = _looks_like_black_banner(drawn_bgr, 0, band)
     bot_black = _looks_like_black_banner(drawn_bgr, h - band, h)
-
     if top_black and bot_black:
         out = drawn_bgr.copy()
         out[h - band:h, :, :] = base_bgr[h - band:h, :, :]
         return out
-
     return drawn_bgr
 
 def _draw_hand_old_style(hc: HandCommand, frame_bgr: np.ndarray) -> np.ndarray:
@@ -739,7 +694,6 @@ def _draw_hand_old_style(hc: HandCommand, frame_bgr: np.ndarray) -> np.ndarray:
         except Exception:
             pass
 
-    # fallback text
     out = frame_bgr
     try:
         st = hc.get_status() if hasattr(hc, "get_status") else {}
@@ -780,19 +734,99 @@ def _rot_if_needed(frame: np.ndarray) -> np.ndarray:
     return frame
 
 
+# ✅ NEW: adapter state (để WebDashboard vẫn lấy "obstacle_state" như cũ)
+def _fusion_state_for_dashboard(fusion: VisionObstacleFusion) -> Dict[str, Any]:
+    payload = fusion.get_boxes_payload()
+    now = time.time()
+
+    if not isinstance(payload, dict) or not payload.get("ok", False):
+        return {
+            "label": "no obstacle",
+            "zone": "NONE",
+            "orientation": "NONE",
+            "ts": now,
+            "shape": None,
+            "reason": payload.get("reason", "fusion_not_ready") if isinstance(payload, dict) else "fusion_not_ready",
+            "obstacle_type": "none",
+            "confidence": 0.0,
+            "source": "none",
+            "boxes": [],
+        }
+
+    dec = payload.get("decision", {}) if isinstance(payload.get("decision", {}), dict) else {}
+    boxes = payload.get("boxes", []) if isinstance(payload.get("boxes", []), list) else []
+
+    has_obs = bool(dec.get("has_obstacle", False))
+    zone = str(dec.get("zone", "NONE"))
+    ts = float(payload.get("ts", now))
+
+    # pick best bbox để trả shape (đỡ phá dashboard cũ)
+    best = None
+    best_score = -1.0
+    for b in boxes:
+        try:
+            kind = str(b.get("kind", ""))
+            conf = float(b.get("conf", 0.0))
+            meta = b.get("meta", {}) if isinstance(b.get("meta", {}), dict) else {}
+            iou_d = float(meta.get("iou_danger", 0.0)) if kind == "yolo" else 0.0
+            score = conf + 0.6 * iou_d + (0.1 if kind == "yolo" else 0.05)
+            if score > best_score:
+                best_score = score
+                best = b
+        except Exception:
+            pass
+
+    shape = None
+    if best and isinstance(best.get("bbox", None), list) and len(best["bbox"]) == 4:
+        x1, y1, x2, y2 = map(int, best["bbox"])
+        shape = {"x1": x1, "x2": x2, "y1": y1, "y2": y2}
+
+    reason = "fusion"
+    try:
+        if best:
+            reason = f"fusion_best={best.get('kind','?')}:{best.get('name','?')}"
+    except Exception:
+        pass
+
+    return {
+        "label": "yes have obstacle" if has_obs else "no obstacle",
+        "zone": zone,
+        "orientation": "FUSION",
+        "ts": ts,
+        "shape": shape,
+        "reason": reason,
+        "obstacle_type": str(dec.get("obstacle_type", "none")),
+        "confidence": float(dec.get("confidence", 0.0)),
+        "source": str(dec.get("source", "none")),
+        "boxes": boxes,
+        "danger_bbox": payload.get("danger_bbox", None),
+        "yolo_status": payload.get("yolo_status", {}),
+    }
+
+
 def main():
     cam = Camera(dev="/dev/video0", w=640, h=480, fps=30,
                  snapshot_path=SNAPSHOT_PATH,
                  snapshot_interval_sec=SNAPSHOT_INTERVAL_SEC,
                  snapshot_quality=SNAPSHOT_JPEG_QUALITY)
 
-    detector = ColorStripeObstacleDetector(
-        # bạn có thể tweak thêm nếu muốn
-        motion_diff_thr=28,
-        motion_ratio_thr=0.22,
-        edge_ratio_thr=0.055,
-        bg_alpha=0.05,
-        exposure_jump_v_thr=18.0
+    # ✅ NEW: dùng Fusion class để detect gò + YOLO obstacles
+    ENABLE_YOLO = os.environ.get("ENABLE_YOLO", "1").strip() == "1"
+    YOLO_MODEL = os.environ.get("YOLO_MODEL", "yolov8n.pt")
+    YOLO_DEVICE = os.environ.get("YOLO_DEVICE", "cpu")
+    YOLO_IMGSZ = int(os.environ.get("YOLO_IMGSZ", "416"))
+    YOLO_CONF = float(os.environ.get("YOLO_CONF", "0.35"))
+    YOLO_IOU = float(os.environ.get("YOLO_IOU", "0.45"))
+    YOLO_EVERY_N = int(os.environ.get("YOLO_EVERY_N", "2"))
+
+    fusion = VisionObstacleFusion(
+        enable_yolo=ENABLE_YOLO,
+        yolo_model=YOLO_MODEL,
+        yolo_imgsz=YOLO_IMGSZ,
+        yolo_conf=YOLO_CONF,
+        yolo_iou=YOLO_IOU,
+        device=YOLO_DEVICE,
+        yolo_every_n=YOLO_EVERY_N,
     )
 
     # FIX remap labels:
@@ -833,7 +867,7 @@ def main():
         ),
         on_action=on_action,
         boot_helper=None,
-        get_frame_bgr=get_frame_rotated,   # ✅ feed rotated frame để overlay khớp camera view
+        get_frame_bgr=get_frame_rotated,
         open_own_camera=False,
         clear_memory_on_start=True
     )
@@ -846,19 +880,31 @@ def main():
         if frame is None:
             return None
 
-        detector.compute(frame)
-        out = detector.draw_overlay(frame)
+        # ✅ NEW: update fusion + draw overlay obstacles
+        try:
+            fusion.update(frame)
+        except Exception as e:
+            # không cho crash service
+            print("[FUSION] ERR:", e, flush=True)
+
+        out = frame
+        try:
+            out = fusion.draw_overlay(frame)
+        except Exception:
+            out = frame
 
         # vẽ hand (fix duplicate)
         out = _draw_hand_old_style(hc, out)
         return out
 
-    # IMPORTANT: rotate180=False vì mình rotate ở service rồi (tránh double rotate)
     dash = WebDashboard(
         host="0.0.0.0",
         port=8000,
         get_frame_bgr=get_frame_for_dashboard,
-        get_obstacle_state=lambda: detector.get_state(),
+
+        # ✅ NEW: trả state theo format cũ nhưng dữ liệu lấy từ fusion
+        get_obstacle_state=lambda: _fusion_state_for_dashboard(fusion),
+
         on_manual_cmd=lambda m: print("[MANUAL CMD]", m, flush=True),
         rotate180=False,  # ✅ FIX trùng overlay
         hand_command=hc,
@@ -895,9 +941,11 @@ def main():
     if not _route_exists(app, "/take_camera_decision"):
         @app.get("/take_camera_decision")
         def take_camera_decision():
+            # ✅ NEW: trả decision + boxes (để web vẽ được)
             from flask import jsonify
-            st = detector.get_state()
-            return jsonify({"ok": True, **st})
+            payload = fusion.get_boxes_payload()
+            # payload đã có ok/ts/decision/boxes/danger_bbox...
+            return jsonify(payload if isinstance(payload, dict) else {"ok": False, "reason": "bad_payload"})
 
     print("\n=== Gesture Service + WebDashboard (SINGLE PORT 8000) ===", flush=True)
     print("WebDashboard: http://<pi_ip>:8000", flush=True)
@@ -905,6 +953,7 @@ def main():
     print("Camera API  : http://<pi_ip>:8000/take_camera_decision", flush=True)
     print("Snapshot    :", SNAPSHOT_PATH, flush=True)
     print("Rotate180   :", ROTATE180, flush=True)
+    print("Fusion YOLO :", "ON" if ENABLE_YOLO else "OFF", "| model:", YOLO_MODEL, "| device:", YOLO_DEVICE, flush=True)
 
     try:
         dash.run()
