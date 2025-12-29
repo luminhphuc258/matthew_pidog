@@ -6,10 +6,14 @@ vision_obstacle_fusion.py
 
 Class độc lập để:
 - detect gò/gờ trên sàn bằng OpenCV (FloorBumpDetector)
-- detect chân bàn/cột mảnh (VerticalLegDetector)  ✅ NEW
-- detect vật cản bằng YOLO (Ultralytics)
+- detect chân bàn/cột mảnh (VerticalLegDetector)
+- detect vật cản bằng YOLO (Ultralytics) + SAHI slice inference ✅ NEW
 - fuse kết quả => quyết định obstacle trước mặt + loại vật cản
 - export boxes để file khác vẽ lên camera frame
+
+NOTE (SAHI):
+- Cài SAHI:   pip3 install -U sahi
+- Nếu SAHI không có, code tự fallback về YOLO thường (không crash).
 
 Usage:
 
@@ -19,6 +23,11 @@ fusion = VisionObstacleFusion(
     enable_yolo=True,
     yolo_model="/home/matthewlupi/matthew_pidog/yolov8n.pt",
     device="cpu",
+    yolo_use_sahi=True,
+    sahi_slice_w=320,
+    sahi_slice_h=320,
+    sahi_overlap=0.22,
+    yolo_roi_mode="FLOOR",  # chỉ detect vùng sàn để bắt vật nhỏ + nhẹ hơn
 )
 
 dec = fusion.update(frame_bgr)
@@ -66,7 +75,7 @@ class FusionDecision:
 
 
 # =========================
-# 1) Floor bump detector (OpenCV) - giữ như bạn
+# 1) Floor bump detector (OpenCV)
 # =========================
 class FloorBumpDetector:
     """
@@ -207,23 +216,21 @@ class FloorBumpDetector:
 
 
 # =========================
-# 1.5) Vertical leg / pole detector (OpenCV) ✅ NEW
+# 1.5) Vertical leg / pole detector (OpenCV)
 # =========================
 class VerticalLegDetector:
     """
     Bắt "chân bàn/cột mảnh" (vật thể dọc, hẹp, cao) bằng gradient-x + morphology + contour filter.
-
-    Mục tiêu: trường hợp YOLO không bắt được table/chair nhưng chân bàn rõ trong ảnh.
     """
     def __init__(
         self,
-        roi_y1_ratio: float = 0.25,     # bắt đầu cao hơn để thấy chân bàn (ảnh của bạn chân bàn lên khá cao)
+        roi_y1_ratio: float = 0.25,
         roi_y2_ratio: float = 0.98,
-        min_height_ratio: float = 0.28, # chân bàn phải đủ cao
-        max_width_ratio: float = 0.22,  # chân bàn phải hẹp (so với khung hình)
-        min_area_ratio: float = 0.003,  # lọc noise
-        aspect_min: float = 2.8,        # h/w tối thiểu
-        bottom_touch_ratio: float = 0.16,  # đáy bbox gần đáy ROI (chân bàn chạm sàn)
+        min_height_ratio: float = 0.28,
+        max_width_ratio: float = 0.22,
+        min_area_ratio: float = 0.003,
+        aspect_min: float = 2.8,
+        bottom_touch_ratio: float = 0.16,
         score_trigger: float = 0.55,
         stable_frames: int = 2,
         decay: float = 0.80,
@@ -258,7 +265,6 @@ class VerticalLegDetector:
             return LegHit(False, 0.0, None, "no_frame")
 
         roi, y1f, y2f = self._roi(frame_bgr)
-        H, W = frame_bgr.shape[:2]
         rh, rw = roi.shape[:2]
         if rh < 60 or rw < 120:
             return LegHit(False, float(self._ema), None, "roi_small")
@@ -266,20 +272,15 @@ class VerticalLegDetector:
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        # vertical structures -> gradient theo trục x
         gx = cv2.Sobel(gray, cv2.CV_16S, 1, 0, ksize=3)
         agx = cv2.convertScaleAbs(gx)
 
-        # normalize + Otsu threshold (tự thích nghi ánh sáng)
         agx = cv2.GaussianBlur(agx, (5, 5), 0)
         _, bw = cv2.threshold(agx, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-        # morphology: nối dọc (vertical close)
         vk = max(11, int(rh * 0.10))
         kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (3, vk))
         bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel_v, iterations=1)
-
-        # dày thêm chút để contour ổn định
         bw = cv2.dilate(bw, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 7)), iterations=1)
 
         contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -299,7 +300,6 @@ class VerticalLegDetector:
             if w <= 0 or h <= 0:
                 continue
 
-            # size filters
             hr = h / float(rh)
             wr = w / float(rw)
             ar = (w * h) / float(rw * rh + 1e-6)
@@ -313,16 +313,12 @@ class VerticalLegDetector:
                 continue
             if aspect < self.aspect_min:
                 continue
-
-            # chân bàn thường chạm gần đáy ROI
             if (y + h) < (roi_bottom - bottom_margin):
                 continue
 
-            # edge density trong bbox (để chắc là có “structure”)
             patch = bw[y:y+h, x:x+w]
-            ed = float(np.mean(patch > 0)) if patch.size else 0.0  # 0..1
+            ed = float(np.mean(patch > 0)) if patch.size else 0.0
 
-            # score: ưu tiên cao + hẹp + edge density vừa đủ
             score = 0.55 * min(1.0, hr / 0.55) + 0.25 * min(1.0, ed / 0.55) + 0.20 * (1.0 - min(1.0, wr / 0.25))
             score = float(max(0.0, min(0.99, score)))
 
@@ -351,7 +347,6 @@ class VerticalLegDetector:
         ok = (self._streak >= self.stable_frames) and (self._ema >= self.score_trigger * 0.85)
 
         x1, y1, x2, y2 = best["bbox_roi"]
-        # convert roi->full frame
         bbox_full = (int(x1), int(y1f + y1), int(x2), int(y1f + y2))
 
         self._last_bbox = bbox_full
@@ -360,9 +355,17 @@ class VerticalLegDetector:
 
 
 # =========================
-# 2) YOLO detector (Ultralytics)
+# 2) YOLO detector (Ultralytics) + SAHI slice inference ✅
 # =========================
 class YoloDetector:
+    """
+    - YOLO thường: ultralytics.YOLO().predict
+    - SAHI: get_sliced_prediction (cắt ảnh thành nhiều miếng nhỏ -> bắt small objects tốt hơn)
+
+    Tip hiệu quả nhất cho vật nhỏ trên sàn:
+    - yolo_roi_mode="FLOOR" (chỉ detect vùng dưới ảnh)
+    - SAHI slice 320/384 + overlap ~0.2
+    """
     def __init__(
         self,
         model_path: str,
@@ -370,8 +373,21 @@ class YoloDetector:
         conf: float = 0.35,
         iou: float = 0.45,
         device: str = "cpu",
-        max_det: int = 30,
-        every_n_frames: int = 2
+        max_det: int = 60,
+        every_n_frames: int = 2,
+
+        # SAHI
+        use_sahi: bool = True,
+        sahi_slice_w: int = 320,
+        sahi_slice_h: int = 320,
+        sahi_overlap: float = 0.22,
+        sahi_postprocess: str = "NMS",
+
+        # ROI mode để nhẹ + tăng khả năng bắt vật nhỏ
+        # "FULL" | "FLOOR"
+        roi_mode: str = "FLOOR",
+        roi_y1_ratio: float = 0.42,
+        roi_y2_ratio: float = 0.98,
     ):
         self.model_path = str(model_path)
         self.img_size = int(img_size)
@@ -381,12 +397,100 @@ class YoloDetector:
         self.max_det = int(max_det)
         self.every_n_frames = max(1, int(every_n_frames))
 
+        self.use_sahi = bool(use_sahi)
+        self.sahi_slice_w = int(sahi_slice_w)
+        self.sahi_slice_h = int(sahi_slice_h)
+        self.sahi_overlap = float(sahi_overlap)
+        self.sahi_postprocess = str(sahi_postprocess or "NMS")
+
+        self.roi_mode = str(roi_mode or "FULL").upper()
+        self.roi_y1_ratio = float(roi_y1_ratio)
+        self.roi_y2_ratio = float(roi_y2_ratio)
+
         self._frame_i = 0
         self._last: List[Dict[str, Any]] = []
         self._last_ts = 0.0
 
+        # load YOLO
         from ultralytics import YOLO
         self.model = YOLO(self.model_path)
+
+        # SAHI init (optional)
+        self._sahi_ok = False
+        self._sahi_err = ""
+        self._sahi_model = None
+        self._sahi_get_sliced_prediction = None
+
+        if self.use_sahi:
+            self._init_sahi()
+
+    def _init_sahi(self):
+        """
+        Robust SAHI init:
+        - try AutoDetectionModel.from_pretrained(model_type="yolov8")
+        - fallback to Yolov8DetectionModel
+        """
+        try:
+            from sahi.predict import get_sliced_prediction
+            self._sahi_get_sliced_prediction = get_sliced_prediction
+        except Exception as e:
+            self._sahi_ok = False
+            self._sahi_err = f"import_sahi_predict_err:{e}"
+            return
+
+        detection_model = None
+        last_err = ""
+
+        # Try AutoDetectionModel
+        try:
+            from sahi import AutoDetectionModel
+            # SAHI expects device string like "cpu" or "cuda:0"
+            detection_model = AutoDetectionModel.from_pretrained(
+                model_type="yolov8",
+                model_path=self.model_path,
+                confidence_threshold=float(self.conf),
+                device=str(self.device),
+            )
+        except Exception as e:
+            last_err = f"auto_model_err:{e}"
+            detection_model = None
+
+        # Fallback explicit Yolov8DetectionModel (some SAHI versions)
+        if detection_model is None:
+            try:
+                from sahi.models.yolov8 import Yolov8DetectionModel
+                detection_model = Yolov8DetectionModel(
+                    model_path=self.model_path,
+                    confidence_threshold=float(self.conf),
+                    device=str(self.device),
+                )
+            except Exception as e:
+                last_err = (last_err + " | " if last_err else "") + f"yolov8_model_err:{e}"
+                detection_model = None
+
+        if detection_model is None:
+            self._sahi_ok = False
+            self._sahi_err = last_err or "sahi_model_init_failed"
+            return
+
+        self._sahi_model = detection_model
+        self._sahi_ok = True
+        self._sahi_err = ""
+
+    def _get_roi(self, frame_bgr: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int]]:
+        """
+        return roi_bgr, (x_offset, y_offset) to map bbox back to full frame
+        """
+        if self.roi_mode != "FLOOR":
+            return frame_bgr, (0, 0)
+
+        H, W = frame_bgr.shape[:2]
+        y1 = int(H * self.roi_y1_ratio)
+        y2 = int(H * self.roi_y2_ratio)
+        y1 = max(0, min(H - 2, y1))
+        y2 = max(y1 + 2, min(H, y2))
+        roi = frame_bgr[y1:y2, :]
+        return roi, (0, y1)
 
     def infer(self, frame_bgr: np.ndarray) -> List[Dict[str, Any]]:
         if frame_bgr is None or frame_bgr.size < 10:
@@ -396,52 +500,136 @@ class YoloDetector:
         if (self._frame_i % self.every_n_frames) != 0:
             return self._last
 
-        H, W = frame_bgr.shape[:2]
-        res = self.model.predict(
-            source=frame_bgr,
-            imgsz=self.img_size,
-            conf=self.conf,
-            iou=self.iou,
-            device=self.device,
-            max_det=self.max_det,
-            verbose=False
-        )
+        H0, W0 = frame_bgr.shape[:2]
+        roi_bgr, (ox, oy) = self._get_roi(frame_bgr)
+        Hr, Wr = roi_bgr.shape[:2]
+
+        # If ROI too small => fallback full
+        if Hr < 60 or Wr < 120:
+            roi_bgr = frame_bgr
+            ox, oy = 0, 0
+            Hr, Wr = H0, W0
 
         out: List[Dict[str, Any]] = []
-        if not res:
-            self._last = []
-            return []
 
-        r0 = res[0]
-        names = getattr(r0, "names", None) or getattr(self.model, "names", {})
-
-        boxes = getattr(r0, "boxes", None)
-        if boxes is None:
-            self._last = []
-            return []
-
-        for b in boxes:
+        # ---- SAHI path (best for small objects) ----
+        if self.use_sahi and self._sahi_ok and self._sahi_model is not None and self._sahi_get_sliced_prediction is not None:
             try:
-                xyxy = b.xyxy[0].cpu().numpy().tolist()
-                conf = float(b.conf[0].cpu().numpy())
-                cls = int(b.cls[0].cpu().numpy())
-            except Exception:
-                continue
+                # SAHI often assumes RGB; convert to be safe
+                roi_rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
 
-            x1, y1, x2, y2 = xyxy
-            x1 = max(0, min(W - 1, int(x1)))
-            y1 = max(0, min(H - 1, int(y1)))
-            x2 = max(0, min(W - 1, int(x2)))
-            y2 = max(0, min(H - 1, int(y2)))
-            if x2 <= x1 or y2 <= y1:
-                continue
+                sliced = self._sahi_get_sliced_prediction(
+                    image=roi_rgb,
+                    detection_model=self._sahi_model,
+                    slice_height=int(self.sahi_slice_h),
+                    slice_width=int(self.sahi_slice_w),
+                    overlap_height_ratio=float(self.sahi_overlap),
+                    overlap_width_ratio=float(self.sahi_overlap),
+                    postprocess_type=str(self.sahi_postprocess),
+                    postprocess_match_metric="IOU",
+                    postprocess_match_threshold=float(self.iou),
+                    verbose=False,
+                )
 
-            name = str(names.get(cls, str(cls))) if isinstance(names, dict) else str(cls)
-            out.append({"cls": cls, "name": name, "conf": conf, "bbox": [x1, y1, x2, y2]})
+                obj_list = getattr(sliced, "object_prediction_list", None) or []
+                for obj in obj_list:
+                    try:
+                        # category
+                        cat = getattr(obj, "category", None)
+                        cls_id = int(getattr(cat, "id", -1)) if cat is not None else -1
+                        name = str(getattr(cat, "name", "obj")) if cat is not None else "obj"
 
-        self._last = out
-        self._last_ts = time.time()
-        return out
+                        # score
+                        score = getattr(obj, "score", None)
+                        conf = float(getattr(score, "value", 0.0)) if score is not None else 0.0
+
+                        # bbox in ROI coords
+                        bb = getattr(obj, "bbox", None)
+                        if bb is None:
+                            continue
+                        x1 = int(getattr(bb, "minx", 0))
+                        y1 = int(getattr(bb, "miny", 0))
+                        x2 = int(getattr(bb, "maxx", 0))
+                        y2 = int(getattr(bb, "maxy", 0))
+
+                        # map back to full frame coords
+                        x1f = max(0, min(W0 - 1, x1 + ox))
+                        y1f = max(0, min(H0 - 1, y1 + oy))
+                        x2f = max(0, min(W0 - 1, x2 + ox))
+                        y2f = max(0, min(H0 - 1, y2 + oy))
+                        if x2f <= x1f or y2f <= y1f:
+                            continue
+
+                        out.append({"cls": cls_id, "name": name, "conf": conf, "bbox": [x1f, y1f, x2f, y2f], "via": "sahi"})
+                    except Exception:
+                        continue
+
+                # limit max_det
+                if len(out) > self.max_det:
+                    out.sort(key=lambda d: float(d.get("conf", 0.0)), reverse=True)
+                    out = out[: self.max_det]
+
+                self._last = out
+                self._last_ts = time.time()
+                return out
+
+            except Exception as e:
+                # SAHI fail -> fallback YOLO thường
+                self._sahi_ok = False
+                self._sahi_err = f"sahi_runtime_err:{e}"
+
+        # ---- YOLO normal path ----
+        try:
+            res = self.model.predict(
+                source=roi_bgr,
+                imgsz=self.img_size,
+                conf=self.conf,
+                iou=self.iou,
+                device=self.device,
+                max_det=self.max_det,
+                verbose=False
+            )
+
+            if not res:
+                self._last = []
+                return []
+
+            r0 = res[0]
+            names = getattr(r0, "names", None) or getattr(self.model, "names", {})
+
+            boxes = getattr(r0, "boxes", None)
+            if boxes is None:
+                self._last = []
+                return []
+
+            for b in boxes:
+                try:
+                    xyxy = b.xyxy[0].cpu().numpy().tolist()
+                    conf = float(b.conf[0].cpu().numpy())
+                    cls = int(b.cls[0].cpu().numpy())
+                except Exception:
+                    continue
+
+                x1, y1, x2, y2 = xyxy
+
+                # map ROI coords -> full frame coords
+                x1f = max(0, min(W0 - 1, int(x1 + ox)))
+                y1f = max(0, min(H0 - 1, int(y1 + oy)))
+                x2f = max(0, min(W0 - 1, int(x2 + ox)))
+                y2f = max(0, min(H0 - 1, int(y2 + oy)))
+                if x2f <= x1f or y2f <= y1f:
+                    continue
+
+                name = str(names.get(cls, str(cls))) if isinstance(names, dict) else str(cls)
+                out.append({"cls": cls, "name": name, "conf": conf, "bbox": [x1f, y1f, x2f, y2f], "via": "yolo"})
+
+            self._last = out
+            self._last_ts = time.time()
+            return out
+
+        except Exception:
+            self._last = []
+            return []
 
 
 # =========================
@@ -449,13 +637,10 @@ class YoloDetector:
 # =========================
 class VisionObstacleFusion:
     """
-    Class độc lập:
-      - update(frame_bgr) => quyết định
-      - get_decision() => dict decision
-      - get_boxes_payload() => dict boxes để web/overlay
-      - draw_overlay(frame_bgr) => vẽ debug
-
-    Không tạo webserver, không endpoints.
+    - update(frame_bgr) => quyết định
+    - get_decision()
+    - get_boxes_payload()
+    - draw_overlay()
     """
 
     def __init__(
@@ -463,10 +648,23 @@ class VisionObstacleFusion:
         enable_yolo: bool = True,
         yolo_model: str = "yolov8n.pt",
         yolo_imgsz: int = 416,
-        yolo_conf: float = 0.35,
+        yolo_conf: float = 0.30,     # ↓ chút để bắt vật nhỏ
         yolo_iou: float = 0.45,
         device: str = "cpu",
         yolo_every_n: int = 2,
+
+        # SAHI
+        yolo_use_sahi: bool = True,
+        sahi_slice_w: int = 320,
+        sahi_slice_h: int = 320,
+        sahi_overlap: float = 0.22,
+        sahi_postprocess: str = "NMS",
+
+        # ROI cho YOLO (để nhẹ + tăng pixel cho vật nhỏ)
+        # "FULL" | "FLOOR"
+        yolo_roi_mode: str = "FLOOR",
+        yolo_roi_y1_ratio: float = 0.42,
+        yolo_roi_y2_ratio: float = 0.98,
 
         # ROI nguy hiểm (vật cản trước mặt)
         danger_y1_ratio: float = 0.45,
@@ -474,14 +672,14 @@ class VisionObstacleFusion:
         danger_x1_ratio: float = 0.20,
         danger_x2_ratio: float = 0.80,
 
-        # lọc box nhỏ
-        min_box_area_ratio: float = 0.010,
+        # lọc box nhỏ (để bắt chân bàn: giảm mạnh)
+        min_box_area_ratio: float = 0.0025,   # ✅ nhỏ hơn trước
 
         # bump detector tuning
         bump_roi_y1_ratio: float = 0.58,
         bump_roi_y2_ratio: float = 0.98,
 
-        # leg detector tuning ✅
+        # leg detector tuning
         enable_leg: bool = True,
         leg_roi_y1_ratio: float = 0.25,
         leg_roi_y2_ratio: float = 0.98,
@@ -497,7 +695,6 @@ class VisionObstacleFusion:
         self.dx2 = float(danger_x2_ratio)
         self.min_box_area_ratio = float(min_box_area_ratio)
 
-        # thêm table/chair ưu tiên, vì chân bàn hay đi kèm
         self.prefer_classes = [c.lower() for c in (prefer_classes or ["person", "chair", "table", "bench", "sofa"])]
 
         self.bump = FloorBumpDetector(
@@ -521,7 +718,13 @@ class VisionObstacleFusion:
                 self.leg_status["err"] = str(e)
 
         self.yolo: Optional[YoloDetector] = None
-        self.yolo_status: Dict[str, Any] = {"enabled": bool(enable_yolo), "ok": False, "err": ""}
+        self.yolo_status: Dict[str, Any] = {
+            "enabled": bool(enable_yolo),
+            "ok": False,
+            "err": "",
+            "sahi": {"enabled": bool(yolo_use_sahi), "ok": False, "err": ""},
+            "roi_mode": str(yolo_roi_mode).upper(),
+        }
 
         if enable_yolo:
             try:
@@ -531,9 +734,24 @@ class VisionObstacleFusion:
                     conf=yolo_conf,
                     iou=yolo_iou,
                     device=device,
-                    every_n_frames=yolo_every_n
+                    max_det=60,
+                    every_n_frames=yolo_every_n,
+
+                    use_sahi=yolo_use_sahi,
+                    sahi_slice_w=sahi_slice_w,
+                    sahi_slice_h=sahi_slice_h,
+                    sahi_overlap=sahi_overlap,
+                    sahi_postprocess=sahi_postprocess,
+
+                    roi_mode=yolo_roi_mode,
+                    roi_y1_ratio=yolo_roi_y1_ratio,
+                    roi_y2_ratio=yolo_roi_y2_ratio,
                 )
                 self.yolo_status["ok"] = True
+                # SAHI status
+                if self.yolo is not None:
+                    self.yolo_status["sahi"]["ok"] = bool(getattr(self.yolo, "_sahi_ok", False))
+                    self.yolo_status["sahi"]["err"] = str(getattr(self.yolo, "_sahi_err", "") or "")
             except Exception as e:
                 self.yolo = None
                 self.yolo_status["ok"] = False
@@ -613,6 +831,9 @@ class VisionObstacleFusion:
         if self.yolo is not None:
             try:
                 dets = self.yolo.infer(frame_bgr)
+                # update SAHI status live
+                self.yolo_status["sahi"]["ok"] = bool(getattr(self.yolo, "_sahi_ok", False))
+                self.yolo_status["sahi"]["err"] = str(getattr(self.yolo, "_sahi_err", "") or "")
             except Exception as e:
                 dets = []
                 yolo_err = str(e)
@@ -623,19 +844,21 @@ class VisionObstacleFusion:
         for d in dets:
             conf = float(d.get("conf", 0.0))
             x1, y1, x2, y2 = map(int, d.get("bbox", [0, 0, 0, 0]))
-            if conf < 0.0:
-                continue
+
             area = max(0, (x2 - x1) * (y2 - y1))
             if (W * H) > 0 and (area / float(W * H)) < self.min_box_area_ratio:
                 continue
 
             iou = self._iou_rect([x1, y1, x2, y2], danger)
-            if iou <= 0.02:
+            if iou <= 0.015:
                 continue
 
             name = str(d.get("name", "obj"))
             bonus = 0.15 if (name.lower() in self.prefer_classes) else 0.0
-            score = conf + 0.8 * iou + bonus
+            via = str(d.get("via", "yolo"))
+            bonus2 = 0.06 if via == "sahi" else 0.0  # ưu tiên nhẹ cho SAHI khi cạnh tranh
+            score = conf + 0.85 * iou + bonus + bonus2
+
             if score > best_score:
                 best_score = score
                 best_yolo = {**d, "iou_danger": float(iou), "score": float(score)}
@@ -649,7 +872,7 @@ class VisionObstacleFusion:
                 leg_ok = True
                 leg_zone = self._zone_from_cx(0.5 * (lx1 + lx2), W)
 
-        # bump meaningful (giữ logic cũ)
+        # bump meaningful
         bump_ok = False
         bump_zone = "CENTER"
         if bump_hit.ok and bump_hit.band_bbox:
@@ -660,12 +883,12 @@ class VisionObstacleFusion:
                 bump_ok = (bump_zone == "CENTER")
 
         # ---------------- fusion decision ----------------
-        # Ưu tiên: YOLO (nếu có) > LEG > BUMP
+        # Ưu tiên: YOLO (SAHI) > LEG > BUMP
         if best_yolo is not None:
             typ = str(best_yolo.get("name", "object"))
             conf = float(best_yolo.get("conf", 0.0))
             zone = self._zone_from_cx(0.5 * (best_yolo["bbox"][0] + best_yolo["bbox"][2]), W)
-            src = "yolo"
+            src = "yolo_sahi" if str(best_yolo.get("via", "")) == "sahi" else "yolo"
             dec = FusionDecision(
                 True, typ, conf, zone, src,
                 {"danger": {"bbox": danger},
@@ -675,7 +898,6 @@ class VisionObstacleFusion:
             )
 
         elif leg_ok:
-            # chân bàn/cột mảnh
             conf = float(min(0.99, max(0.50, leg_hit.score)))
             dec = FusionDecision(
                 True, "table_leg", conf, leg_zone, "leg",
@@ -706,9 +928,6 @@ class VisionObstacleFusion:
         # ---------------- build boxes payload ----------------
         boxes: List[Dict[str, Any]] = []
 
-        # danger ROI
-        # (để file khác vẽ)
-        # bump box
         if bump_hit.band_bbox:
             bx1, by1, bx2, by2 = bump_hit.band_bbox
             boxes.append({
@@ -720,7 +939,6 @@ class VisionObstacleFusion:
                 "meta": {"reason": bump_hit.reason, "ok": bool(bump_hit.ok), "score": float(bump_hit.score)}
             })
 
-        # leg box ✅
         if leg_hit.bbox:
             lx1, ly1, lx2, ly2 = leg_hit.bbox
             boxes.append({
@@ -732,7 +950,6 @@ class VisionObstacleFusion:
                 "meta": {"reason": leg_hit.reason, "ok": bool(leg_hit.ok), "score": float(leg_hit.score)}
             })
 
-        # yolo boxes
         for d in dets:
             conf = float(d.get("conf", 0.0))
             if conf < 1e-6:
@@ -750,7 +967,7 @@ class VisionObstacleFusion:
                 "conf": float(conf),
                 "bbox": [x1, y1, x2, y2],
                 "zone": self._zone_from_cx(0.5 * (x1 + x2), W),
-                "meta": {"iou_danger": float(iou), "cls": int(d.get("cls", -1))}
+                "meta": {"iou_danger": float(iou), "cls": int(d.get("cls", -1)), "via": str(d.get("via", "yolo"))}
             })
 
         payload = {
@@ -802,7 +1019,6 @@ class VisionObstacleFusion:
         if not payload.get("ok", False):
             return out
 
-        # draw danger ROI
         danger = payload.get("danger_bbox", None)
         if isinstance(danger, list) and len(danger) == 4:
             x1, y1, x2, y2 = map(int, danger)
@@ -820,11 +1036,16 @@ class VisionObstacleFusion:
                         continue
 
                     # colors:
-                    # yolo: green
+                    # yolo: green (SAHI brighter)
                     # bump: yellow
                     # leg: cyan
                     if kind == "yolo":
-                        color = (0, 255, 0)
+                        via = ""
+                        try:
+                            via = str((b.get("meta", {}) or {}).get("via", ""))
+                        except Exception:
+                            via = ""
+                        color = (0, 255, 80) if via == "sahi" else (0, 255, 0)
                     elif kind == "bump":
                         color = (0, 255, 255)
                     elif kind == "leg":
@@ -833,7 +1054,17 @@ class VisionObstacleFusion:
                         color = (255, 255, 255)
 
                     cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(out, f"{name} {conf:.2f}", (x1, max(20, y1 - 8)),
+
+                    tag = name
+                    if kind == "yolo":
+                        try:
+                            via = str((b.get("meta", {}) or {}).get("via", ""))
+                            if via:
+                                tag = f"{name}({via})"
+                        except Exception:
+                            pass
+
+                    cv2.putText(out, f"{tag} {conf:.2f}", (x1, max(20, y1 - 8)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
                 except Exception:
                     pass
