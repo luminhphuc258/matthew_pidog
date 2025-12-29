@@ -5,7 +5,6 @@ import os
 import time
 import threading
 import socket
-import math
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Any
 
@@ -25,6 +24,10 @@ URL_LIDAR_STATUS       = f"{LIDAR_BASE}/api/status"
 URL_LIDAR_DECISION_TXT = f"{LIDAR_BASE}/api/decision_label"
 URL_LIDAR_DATA         = f"{LIDAR_BASE}/take_lidar_data"
 
+# Camera decision server (Gesture/WebDashboard port 8000)
+CAM_BASE = os.environ.get("CAM_BASE", "http://127.0.0.1:8000")
+URL_CAMERA_DECISION = f"{CAM_BASE}/take_camera_decision"
+
 # Map web
 MAP_PORT = 5000
 
@@ -37,6 +40,14 @@ CMD_REFRESH_SEC = 0.35
 
 # Debug
 DBG_PRINT_EVERY_SEC = 1.0
+
+# ====== AVOIDANCE CONFIG ======
+# Nếu LiDAR CLEAR nhưng camera thấy obstacle -> STOP + BACK + TURN
+LIDAR_FRONT_CLEAR_CM = float(os.environ.get("LIDAR_FRONT_CLEAR_CM", "80"))  # front >= 80cm coi là khá clear
+CAM_OBS_MIN_CONF     = float(os.environ.get("CAM_OBS_MIN_CONF", "0.35"))     # camera conf tối thiểu để tin
+BACK_SEC             = float(os.environ.get("BACK_SEC", "1.0"))              # lùi lại bao lâu
+TURN_OVERRIDE_SEC    = float(os.environ.get("TURN_OVERRIDE_SEC", "1.1"))     # giữ lệnh rẽ bao lâu
+CAM_AVOID_COOLDOWN   = float(os.environ.get("CAM_AVOID_COOLDOWN", "1.0"))    # chống trigger liên tục
 
 # =========================
 # FACE UDP (optional)
@@ -100,7 +111,7 @@ class RobotState:
 # =========================
 class RobotMotion:
     """
-    Supports STOP / FORWARD / TURN_LEFT / TURN_RIGHT
+    Supports STOP / FORWARD / BACK / TURN_LEFT / TURN_RIGHT
     LED: try multiple API variants to avoid "no light" issue.
     """
     def __init__(self, motion: MotionController, state: RobotState):
@@ -167,13 +178,11 @@ class RobotMotion:
         self.state.set("BOOT")
         self.motion.boot()
 
-        # đảm bảo về STOP trước
         try:
             self.motion.execute("STOP")
         except Exception:
             pass
 
-        # LED + state
         self.set_led("white", bps=0.35)
         self.state.set("STAND")
 
@@ -192,6 +201,17 @@ class RobotMotion:
             self.motion.execute("FORWARD")
         except Exception:
             pass
+
+    def back(self):
+        # thử nhiều label vì tuỳ MotionController bạn dùng
+        self.set_led("purple", bps=0.6)
+        self.state.set("MOVE", "BACK")
+        for cmd in ("BACK", "BACKWARD", "REVERSE"):
+            try:
+                self.motion.execute(cmd)
+                return
+            except Exception:
+                continue
 
     def turn_left(self):
         self.set_led("yellow", bps=0.6)
@@ -363,6 +383,72 @@ def lidar_scan_points() -> Tuple[List[Tuple[float, float]], Optional[dict]]:
         return [], None
     pts = _extract_points(js)
     return pts, js
+
+# =========================
+# Camera decision
+# =========================
+def camera_decision() -> Dict[str, Any]:
+    """
+    Expect payload from /take_camera_decision (VisionObstacleFusion):
+    {
+      ok: bool,
+      ts: ...,
+      decision: { has_obstacle, zone, obstacle_type, confidence, source, ... },
+      boxes: [...]
+    }
+    """
+    js = http_get_json(URL_CAMERA_DECISION, timeout=0.35)
+    if not isinstance(js, dict) or not js.get("ok", False):
+        return {"ok": False, "has_obstacle": False, "zone": "NONE", "confidence": 0.0, "obstacle_type": "none"}
+
+    dec = js.get("decision", {})
+    if not isinstance(dec, dict):
+        dec = {}
+
+    has_obs = bool(dec.get("has_obstacle", False))
+    zone = str(dec.get("zone", "NONE") or "NONE").upper()
+    conf = 0.0
+    try:
+        conf = float(dec.get("confidence", 0.0) or 0.0)
+    except Exception:
+        conf = 0.0
+
+    return {
+        "ok": True,
+        "has_obstacle": has_obs,
+        "zone": zone,
+        "confidence": conf,
+        "obstacle_type": str(dec.get("obstacle_type", "none")),
+        "source": str(dec.get("source", "camera")),
+        "raw": js,
+    }
+
+def pick_turn_direction(clearance: Dict[str, float], cam_zone: str) -> str:
+    """
+    Chọn hướng ít vật cản hơn:
+    - dựa trên LiDAR LEFT/RIGHT clearance
+    - tránh phía cam_zone báo có vật cản (penalty)
+    """
+    L = float(clearance.get("LEFT", 9999.0) or 9999.0)
+    R = float(clearance.get("RIGHT", 9999.0) or 9999.0)
+
+    scoreL = L
+    scoreR = R
+
+    z = (cam_zone or "NONE").upper()
+    if z == "LEFT":
+        scoreL -= 120.0
+    elif z == "RIGHT":
+        scoreR -= 120.0
+    elif z == "CENTER":
+        scoreL -= 60.0
+        scoreR -= 60.0
+
+    # nếu một bên cực gần thì phạt thêm
+    if L < 60: scoreL -= 80
+    if R < 60: scoreR -= 80
+
+    return "TURN_LEFT" if scoreL >= scoreR else "TURN_RIGHT"
 
 # =========================
 # Map Web (debug only)
@@ -625,6 +711,8 @@ def send_cmd_rate_limited(rm: RobotMotion, cmd: str, last_sent_cmd: str, last_se
         rm.turn_left()
     elif cmd == "TURN_RIGHT":
         rm.turn_right()
+    elif cmd == "BACK":
+        rm.back()
     else:
         rm.stop()
 
@@ -666,11 +754,19 @@ def main():
     last_sent_ts = 0.0
     last_dbg_ts = 0.0
 
+    # avoidance state
+    turn_override_until = 0.0
+    turn_override_cmd = "STOP"
+    last_cam_avoid_ts = 0.0
+
     print(f"[DEMO] map web: http://<pi_ip>:{MAP_PORT}/", flush=True)
-    print("[DEMO] control mode: ONLY FOLLOW LiDAR /api/decision_label (no camera, no self-decision)", flush=True)
+    print("[DEMO] control mode: LiDAR decision + camera override (/take_camera_decision)", flush=True)
+    print(f"[DEMO] camera endpoint: {URL_CAMERA_DECISION}", flush=True)
 
     try:
         while True:
+            now = time.time()
+
             pts, _scan_js = lidar_scan_points()
             clr = lidar_clearance(pts)
 
@@ -678,11 +774,73 @@ def main():
 
             # If LiDAR not reachable -> STOP
             if not lidar_dec_norm:
-                last_cmd = "STOP"
+                base_cmd = "STOP"
                 reason = "no_lidar_decision -> STOP"
             else:
-                last_cmd = lidar_dec_norm
+                base_cmd = lidar_dec_norm
                 reason = "lidar_decision_label"
+
+            # camera decision (optional)
+            cam = camera_decision()
+            cam_has = bool(cam.get("has_obstacle", False))
+            cam_zone = str(cam.get("zone", "NONE"))
+            cam_conf = float(cam.get("confidence", 0.0) or 0.0)
+
+            front_cm = float(clr.get("FRONT", 9999.0) or 9999.0)
+            lidar_clear = (base_cmd == "FORWARD") and (front_cm >= LIDAR_FRONT_CLEAR_CM)
+
+            # 1) if we are in override window -> keep turning
+            if now < turn_override_until:
+                last_cmd = turn_override_cmd
+                reason = f"cam_override_window cmd={turn_override_cmd}"
+
+            else:
+                # 2) if lidar says clear but camera sees obstacle -> STOP + BACK + TURN
+                should_cam_avoid = (
+                    lidar_clear
+                    and cam.get("ok", False)
+                    and cam_has
+                    and (cam_conf >= CAM_OBS_MIN_CONF)
+                    and ((now - last_cam_avoid_ts) >= CAM_AVOID_COOLDOWN)
+                )
+
+                if should_cam_avoid:
+                    last_cam_avoid_ts = now
+
+                    # STOP immediately (force)
+                    rm.stop()
+                    last_sent_cmd, last_sent_ts = "STOP", time.time()
+
+                    # BACK for BACK_SEC (force)
+                    rm.back()
+                    last_sent_cmd, last_sent_ts = "BACK", time.time()
+                    time.sleep(max(0.1, BACK_SEC))
+
+                    rm.stop()
+                    last_sent_cmd, last_sent_ts = "STOP", time.time()
+
+                    # choose turn direction (least obstacles)
+                    turn_cmd = pick_turn_direction(clr, cam_zone)
+
+                    # set override window
+                    turn_override_cmd = turn_cmd
+                    turn_override_until = time.time() + TURN_OVERRIDE_SEC
+
+                    last_cmd = turn_cmd
+                    reason = f"cam_detected({cam_zone},conf={cam_conf:.2f}) -> STOP+BACK -> {turn_cmd}"
+
+                    # optional face feedback
+                    try:
+                        set_face("angry")
+                    except Exception:
+                        pass
+
+                else:
+                    # 3) normal follow lidar
+                    last_cmd = base_cmd
+                    # attach camera info into reason (debug)
+                    if cam.get("ok", False):
+                        reason = f"{reason} | cam={('OBS' if cam_has else 'clear')} {cam_zone} c={cam_conf:.2f}"
 
             # Send cmd (rate-limited)
             last_sent_cmd, last_sent_ts = send_cmd_rate_limited(
@@ -704,13 +862,12 @@ def main():
             )
 
             # Debug log
-            now = time.time()
             if (now - last_dbg_ts) >= DBG_PRINT_EVERY_SEC:
                 last_dbg_ts = now
-                front_cm = float(clr.get("FRONT", 9999.0) or 9999.0)
                 print(
                     f"[DBG] front={front_cm:.1f} L={clr.get('LEFT',9999.0):.1f} R={clr.get('RIGHT',9999.0):.1f} "
-                    f"lidar_raw={lidar_dec_raw} -> cmd={last_cmd} | state={state}",
+                    f"lidar_raw={lidar_dec_raw} -> base={base_cmd} | cmd={last_cmd} | cam_ok={cam.get('ok',False)} "
+                    f"cam_obs={cam_has} zone={cam_zone} conf={cam_conf:.2f} | state={state} | reason={reason}",
                     flush=True
                 )
 
