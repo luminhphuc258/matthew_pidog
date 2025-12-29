@@ -6,33 +6,24 @@ vision_obstacle_fusion.py
 
 Class độc lập để:
 - detect gò/gờ trên sàn bằng OpenCV (FloorBumpDetector)
+- detect chân bàn/cột mảnh (VerticalLegDetector)  ✅ NEW
 - detect vật cản bằng YOLO (Ultralytics)
 - fuse kết quả => quyết định obstacle trước mặt + loại vật cản
 - export boxes để file khác vẽ lên camera frame
 
-Usage (ở file khác):
+Usage:
 
 from vision_obstacle_fusion import VisionObstacleFusion
 
 fusion = VisionObstacleFusion(
     enable_yolo=True,
-    yolo_model="/home/matthew/yolo_models/yolov8n.pt",
+    yolo_model="/home/matthewlupi/matthew_pidog/yolov8n.pt",
     device="cpu",
 )
 
-while True:
-    frame = cam.get_frame()  # BGR
-    dec = fusion.update(frame)
-
-    # quyết định
-    if dec["has_obstacle"]:
-        print(dec["obstacle_type"], dec["confidence"], dec["zone"], dec["source"])
-
-    # boxes (để web/canvas vẽ)
-    boxes = fusion.get_boxes_payload()
-
-    # debug overlay
-    out = fusion.draw_overlay(frame)
+dec = fusion.update(frame_bgr)
+out = fusion.draw_overlay(frame_bgr)
+payload = fusion.get_boxes_payload()
 """
 
 import time
@@ -57,6 +48,14 @@ class BumpHit:
 
 
 @dataclass
+class LegHit:
+    ok: bool
+    score: float
+    bbox: Optional[Tuple[int, int, int, int]]       # (x1,y1,x2,y2) full-frame bbox
+    reason: str
+
+
+@dataclass
 class FusionDecision:
     has_obstacle: bool
     obstacle_type: str
@@ -67,12 +66,11 @@ class FusionDecision:
 
 
 # =========================
-# 1) Floor bump detector (OpenCV)
+# 1) Floor bump detector (OpenCV) - giữ như bạn
 # =========================
 class FloorBumpDetector:
     """
-    Detect gò/gờ trên sàn bằng cách tìm "dải line ngang" trong ROI dưới (Canny + HoughLinesP).
-    Có streak + ema score để giảm false positive.
+    Detect gò/gờ trên sàn bằng cách tìm dải line ngang trong ROI dưới (Canny + HoughLinesP).
     """
     def __init__(
         self,
@@ -153,7 +151,6 @@ class FloorBumpDetector:
             self._streak = max(0, self._streak - 1)
             return BumpHit(False, float(self._ema_score), None, "no_horizontal")
 
-        # merge lines into bands by y
         horiz.sort(key=lambda t: (t[1] + t[3]) // 2)
         bands = []  # [ymin,ymax,xmin,xmax,count]
         for (x1l, y1l, x2l, y2l) in horiz:
@@ -203,11 +200,163 @@ class FloorBumpDetector:
 
         hit_ok = (self._streak >= self.stable_frames) and (self._ema_score >= self.score_trigger * 0.85)
 
-        # full-frame bbox
         x1f = int(bx0); x2f = int(bx1)
         y1f = int(y1 + by0); y2f = int(y1 + by1)
         reason = f"band(thick={thickness}px cnt={cnt} wr={wr:.2f}) ema={self._ema_score:.2f} streak={self._streak}"
         return BumpHit(bool(hit_ok), float(self._ema_score), (x1f, y1f, x2f, y2f), reason)
+
+
+# =========================
+# 1.5) Vertical leg / pole detector (OpenCV) ✅ NEW
+# =========================
+class VerticalLegDetector:
+    """
+    Bắt "chân bàn/cột mảnh" (vật thể dọc, hẹp, cao) bằng gradient-x + morphology + contour filter.
+
+    Mục tiêu: trường hợp YOLO không bắt được table/chair nhưng chân bàn rõ trong ảnh.
+    """
+    def __init__(
+        self,
+        roi_y1_ratio: float = 0.25,     # bắt đầu cao hơn để thấy chân bàn (ảnh của bạn chân bàn lên khá cao)
+        roi_y2_ratio: float = 0.98,
+        min_height_ratio: float = 0.28, # chân bàn phải đủ cao
+        max_width_ratio: float = 0.22,  # chân bàn phải hẹp (so với khung hình)
+        min_area_ratio: float = 0.003,  # lọc noise
+        aspect_min: float = 2.8,        # h/w tối thiểu
+        bottom_touch_ratio: float = 0.16,  # đáy bbox gần đáy ROI (chân bàn chạm sàn)
+        score_trigger: float = 0.55,
+        stable_frames: int = 2,
+        decay: float = 0.80,
+    ):
+        self.ry1 = float(roi_y1_ratio)
+        self.ry2 = float(roi_y2_ratio)
+        self.min_h = float(min_height_ratio)
+        self.max_w = float(max_width_ratio)
+        self.min_area = float(min_area_ratio)
+        self.aspect_min = float(aspect_min)
+        self.bottom_touch_ratio = float(bottom_touch_ratio)
+
+        self.score_trigger = float(score_trigger)
+        self.stable_frames = int(stable_frames)
+        self.decay = float(decay)
+
+        self._ema = 0.0
+        self._streak = 0
+        self._last_bbox = None
+        self._last_reason = "init"
+
+    def _roi(self, frame: np.ndarray) -> Tuple[np.ndarray, int, int]:
+        H, W = frame.shape[:2]
+        y1 = int(H * self.ry1)
+        y2 = int(H * self.ry2)
+        y1 = max(0, min(H - 2, y1))
+        y2 = max(y1 + 2, min(H, y2))
+        return frame[y1:y2, :], y1, y2
+
+    def detect(self, frame_bgr: np.ndarray) -> LegHit:
+        if frame_bgr is None or frame_bgr.size < 10:
+            return LegHit(False, 0.0, None, "no_frame")
+
+        roi, y1f, y2f = self._roi(frame_bgr)
+        H, W = frame_bgr.shape[:2]
+        rh, rw = roi.shape[:2]
+        if rh < 60 or rw < 120:
+            return LegHit(False, float(self._ema), None, "roi_small")
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        # vertical structures -> gradient theo trục x
+        gx = cv2.Sobel(gray, cv2.CV_16S, 1, 0, ksize=3)
+        agx = cv2.convertScaleAbs(gx)
+
+        # normalize + Otsu threshold (tự thích nghi ánh sáng)
+        agx = cv2.GaussianBlur(agx, (5, 5), 0)
+        _, bw = cv2.threshold(agx, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # morphology: nối dọc (vertical close)
+        vk = max(11, int(rh * 0.10))
+        kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (3, vk))
+        bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel_v, iterations=1)
+
+        # dày thêm chút để contour ổn định
+        bw = cv2.dilate(bw, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 7)), iterations=1)
+
+        contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            self._ema *= self.decay
+            self._streak = max(0, self._streak - 1)
+            self._last_bbox = None
+            self._last_reason = "no_contours"
+            return LegHit(False, float(self._ema), None, self._last_reason)
+
+        best = None
+        roi_bottom = rh
+        bottom_margin = int(self.bottom_touch_ratio * rh)
+
+        for c in contours:
+            x, y, w, h = cv2.boundingRect(c)
+            if w <= 0 or h <= 0:
+                continue
+
+            # size filters
+            hr = h / float(rh)
+            wr = w / float(rw)
+            ar = (w * h) / float(rw * rh + 1e-6)
+            aspect = h / float(w + 1e-6)
+
+            if hr < self.min_h:
+                continue
+            if wr > self.max_w:
+                continue
+            if ar < self.min_area:
+                continue
+            if aspect < self.aspect_min:
+                continue
+
+            # chân bàn thường chạm gần đáy ROI
+            if (y + h) < (roi_bottom - bottom_margin):
+                continue
+
+            # edge density trong bbox (để chắc là có “structure”)
+            patch = bw[y:y+h, x:x+w]
+            ed = float(np.mean(patch > 0)) if patch.size else 0.0  # 0..1
+
+            # score: ưu tiên cao + hẹp + edge density vừa đủ
+            score = 0.55 * min(1.0, hr / 0.55) + 0.25 * min(1.0, ed / 0.55) + 0.20 * (1.0 - min(1.0, wr / 0.25))
+            score = float(max(0.0, min(0.99, score)))
+
+            if best is None or score > best["score"]:
+                best = {
+                    "score": score,
+                    "bbox_roi": (x, y, x + w, y + h),
+                    "hr": hr, "wr": wr, "ar": ar, "aspect": aspect, "ed": ed
+                }
+
+        if best is None:
+            self._ema *= self.decay
+            self._streak = max(0, self._streak - 1)
+            self._last_bbox = None
+            self._last_reason = "no_candidate"
+            return LegHit(False, float(self._ema), None, self._last_reason)
+
+        score = float(best["score"])
+        self._ema = self._ema * self.decay + score * (1.0 - self.decay)
+
+        if score >= self.score_trigger:
+            self._streak += 1
+        else:
+            self._streak = max(0, self._streak - 1)
+
+        ok = (self._streak >= self.stable_frames) and (self._ema >= self.score_trigger * 0.85)
+
+        x1, y1, x2, y2 = best["bbox_roi"]
+        # convert roi->full frame
+        bbox_full = (int(x1), int(y1f + y1), int(x2), int(y1f + y2))
+
+        self._last_bbox = bbox_full
+        self._last_reason = f"leg(hr={best['hr']:.2f} wr={best['wr']:.2f} asp={best['aspect']:.1f} ed={best['ed']:.2f}) ema={self._ema:.2f} streak={self._streak}"
+        return LegHit(bool(ok), float(self._ema), bbox_full, self._last_reason)
 
 
 # =========================
@@ -236,7 +385,7 @@ class YoloDetector:
         self._last: List[Dict[str, Any]] = []
         self._last_ts = 0.0
 
-        from ultralytics import YOLO  # pip3 install ultralytics
+        from ultralytics import YOLO
         self.model = YOLO(self.model_path)
 
     def infer(self, frame_bgr: np.ndarray) -> List[Dict[str, Any]]:
@@ -296,7 +445,7 @@ class YoloDetector:
 
 
 # =========================
-# 3) Fusion class (đây là cái bạn cần)
+# 3) Fusion class
 # =========================
 class VisionObstacleFusion:
     """
@@ -332,10 +481,14 @@ class VisionObstacleFusion:
         bump_roi_y1_ratio: float = 0.58,
         bump_roi_y2_ratio: float = 0.98,
 
+        # leg detector tuning ✅
+        enable_leg: bool = True,
+        leg_roi_y1_ratio: float = 0.25,
+        leg_roi_y2_ratio: float = 0.98,
+
         # prefer classes (YOLO)
         prefer_classes: Optional[List[str]] = None,
 
-        # nếu muốn thread-safe
         thread_safe: bool = True,
     ):
         self.dy1 = float(danger_y1_ratio)
@@ -344,12 +497,28 @@ class VisionObstacleFusion:
         self.dx2 = float(danger_x2_ratio)
         self.min_box_area_ratio = float(min_box_area_ratio)
 
-        self.prefer_classes = [c.lower() for c in (prefer_classes or ["person", "chair", "table"])]
+        # thêm table/chair ưu tiên, vì chân bàn hay đi kèm
+        self.prefer_classes = [c.lower() for c in (prefer_classes or ["person", "chair", "table", "bench", "sofa"])]
 
         self.bump = FloorBumpDetector(
             roi_y1_ratio=bump_roi_y1_ratio,
             roi_y2_ratio=bump_roi_y2_ratio
         )
+
+        self.leg: Optional[VerticalLegDetector] = None
+        self.leg_status: Dict[str, Any] = {"enabled": bool(enable_leg), "ok": False, "err": ""}
+
+        if enable_leg:
+            try:
+                self.leg = VerticalLegDetector(
+                    roi_y1_ratio=leg_roi_y1_ratio,
+                    roi_y2_ratio=leg_roi_y2_ratio
+                )
+                self.leg_status["ok"] = True
+            except Exception as e:
+                self.leg = None
+                self.leg_status["ok"] = False
+                self.leg_status["err"] = str(e)
 
         self.yolo: Optional[YoloDetector] = None
         self.yolo_status: Dict[str, Any] = {"enabled": bool(enable_yolo), "ok": False, "err": ""}
@@ -366,9 +535,9 @@ class VisionObstacleFusion:
                 )
                 self.yolo_status["ok"] = True
             except Exception as e:
+                self.yolo = None
                 self.yolo_status["ok"] = False
                 self.yolo_status["err"] = str(e)
-                self.yolo = None
 
         self._lock = threading.Lock() if thread_safe else None
         self._last_dec = FusionDecision(False, "none", 0.0, "NONE", "none", {"reason": "init"})
@@ -420,10 +589,6 @@ class VisionObstacleFusion:
 
     # ---------- core ----------
     def update(self, frame_bgr: np.ndarray) -> Dict[str, Any]:
-        """
-        Call mỗi frame.
-        Return dict decision (nhanh để file khác dùng).
-        """
         now = time.time()
         if frame_bgr is None or frame_bgr.size < 10:
             dec = FusionDecision(False, "none", 0.0, "NONE", "none", {"reason": "no_frame"})
@@ -435,6 +600,13 @@ class VisionObstacleFusion:
         danger = [int(W * self.dx1), int(H * self.dy1), int(W * self.dx2), int(H * self.dy2)]
 
         bump_hit = self.bump.detect(frame_bgr)
+
+        leg_hit = LegHit(False, 0.0, None, "disabled")
+        if self.leg is not None:
+            try:
+                leg_hit = self.leg.detect(frame_bgr)
+            except Exception as e:
+                leg_hit = LegHit(False, 0.0, None, f"leg_err:{e}")
 
         dets: List[Dict[str, Any]] = []
         yolo_err = ""
@@ -468,7 +640,16 @@ class VisionObstacleFusion:
                 best_score = score
                 best_yolo = {**d, "iou_danger": float(iou), "score": float(score)}
 
-        # bump meaningful if overlaps danger zone and center-ish
+        # leg meaningful if overlap danger zone
+        leg_ok = False
+        leg_zone = "CENTER"
+        if leg_hit.ok and leg_hit.bbox:
+            lx1, ly1, lx2, ly2 = leg_hit.bbox
+            if self._iou_rect([lx1, ly1, lx2, ly2], danger) > 0.08:
+                leg_ok = True
+                leg_zone = self._zone_from_cx(0.5 * (lx1 + lx2), W)
+
+        # bump meaningful (giữ logic cũ)
         bump_ok = False
         bump_zone = "CENTER"
         if bump_hit.ok and bump_hit.band_bbox:
@@ -478,57 +659,56 @@ class VisionObstacleFusion:
                 bump_zone = self._zone_from_cx(cx, W)
                 bump_ok = (bump_zone == "CENTER")
 
-        # fusion decision
-        if bump_ok and best_yolo is None:
-            dec = FusionDecision(
-                True, "floor_bump",
-                min(0.99, 0.55 + 0.45 * float(bump_hit.score)),
-                bump_zone, "bump",
-                {"danger": {"bbox": danger},
-                 "bump": {"score": bump_hit.score, "bbox": bump_hit.band_bbox, "reason": bump_hit.reason},
-                 "yolo": None, "yolo_err": yolo_err}
-            )
-        elif bump_ok and best_yolo is not None:
-            yname = str(best_yolo.get("name", "")).lower()
-            # nếu yolo ra object "đinh" (chair/table/person..) thì ưu tiên type đó
-            if yname in ("person", "chair", "table", "bench", "sofa", "dog", "cat"):
-                typ = str(best_yolo.get("name", "object"))
-                conf = float(best_yolo.get("conf", 0.0))
-                zone = self._zone_from_cx(0.5 * (best_yolo["bbox"][0] + best_yolo["bbox"][2]), W)
-                src = "both(yolo_first)"
-            else:
-                typ = "floor_bump"
-                conf = min(0.99, 0.55 + 0.45 * float(bump_hit.score))
-                zone = bump_zone
-                src = "both(bump_first)"
-
-            dec = FusionDecision(
-                True, typ, float(conf), zone, src,
-                {"danger": {"bbox": danger},
-                 "bump": {"score": bump_hit.score, "bbox": bump_hit.band_bbox, "reason": bump_hit.reason},
-                 "yolo": best_yolo, "yolo_err": yolo_err}
-            )
-        elif best_yolo is not None:
+        # ---------------- fusion decision ----------------
+        # Ưu tiên: YOLO (nếu có) > LEG > BUMP
+        if best_yolo is not None:
             typ = str(best_yolo.get("name", "object"))
             conf = float(best_yolo.get("conf", 0.0))
             zone = self._zone_from_cx(0.5 * (best_yolo["bbox"][0] + best_yolo["bbox"][2]), W)
+            src = "yolo"
             dec = FusionDecision(
-                True, typ, conf, zone, "yolo",
+                True, typ, conf, zone, src,
                 {"danger": {"bbox": danger},
+                 "leg": {"ok": leg_hit.ok, "score": leg_hit.score, "bbox": leg_hit.bbox, "reason": leg_hit.reason},
                  "bump": {"ok": bump_hit.ok, "score": bump_hit.score, "bbox": bump_hit.band_bbox, "reason": bump_hit.reason},
                  "yolo": best_yolo, "yolo_err": yolo_err}
+            )
+
+        elif leg_ok:
+            # chân bàn/cột mảnh
+            conf = float(min(0.99, max(0.50, leg_hit.score)))
+            dec = FusionDecision(
+                True, "table_leg", conf, leg_zone, "leg",
+                {"danger": {"bbox": danger},
+                 "leg": {"score": leg_hit.score, "bbox": leg_hit.bbox, "reason": leg_hit.reason},
+                 "bump": {"ok": bump_hit.ok, "score": bump_hit.score, "bbox": bump_hit.band_bbox, "reason": bump_hit.reason},
+                 "yolo": None, "yolo_err": yolo_err}
+            )
+
+        elif bump_ok:
+            conf = float(min(0.99, 0.55 + 0.45 * float(bump_hit.score)))
+            dec = FusionDecision(
+                True, "floor_bump", conf, bump_zone, "bump",
+                {"danger": {"bbox": danger},
+                 "leg": {"ok": leg_hit.ok, "score": leg_hit.score, "bbox": leg_hit.bbox, "reason": leg_hit.reason},
+                 "bump": {"score": bump_hit.score, "bbox": bump_hit.band_bbox, "reason": bump_hit.reason},
+                 "yolo": None, "yolo_err": yolo_err}
             )
         else:
             dec = FusionDecision(
                 False, "none", 0.0, "NONE", "none",
                 {"danger": {"bbox": danger},
+                 "leg": {"ok": leg_hit.ok, "score": leg_hit.score, "bbox": leg_hit.bbox, "reason": leg_hit.reason},
                  "bump": {"ok": bump_hit.ok, "score": bump_hit.score, "bbox": bump_hit.band_bbox, "reason": bump_hit.reason},
                  "yolo": None, "yolo_err": yolo_err}
             )
 
-        # build boxes payload for external usage (web/canvas)
+        # ---------------- build boxes payload ----------------
         boxes: List[Dict[str, Any]] = []
 
+        # danger ROI
+        # (để file khác vẽ)
+        # bump box
         if bump_hit.band_bbox:
             bx1, by1, bx2, by2 = bump_hit.band_bbox
             boxes.append({
@@ -540,6 +720,19 @@ class VisionObstacleFusion:
                 "meta": {"reason": bump_hit.reason, "ok": bool(bump_hit.ok), "score": float(bump_hit.score)}
             })
 
+        # leg box ✅
+        if leg_hit.bbox:
+            lx1, ly1, lx2, ly2 = leg_hit.bbox
+            boxes.append({
+                "kind": "leg",
+                "name": "table_leg",
+                "conf": float(min(0.99, max(0.0, leg_hit.score))),
+                "bbox": [int(lx1), int(ly1), int(lx2), int(ly2)],
+                "zone": self._zone_from_cx(0.5 * (lx1 + lx2), W),
+                "meta": {"reason": leg_hit.reason, "ok": bool(leg_hit.ok), "score": float(leg_hit.score)}
+            })
+
+        # yolo boxes
         for d in dets:
             conf = float(d.get("conf", 0.0))
             if conf < 1e-6:
@@ -573,7 +766,8 @@ class VisionObstacleFusion:
                 "source": dec.source
             },
             "boxes": boxes,
-            "yolo_status": dict(self.yolo_status)
+            "yolo_status": dict(self.yolo_status),
+            "leg_status": dict(self.leg_status),
         }
 
         self._set_state(dec, payload, (W, H))
@@ -590,7 +784,8 @@ class VisionObstacleFusion:
             "zone": dec.zone,
             "source": dec.source,
             "detail": dec.detail,
-            "yolo_status": dict(self.yolo_status)
+            "yolo_status": dict(self.yolo_status),
+            "leg_status": dict(self.leg_status),
         }
 
     def get_boxes_payload(self) -> Dict[str, Any]:
@@ -607,6 +802,7 @@ class VisionObstacleFusion:
         if not payload.get("ok", False):
             return out
 
+        # draw danger ROI
         danger = payload.get("danger_bbox", None)
         if isinstance(danger, list) and len(danger) == 4:
             x1, y1, x2, y2 = map(int, danger)
@@ -623,10 +819,16 @@ class VisionObstacleFusion:
                     if x2 <= x1 or y2 <= y1:
                         continue
 
+                    # colors:
+                    # yolo: green
+                    # bump: yellow
+                    # leg: cyan
                     if kind == "yolo":
                         color = (0, 255, 0)
                     elif kind == "bump":
                         color = (0, 255, 255)
+                    elif kind == "leg":
+                        color = (255, 255, 0)
                     else:
                         color = (255, 255, 255)
 
