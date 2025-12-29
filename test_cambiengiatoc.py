@@ -331,7 +331,7 @@ if __name__ == "__main__":
         min_dA_th=30.0,
         min_jerk_th=1500.0,
         min_gyro_th=10.0,
-        require_two_signals=True,  # True nếu bạn muốn “chắc ăn hơn”
+        require_two_signals=True,  
         print_events=True,
         name="SH3001",
     )
