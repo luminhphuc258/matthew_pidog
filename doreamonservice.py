@@ -4,6 +4,7 @@
 import argparse
 import os
 import socket
+import random
 import sys
 import time
 
@@ -198,6 +199,9 @@ def main():
     transition_start = 0.0
 
     talk_idx = 0
+    talk_seq = []
+    talk_seq_idx = 0
+    talk_pair_order = []
     next_talk_switch = 0.0
     talk_overlay_until = 0.0
 
@@ -264,8 +268,29 @@ def main():
             last_logged_auto_talk = auto_talk
 
         if is_talking and talk_assets:
-            if now >= next_talk_switch:
-                talk_idx = (talk_idx + 1) % len(talk_assets)
+            if not talk_seq:
+                if len(talk_assets) >= 2:
+                    talk_pair_order = list(range(1, len(talk_assets)))
+                    random.shuffle(talk_pair_order)
+                    talk_seq = []
+                    for idx in talk_pair_order:
+                        talk_seq.extend([0, idx])
+                else:
+                    talk_seq = [0]
+                talk_seq_idx = 0
+                talk_idx = talk_seq[talk_seq_idx]
+                next_talk_switch = now + max(0.02, args.talk_interval)
+                talk_overlay_until = now + max(0.0, args.talk_overlay_duration)
+            elif now >= next_talk_switch:
+                talk_seq_idx += 1
+                if talk_seq_idx >= len(talk_seq):
+                    if len(talk_assets) >= 2:
+                        random.shuffle(talk_pair_order)
+                        talk_seq = []
+                        for idx in talk_pair_order:
+                            talk_seq.extend([0, idx])
+                    talk_seq_idx = 0
+                talk_idx = talk_seq[talk_seq_idx]
                 next_talk_switch = now + max(0.02, args.talk_interval)
                 talk_overlay_until = now + max(0.0, args.talk_overlay_duration)
             desired_asset = talk_assets[talk_idx]
