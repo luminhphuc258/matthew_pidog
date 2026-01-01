@@ -159,7 +159,7 @@ def main():
     talk_files = find_talk_files(files)
     mouth_big_path = find_label_file(files, "mouth_big")
     mouth_medium_path = find_label_file(files, "mouth_medium")
-    mouth_small_path = find_label_file(files, "mouth_small")
+    mouth_closed_path = find_label_file(files, "mouth_closed")
 
     if missing:
         log("Missing image for labels:")
@@ -177,8 +177,8 @@ def main():
         mouth_missing.append("mouth_big")
     if not mouth_medium_path:
         mouth_missing.append("mouth_medium")
-    if not mouth_small_path:
-        mouth_missing.append("mouth_small")
+    if not mouth_closed_path:
+        mouth_missing.append("mouth_closed")
     if mouth_missing:
         log("Warning: missing mouth images for talk sequence: %s" % ", ".join(mouth_missing))
 
@@ -188,8 +188,8 @@ def main():
         log("Mouth big -> %s" % os.path.basename(mouth_big_path))
     if mouth_medium_path:
         log("Mouth medium -> %s" % os.path.basename(mouth_medium_path))
-    if mouth_small_path:
-        log("Mouth small -> %s" % os.path.basename(mouth_small_path))
+    if mouth_closed_path:
+        log("Mouth closed -> %s" % os.path.basename(mouth_closed_path))
     assets = {}
     for emo, path in emo_files.items():
         assets[emo] = load_asset(path, screen_size)
@@ -206,9 +206,9 @@ def main():
                 break
     mouth_big_asset = load_asset(mouth_big_path, screen_size) if mouth_big_path else None
     mouth_medium_asset = load_asset(mouth_medium_path, screen_size) if mouth_medium_path else None
-    mouth_small_asset = load_asset(mouth_small_path, screen_size) if mouth_small_path else None
+    mouth_closed_asset = load_asset(mouth_closed_path, screen_size) if mouth_closed_path else None
     use_mouth_sequence = bool(
-        mouth_big_asset and mouth_medium_asset and mouth_small_asset
+        mouth_big_asset and mouth_medium_asset and mouth_closed_asset
     )
 
     # UDP receive commands
@@ -307,11 +307,11 @@ def main():
                     elif talk_assets:
                         tail_asset = talk_assets[0]
                     else:
-                        tail_asset = mouth_small_asset
+                        tail_asset = mouth_closed_asset
                     talk_sequence = [
                         mouth_big_asset,
                         mouth_medium_asset,
-                        mouth_small_asset,
+                        mouth_closed_asset,
                         tail_asset,
                     ]
                     talk_seq_pos = 0
@@ -326,11 +326,11 @@ def main():
                         elif talk_assets:
                             tail_asset = talk_assets[0]
                         else:
-                            tail_asset = mouth_small_asset
+                            tail_asset = mouth_closed_asset
                         talk_sequence = [
                             mouth_big_asset,
                             mouth_medium_asset,
-                            mouth_small_asset,
+                            mouth_closed_asset,
                             tail_asset,
                         ]
                         talk_seq_pos = 0
