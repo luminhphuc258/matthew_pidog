@@ -101,7 +101,7 @@ def parse_args():
     parser.add_argument("--windowed", action="store_true")
     parser.add_argument("--size", default="800x600")
     parser.add_argument("--port", type=int, default=39393)
-    parser.add_argument("--talk-interval", type=float, default=1.2)
+    parser.add_argument("--talk-interval", type=float, default=0.7)
     parser.add_argument("--fade", type=float, default=0.2)
     parser.add_argument("--talk-overlay-alpha", type=int, default=60)
     parser.add_argument("--talk-overlay-duration", type=float, default=0.12)
