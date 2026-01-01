@@ -4,7 +4,6 @@
 import argparse
 import os
 import socket
-import random
 import sys
 import time
 
@@ -69,16 +68,13 @@ def find_label_file(files, label):
 
 
 def find_talk_files(files):
-    indexed = []
+    talk1 = []
     for path in files:
         base = os.path.basename(path).lower()
-        for i in range(1, 5):
-            if ("talk%d" % i) in base or ("%d_talk" % i) in base or ("talk-%d" % i) in base:
-                indexed.append((i, path))
-                break
-    if indexed:
-        indexed.sort(key=lambda item: item[0])
-        return [p for _, p in indexed]
+        if "talk1" in base or "1_talk" in base or "talk-1" in base:
+            talk1.append(path)
+    if talk1:
+        return talk1
 
     # fallback: any file containing "talk" in name
     fallback = [p for p in files if "talk" in os.path.basename(p).lower()]
@@ -176,6 +172,8 @@ def main():
     mouth_missing = []
     if not mouth_big_path:
         mouth_missing.append("mouth_big")
+    if not mouth_medium_path:
+        mouth_missing.append("mouth_medium")
     if not mouth_small_path:
         mouth_missing.append("mouth_small")
     if not mouth_closed_path:
@@ -201,19 +199,13 @@ def main():
     talk_assets = []
     for path in talk_files:
         talk_assets.append(load_asset(path, screen_size))
-    talk_variant_assets = []
-    for idx in (2, 3, 4):
-        for path in talk_files:
-            base = os.path.basename(path).lower()
-            if ("talk%d" % idx) in base or ("%d_talk" % idx) in base or ("talk-%d" % idx) in base:
-                talk_variant_assets.append(load_asset(path, screen_size))
-                break
-
     mouth_big_asset = load_asset(mouth_big_path, screen_size) if mouth_big_path else None
     mouth_medium_asset = load_asset(mouth_medium_path, screen_size) if mouth_medium_path else None
     mouth_small_asset = load_asset(mouth_small_path, screen_size) if mouth_small_path else None
     mouth_closed_asset = load_asset(mouth_closed_path, screen_size) if mouth_closed_path else None
-    use_mouth_sequence = bool(mouth_big_asset and mouth_small_asset and mouth_closed_asset)
+    use_mouth_sequence = bool(
+        mouth_big_asset and mouth_medium_asset and mouth_small_asset and mouth_closed_asset
+    )
 
     # UDP receive commands
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -235,7 +227,6 @@ def main():
     talk_idx = 0
     talk_seq = []
     talk_seq_idx = 0
-    talk_pair_order = []
     next_talk_switch = 0.0
     talk_overlay_until = 0.0
     talk_sequence = []
@@ -306,40 +297,31 @@ def main():
         if is_talking and (talk_assets or use_mouth_sequence):
             if use_mouth_sequence:
                 if not talk_sequence:
-                    if talk_variant_assets:
-                        mid = random.choice(talk_variant_assets)
-                    elif mouth_medium_asset:
-                        mid = mouth_medium_asset
-                    else:
-                        mid = mouth_big_asset
-                    talk_sequence = [mouth_big_asset, mid, mouth_small_asset, mouth_closed_asset]
+                    talk_sequence = [
+                        mouth_big_asset,
+                        mouth_medium_asset,
+                        mouth_small_asset,
+                        mouth_closed_asset,
+                    ]
                     talk_seq_pos = 0
                     next_talk_switch = now + max(0.02, args.talk_interval)
                     talk_overlay_until = now + max(0.0, args.talk_overlay_duration)
                 elif now >= next_talk_switch:
                     talk_seq_pos += 1
                     if talk_seq_pos >= len(talk_sequence):
-                        if talk_variant_assets:
-                            mid = random.choice(talk_variant_assets)
-                        elif mouth_medium_asset:
-                            mid = mouth_medium_asset
-                        else:
-                            mid = mouth_big_asset
-                        talk_sequence = [mouth_big_asset, mid, mouth_small_asset, mouth_closed_asset]
+                        talk_sequence = [
+                            mouth_big_asset,
+                            mouth_medium_asset,
+                            mouth_small_asset,
+                            mouth_closed_asset,
+                        ]
                         talk_seq_pos = 0
                     next_talk_switch = now + max(0.02, args.talk_interval)
                     talk_overlay_until = now + max(0.0, args.talk_overlay_duration)
                 desired_asset = talk_sequence[talk_seq_pos]
             else:
                 if not talk_seq:
-                    if len(talk_assets) >= 2:
-                        talk_pair_order = list(range(1, len(talk_assets)))
-                        random.shuffle(talk_pair_order)
-                        talk_seq = []
-                        for idx in talk_pair_order:
-                            talk_seq.extend([0, idx])
-                    else:
-                        talk_seq = [0]
+                    talk_seq = [0]
                     talk_seq_idx = 0
                     talk_idx = talk_seq[talk_seq_idx]
                     next_talk_switch = now + max(0.02, args.talk_interval)
@@ -347,11 +329,6 @@ def main():
                 elif now >= next_talk_switch:
                     talk_seq_idx += 1
                     if talk_seq_idx >= len(talk_seq):
-                        if len(talk_assets) >= 2:
-                            random.shuffle(talk_pair_order)
-                            talk_seq = []
-                            for idx in talk_pair_order:
-                                talk_seq.extend([0, idx])
                         talk_seq_idx = 0
                     talk_idx = talk_seq[talk_seq_idx]
                     next_talk_switch = now + max(0.02, args.talk_interval)
