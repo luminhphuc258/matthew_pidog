@@ -104,8 +104,9 @@ def parse_args():
     parser.add_argument("--windowed", action="store_true")
     parser.add_argument("--size", default="800x600")
     parser.add_argument("--port", type=int, default=39393)
-    parser.add_argument("--talk-interval", type=float, default=0.12)
-    parser.add_argument("--fade", type=float, default=0.12)
+    parser.add_argument("--talk-interval", type=float, default=1.0)
+    parser.add_argument("--fade", type=float, default=0.2)
+    parser.add_argument("--talk-fade", type=float, default=0.4)
     parser.add_argument("--fps", type=int, default=60)
     return parser.parse_args()
 
@@ -134,8 +135,8 @@ def main():
     pygame.display.set_caption("Doraemon Service")
     pygame.mouse.set_visible(False)
     log("SDL_VIDEODRIVER=%s" % os.environ.get("SDL_VIDEODRIVER", "default"))
-    log("Port=%d | windowed=%s | size=%s | talk_interval=%.2f | fade=%.2f" % (
-        args.port, args.windowed, args.size, args.talk_interval, args.fade
+    log("Port=%d | windowed=%s | size=%s | talk_interval=%.2f | fade=%.2f | talk_fade=%.2f" % (
+        args.port, args.windowed, args.size, args.talk_interval, args.fade, args.talk_fade
     ))
 
     files = list_image_files(os.getcwd())
@@ -279,7 +280,12 @@ def main():
         screen.fill(BG)
 
         if next_asset is not None:
-            alpha = clamp((now - transition_start) / max(0.01, args.fade), 0.0, 1.0)
+            fade_duration = args.fade
+            if is_talking:
+                fade_duration = args.talk_fade
+                if args.talk_interval > 0:
+                    fade_duration = min(fade_duration, args.talk_interval * 0.9)
+            alpha = clamp((now - transition_start) / max(0.01, fade_duration), 0.0, 1.0)
             if current_asset:
                 blit_with_alpha(screen, current_asset[0], current_asset[1], int(255 * (1.0 - alpha)))
             blit_with_alpha(screen, next_asset[0], next_asset[1], int(255 * alpha))
