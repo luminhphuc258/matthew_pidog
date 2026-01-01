@@ -189,6 +189,7 @@ def main():
     mouth_level = 0.0
     last_mouth_ts = 0.0
     force_talk = False
+    auto_talk = True
 
     current_asset = assets.get(emo)
     next_asset = None
@@ -201,6 +202,7 @@ def main():
 
     last_logged_emo = emo
     last_logged_talk = force_talk
+    last_logged_auto_talk = auto_talk
 
     while True:
         now = time.time()
@@ -214,11 +216,13 @@ def main():
             if len(parts) == 1:
                 if parts[0] in VALID_EMOS:
                     emo = parts[0]
+                    auto_talk = False
                 elif parts[0].upper() == "TALK":
                     force_talk = True
             elif len(parts) >= 2:
                 if parts[0].upper() == "EMO" and parts[1] in VALID_EMOS:
                     emo = parts[1]
+                    auto_talk = False
                 elif parts[0].upper() == "MOUTH":
                     try:
                         mouth_target = clamp(float(parts[1]), 0.0, 1.0)
@@ -227,6 +231,8 @@ def main():
                         pass
                 elif parts[0].upper() == "TALK":
                     force_talk = parts[1] not in ("0", "off", "false")
+                    if force_talk:
+                        auto_talk = True
         except BlockingIOError:
             pass
 
@@ -243,13 +249,16 @@ def main():
                 if e.key in (pygame.K_ESCAPE, pygame.K_q):
                     return 0
 
-        is_talking = (mouth_level > 0.02) or force_talk
+        is_talking = auto_talk or (mouth_level > 0.02) or force_talk
         if emo != last_logged_emo:
             log("EMO -> %s" % emo)
             last_logged_emo = emo
         if force_talk != last_logged_talk:
             log("TALK -> %s" % ("on" if force_talk else "off"))
             last_logged_talk = force_talk
+        if auto_talk != last_logged_auto_talk:
+            log("AUTO_TALK -> %s" % ("on" if auto_talk else "off"))
+            last_logged_auto_talk = auto_talk
 
         if is_talking and talk_assets:
             if now >= next_talk_switch:
