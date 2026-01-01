@@ -105,8 +105,9 @@ def parse_args():
     parser.add_argument("--size", default="800x600")
     parser.add_argument("--port", type=int, default=39393)
     parser.add_argument("--talk-interval", type=float, default=2.0)
-    parser.add_argument("--fade", type=float, default=1)
-    parser.add_argument("--talk-fade", type=float, default=1)
+    parser.add_argument("--fade", type=float, default=0.2)
+    parser.add_argument("--talk-overlay-alpha", type=int, default=60)
+    parser.add_argument("--talk-overlay-duration", type=float, default=0.12)
     parser.add_argument("--fps", type=int, default=60)
     return parser.parse_args()
 
@@ -135,8 +136,8 @@ def main():
     pygame.display.set_caption("Doraemon Service")
     pygame.mouse.set_visible(False)
     log("SDL_VIDEODRIVER=%s" % os.environ.get("SDL_VIDEODRIVER", "default"))
-    log("Port=%d | windowed=%s | size=%s | talk_interval=%.2f | fade=%.2f | talk_fade=%.2f" % (
-        args.port, args.windowed, args.size, args.talk_interval, args.fade, args.talk_fade
+    log("Port=%d | windowed=%s | size=%s | talk_interval=%.2f | fade=%.2f" % (
+        args.port, args.windowed, args.size, args.talk_interval, args.fade
     ))
 
     files = list_image_files(os.getcwd())
@@ -198,6 +199,7 @@ def main():
 
     talk_idx = 0
     next_talk_switch = 0.0
+    talk_overlay_until = 0.0
 
     clock = pygame.time.Clock()
 
@@ -265,6 +267,7 @@ def main():
             if now >= next_talk_switch:
                 talk_idx = (talk_idx + 1) % len(talk_assets)
                 next_talk_switch = now + max(0.02, args.talk_interval)
+                talk_overlay_until = now + max(0.0, args.talk_overlay_duration)
             desired_asset = talk_assets[talk_idx]
         else:
             desired_asset = assets.get(emo)
@@ -273,19 +276,20 @@ def main():
             current_asset = desired_asset
 
         if desired_asset != current_asset and desired_asset is not None:
-            if next_asset != desired_asset:
-                next_asset = desired_asset
-                transition_start = now
+            if is_talking:
+                current_asset = desired_asset
+                next_asset = None
+            else:
+                if next_asset != desired_asset:
+                    next_asset = desired_asset
+                    transition_start = now
+        if is_talking:
+            next_asset = None
 
         screen.fill(BG)
 
         if next_asset is not None:
-            fade_duration = args.fade
-            if is_talking:
-                fade_duration = args.talk_fade
-                if args.talk_interval > 0:
-                    fade_duration = min(fade_duration, args.talk_interval * 0.9)
-            alpha = clamp((now - transition_start) / max(0.01, fade_duration), 0.0, 1.0)
+            alpha = clamp((now - transition_start) / max(0.01, args.fade), 0.0, 1.0)
             if current_asset:
                 blit_with_alpha(screen, current_asset[0], current_asset[1], int(255 * (1.0 - alpha)))
             blit_with_alpha(screen, next_asset[0], next_asset[1], int(255 * alpha))
@@ -295,6 +299,10 @@ def main():
         else:
             if current_asset:
                 screen.blit(current_asset[0], current_asset[1])
+        if is_talking and current_asset and now < talk_overlay_until and args.talk_overlay_alpha > 0:
+            overlay = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
+            overlay.fill((255, 255, 255, clamp(args.talk_overlay_alpha, 0, 255)))
+            screen.blit(overlay, (0, 0))
 
         pygame.display.flip()
         clock.tick(args.fps)
