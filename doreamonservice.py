@@ -3,6 +3,7 @@
 
 import argparse
 import os
+import random
 import socket
 import sys
 import time
@@ -68,13 +69,16 @@ def find_label_file(files, label):
 
 
 def find_talk_files(files):
-    talk1 = []
+    indexed = []
     for path in files:
         base = os.path.basename(path).lower()
-        if "talk1" in base or "1_talk" in base or "talk-1" in base:
-            talk1.append(path)
-    if talk1:
-        return talk1
+        for i in range(1, 5):
+            if ("talk%d" % i) in base or ("%d_talk" % i) in base or ("talk-%d" % i) in base:
+                indexed.append((i, path))
+                break
+    if indexed:
+        indexed.sort(key=lambda item: item[0])
+        return [p for _, p in indexed]
 
     # fallback: any file containing "talk" in name
     fallback = [p for p in files if "talk" in os.path.basename(p).lower()]
@@ -156,7 +160,6 @@ def main():
     mouth_big_path = find_label_file(files, "mouth_big")
     mouth_medium_path = find_label_file(files, "mouth_medium")
     mouth_small_path = find_label_file(files, "mouth_small")
-    mouth_closed_path = find_label_file(files, "mouth_closed")
 
     if missing:
         log("Missing image for labels:")
@@ -176,8 +179,6 @@ def main():
         mouth_missing.append("mouth_medium")
     if not mouth_small_path:
         mouth_missing.append("mouth_small")
-    if not mouth_closed_path:
-        mouth_missing.append("mouth_closed")
     if mouth_missing:
         log("Warning: missing mouth images for talk sequence: %s" % ", ".join(mouth_missing))
 
@@ -189,9 +190,6 @@ def main():
         log("Mouth medium -> %s" % os.path.basename(mouth_medium_path))
     if mouth_small_path:
         log("Mouth small -> %s" % os.path.basename(mouth_small_path))
-    if mouth_closed_path:
-        log("Mouth closed -> %s" % os.path.basename(mouth_closed_path))
-
     assets = {}
     for emo, path in emo_files.items():
         assets[emo] = load_asset(path, screen_size)
@@ -199,12 +197,18 @@ def main():
     talk_assets = []
     for path in talk_files:
         talk_assets.append(load_asset(path, screen_size))
+    talk_variant_assets = []
+    for idx in (2, 3, 4):
+        for path in talk_files:
+            base = os.path.basename(path).lower()
+            if ("talk%d" % idx) in base or ("%d_talk" % idx) in base or ("talk-%d" % idx) in base:
+                talk_variant_assets.append(load_asset(path, screen_size))
+                break
     mouth_big_asset = load_asset(mouth_big_path, screen_size) if mouth_big_path else None
     mouth_medium_asset = load_asset(mouth_medium_path, screen_size) if mouth_medium_path else None
     mouth_small_asset = load_asset(mouth_small_path, screen_size) if mouth_small_path else None
-    mouth_closed_asset = load_asset(mouth_closed_path, screen_size) if mouth_closed_path else None
     use_mouth_sequence = bool(
-        mouth_big_asset and mouth_medium_asset and mouth_small_asset and mouth_closed_asset
+        mouth_big_asset and mouth_medium_asset and mouth_small_asset
     )
 
     # UDP receive commands
@@ -297,11 +301,18 @@ def main():
         if is_talking and (talk_assets or use_mouth_sequence):
             if use_mouth_sequence:
                 if not talk_sequence:
+                    tail_asset = None
+                    if talk_variant_assets:
+                        tail_asset = random.choice(talk_variant_assets)
+                    elif talk_assets:
+                        tail_asset = talk_assets[0]
+                    else:
+                        tail_asset = mouth_small_asset
                     talk_sequence = [
                         mouth_big_asset,
                         mouth_medium_asset,
                         mouth_small_asset,
-                        mouth_closed_asset,
+                        tail_asset,
                     ]
                     talk_seq_pos = 0
                     next_talk_switch = now + max(0.02, args.talk_interval)
@@ -309,11 +320,18 @@ def main():
                 elif now >= next_talk_switch:
                     talk_seq_pos += 1
                     if talk_seq_pos >= len(talk_sequence):
+                        tail_asset = None
+                        if talk_variant_assets:
+                            tail_asset = random.choice(talk_variant_assets)
+                        elif talk_assets:
+                            tail_asset = talk_assets[0]
+                        else:
+                            tail_asset = mouth_small_asset
                         talk_sequence = [
                             mouth_big_asset,
                             mouth_medium_asset,
                             mouth_small_asset,
-                            mouth_closed_asset,
+                            tail_asset,
                         ]
                         talk_seq_pos = 0
                     next_talk_switch = now + max(0.02, args.talk_interval)
