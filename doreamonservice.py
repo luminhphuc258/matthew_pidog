@@ -105,7 +105,7 @@ def parse_args():
     parser.add_argument("--windowed", action="store_true")
     parser.add_argument("--size", default="800x600")
     parser.add_argument("--port", type=int, default=39393)
-    parser.add_argument("--talk-interval", type=float, default=1.5)
+    parser.add_argument("--talk-interval", type=float, default=1.2)
     parser.add_argument("--fade", type=float, default=0.2)
     parser.add_argument("--talk-overlay-alpha", type=int, default=60)
     parser.add_argument("--talk-overlay-duration", type=float, default=0.12)
@@ -157,6 +157,10 @@ def main():
             emo_files[emo] = path
 
     talk_files = find_talk_files(files)
+    mouth_big_path = find_label_file(files, "mouth_big")
+    mouth_medium_path = find_label_file(files, "mouth_medium")
+    mouth_small_path = find_label_file(files, "mouth_small")
+    mouth_closed_path = find_label_file(files, "mouth_closed")
 
     if missing:
         log("Missing image for labels:")
@@ -169,9 +173,26 @@ def main():
         log("Warning: no talk images found (expected names like talk1..talk4).")
     else:
         log("Talk frames: %d" % len(talk_files))
+    mouth_missing = []
+    if not mouth_big_path:
+        mouth_missing.append("mouth_big")
+    if not mouth_small_path:
+        mouth_missing.append("mouth_small")
+    if not mouth_closed_path:
+        mouth_missing.append("mouth_closed")
+    if mouth_missing:
+        log("Warning: missing mouth images for talk sequence: %s" % ", ".join(mouth_missing))
 
     for emo, path in sorted(emo_files.items()):
         log("Asset %s -> %s" % (emo, os.path.basename(path)))
+    if mouth_big_path:
+        log("Mouth big -> %s" % os.path.basename(mouth_big_path))
+    if mouth_medium_path:
+        log("Mouth medium -> %s" % os.path.basename(mouth_medium_path))
+    if mouth_small_path:
+        log("Mouth small -> %s" % os.path.basename(mouth_small_path))
+    if mouth_closed_path:
+        log("Mouth closed -> %s" % os.path.basename(mouth_closed_path))
 
     assets = {}
     for emo, path in emo_files.items():
@@ -180,6 +201,19 @@ def main():
     talk_assets = []
     for path in talk_files:
         talk_assets.append(load_asset(path, screen_size))
+    talk_variant_assets = []
+    for idx in (2, 3, 4):
+        for path in talk_files:
+            base = os.path.basename(path).lower()
+            if ("talk%d" % idx) in base or ("%d_talk" % idx) in base or ("talk-%d" % idx) in base:
+                talk_variant_assets.append(load_asset(path, screen_size))
+                break
+
+    mouth_big_asset = load_asset(mouth_big_path, screen_size) if mouth_big_path else None
+    mouth_medium_asset = load_asset(mouth_medium_path, screen_size) if mouth_medium_path else None
+    mouth_small_asset = load_asset(mouth_small_path, screen_size) if mouth_small_path else None
+    mouth_closed_asset = load_asset(mouth_closed_path, screen_size) if mouth_closed_path else None
+    use_mouth_sequence = bool(mouth_big_asset and mouth_small_asset and mouth_closed_asset)
 
     # UDP receive commands
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -204,6 +238,8 @@ def main():
     talk_pair_order = []
     next_talk_switch = 0.0
     talk_overlay_until = 0.0
+    talk_sequence = []
+    talk_seq_pos = 0
 
     clock = pygame.time.Clock()
 
@@ -267,33 +303,60 @@ def main():
             log("AUTO_TALK -> %s" % ("on" if auto_talk else "off"))
             last_logged_auto_talk = auto_talk
 
-        if is_talking and talk_assets:
-            if not talk_seq:
-                if len(talk_assets) >= 2:
-                    talk_pair_order = list(range(1, len(talk_assets)))
-                    random.shuffle(talk_pair_order)
-                    talk_seq = []
-                    for idx in talk_pair_order:
-                        talk_seq.extend([0, idx])
-                else:
-                    talk_seq = [0]
-                talk_seq_idx = 0
-                talk_idx = talk_seq[talk_seq_idx]
-                next_talk_switch = now + max(0.02, args.talk_interval)
-                talk_overlay_until = now + max(0.0, args.talk_overlay_duration)
-            elif now >= next_talk_switch:
-                talk_seq_idx += 1
-                if talk_seq_idx >= len(talk_seq):
+        if is_talking and (talk_assets or use_mouth_sequence):
+            if use_mouth_sequence:
+                if not talk_sequence:
+                    if talk_variant_assets:
+                        mid = random.choice(talk_variant_assets)
+                    elif mouth_medium_asset:
+                        mid = mouth_medium_asset
+                    else:
+                        mid = mouth_big_asset
+                    talk_sequence = [mouth_big_asset, mid, mouth_small_asset, mouth_closed_asset]
+                    talk_seq_pos = 0
+                    next_talk_switch = now + max(0.02, args.talk_interval)
+                    talk_overlay_until = now + max(0.0, args.talk_overlay_duration)
+                elif now >= next_talk_switch:
+                    talk_seq_pos += 1
+                    if talk_seq_pos >= len(talk_sequence):
+                        if talk_variant_assets:
+                            mid = random.choice(talk_variant_assets)
+                        elif mouth_medium_asset:
+                            mid = mouth_medium_asset
+                        else:
+                            mid = mouth_big_asset
+                        talk_sequence = [mouth_big_asset, mid, mouth_small_asset, mouth_closed_asset]
+                        talk_seq_pos = 0
+                    next_talk_switch = now + max(0.02, args.talk_interval)
+                    talk_overlay_until = now + max(0.0, args.talk_overlay_duration)
+                desired_asset = talk_sequence[talk_seq_pos]
+            else:
+                if not talk_seq:
                     if len(talk_assets) >= 2:
+                        talk_pair_order = list(range(1, len(talk_assets)))
                         random.shuffle(talk_pair_order)
                         talk_seq = []
                         for idx in talk_pair_order:
                             talk_seq.extend([0, idx])
+                    else:
+                        talk_seq = [0]
                     talk_seq_idx = 0
-                talk_idx = talk_seq[talk_seq_idx]
-                next_talk_switch = now + max(0.02, args.talk_interval)
-                talk_overlay_until = now + max(0.0, args.talk_overlay_duration)
-            desired_asset = talk_assets[talk_idx]
+                    talk_idx = talk_seq[talk_seq_idx]
+                    next_talk_switch = now + max(0.02, args.talk_interval)
+                    talk_overlay_until = now + max(0.0, args.talk_overlay_duration)
+                elif now >= next_talk_switch:
+                    talk_seq_idx += 1
+                    if talk_seq_idx >= len(talk_seq):
+                        if len(talk_assets) >= 2:
+                            random.shuffle(talk_pair_order)
+                            talk_seq = []
+                            for idx in talk_pair_order:
+                                talk_seq.extend([0, idx])
+                        talk_seq_idx = 0
+                    talk_idx = talk_seq[talk_seq_idx]
+                    next_talk_switch = now + max(0.02, args.talk_interval)
+                    talk_overlay_until = now + max(0.0, args.talk_overlay_duration)
+                desired_asset = talk_assets[talk_idx]
         else:
             desired_asset = assets.get(emo)
 
