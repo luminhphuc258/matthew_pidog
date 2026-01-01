@@ -4,13 +4,15 @@
 import argparse
 import os
 import socket
+import sys
 import time
 
 import pygame
 
 # Service defaults for desktop
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
-os.environ.setdefault("SDL_VIDEODRIVER", "x11")
+if sys.platform != "win32" and not os.environ.get("SDL_VIDEODRIVER"):
+    os.environ.setdefault("SDL_VIDEODRIVER", "x11")
 
 BG = (255, 255, 255)
 VALID_EMOS = {
@@ -108,6 +110,10 @@ def parse_args():
     return parser.parse_args()
 
 
+def log(msg):
+    print("[doreamonservice] %s" % msg, flush=True)
+
+
 def main():
     args = parse_args()
 
@@ -118,14 +124,23 @@ def main():
         screen = pygame.display.set_mode((w, h))
     else:
         flags = pygame.FULLSCREEN | pygame.NOFRAME
-        screen = pygame.display.set_mode((0, 0), flags)
+        try:
+            screen = pygame.display.set_mode((0, 0), flags)
+        except pygame.error:
+            w, h = parse_size(args.size)
+            screen = pygame.display.set_mode((w, h))
+            log("Fullscreen failed, fallback to windowed %dx%d" % (w, h))
 
     pygame.display.set_caption("Doraemon Service")
     pygame.mouse.set_visible(False)
+    log("SDL_VIDEODRIVER=%s" % os.environ.get("SDL_VIDEODRIVER", "default"))
+    log("Port=%d | windowed=%s | size=%s | talk_interval=%.2f | fade=%.2f" % (
+        args.port, args.windowed, args.size, args.talk_interval, args.fade
+    ))
 
     files = list_image_files(os.getcwd())
     if not files:
-        print("No image files found in the current folder.")
+        log("No image files found in the current folder.")
         return 2
 
     screen_size = screen.get_size()
@@ -141,14 +156,19 @@ def main():
     talk_files = find_talk_files(files)
 
     if missing:
-        print("Missing image for labels:")
+        log("Missing image for labels:")
         for emo in missing:
-            print("- %s" % emo)
-        print("Ensure filenames include the label text.")
+            log("- %s" % emo)
+        log("Ensure filenames include the label text.")
         return 2
 
     if not talk_files:
-        print("Warning: no talk images found (expected names like talk1..talk4).")
+        log("Warning: no talk images found (expected names like talk1..talk4).")
+    else:
+        log("Talk frames: %d" % len(talk_files))
+
+    for emo, path in sorted(emo_files.items()):
+        log("Asset %s -> %s" % (emo, os.path.basename(path)))
 
     assets = {}
     for emo, path in emo_files.items():
@@ -162,6 +182,7 @@ def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("127.0.0.1", args.port))
     sock.setblocking(False)
+    log("Listening UDP on 127.0.0.1:%d" % args.port)
 
     emo = "what_is_it"
     mouth_target = 0.0
@@ -177,6 +198,9 @@ def main():
     next_talk_switch = 0.0
 
     clock = pygame.time.Clock()
+
+    last_logged_emo = emo
+    last_logged_talk = force_talk
 
     while True:
         now = time.time()
@@ -220,6 +244,12 @@ def main():
                     return 0
 
         is_talking = (mouth_level > 0.02) or force_talk
+        if emo != last_logged_emo:
+            log("EMO -> %s" % emo)
+            last_logged_emo = emo
+        if force_talk != last_logged_talk:
+            log("TALK -> %s" % ("on" if force_talk else "off"))
+            last_logged_talk = force_talk
 
         if is_talking and talk_assets:
             if now >= next_talk_switch:
