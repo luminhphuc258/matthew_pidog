@@ -171,7 +171,11 @@ def main():
             face_missing.append(label)
         return path
 
-    baseface_path = face_path("baseface") if face_files else None
+    baseface_path = None
+    if face_files:
+        baseface_path = face_path("baseface")
+        if not baseface_path:
+            baseface_path = face_path("facebase")
     eyeopen_path = face_path("eyeopen") if face_files else None
     eyeclose_path = face_path("eyeclose") if face_files else None
     eyeleft_path = face_path("eyeleft") if face_files else None
