@@ -101,11 +101,14 @@ def scale_by_factor(surface, scale):
     )
 
 
-def maybe_set_colorkey(surface):
+def maybe_set_colorkey(surface, force=False):
     try:
         c = surface.get_at((0, 0))
     except Exception:
         return False
+    if force and c.a == 255:
+        surface.set_colorkey(c)
+        return True
     if c.a == 255 and c.r >= 245 and c.g >= 245 and c.b >= 245:
         surface.set_colorkey(c)
         return True
@@ -250,7 +253,7 @@ def main():
         if not path:
             return None
         part_raw = pygame.image.load(path).convert_alpha()
-        if maybe_set_colorkey(part_raw):
+        if maybe_set_colorkey(part_raw, force=True):
             log("Doreamonface %s: set colorkey from top-left pixel." % label)
         part_scaled = scale_by_factor(part_raw, base_scale)
         if part_raw.get_size() == base_raw.get_size():
