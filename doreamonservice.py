@@ -243,7 +243,10 @@ def main():
     base_scaled = scale_by_factor(base_raw, base_scale)
     base_rect = base_scaled.get_rect(center=(screen_size[0] // 2, screen_size[1] // 2))
 
-    def load_face_part(path, label):
+    eye_y_ratio = 0.32
+    mouth_y_ratio = 0.68
+
+    def load_face_part(path, label, role):
         if not path:
             return None
         part_raw = pygame.image.load(path).convert_alpha()
@@ -253,17 +256,24 @@ def main():
         if part_raw.get_size() == base_raw.get_size():
             rect = part_scaled.get_rect(topleft=base_rect.topleft)
         else:
-            rect = part_scaled.get_rect(center=base_rect.center)
+            if role == "eye":
+                anchor = (base_rect.centerx, base_rect.top + int(base_scaled.get_height() * eye_y_ratio))
+                rect = part_scaled.get_rect(center=anchor)
+            elif role == "mouth":
+                anchor = (base_rect.centerx, base_rect.top + int(base_scaled.get_height() * mouth_y_ratio))
+                rect = part_scaled.get_rect(center=anchor)
+            else:
+                rect = part_scaled.get_rect(center=base_rect.center)
         return part_scaled, rect
 
     face_assets["base"] = (base_scaled, base_rect)
-    face_assets["eyeopen"] = load_face_part(eyeopen_path, "eyeopen")
-    face_assets["eyeclose"] = load_face_part(eyeclose_path, "eyeclose")
-    face_assets["eyeleft"] = load_face_part(eyeleft_path, "eyeleft")
-    face_assets["eyeright"] = load_face_part(eyeright_path, "eyeright")
-    face_assets["mouthopen"] = load_face_part(mouthopen_path, "mouthopen")
-    face_assets["mouthmedium"] = load_face_part(mouthmedium_path, "mouthmedium")
-    face_assets["mouthclose"] = load_face_part(mouthclose_path, "mouthclose")
+    face_assets["eyeopen"] = load_face_part(eyeopen_path, "eyeopen", "eye")
+    face_assets["eyeclose"] = load_face_part(eyeclose_path, "eyeclose", "eye")
+    face_assets["eyeleft"] = load_face_part(eyeleft_path, "eyeleft", "eye")
+    face_assets["eyeright"] = load_face_part(eyeright_path, "eyeright", "eye")
+    face_assets["mouthopen"] = load_face_part(mouthopen_path, "mouthopen", "mouth")
+    face_assets["mouthmedium"] = load_face_part(mouthmedium_path, "mouthmedium", "mouth")
+    face_assets["mouthclose"] = load_face_part(mouthclose_path, "mouthclose", "mouth")
     use_face_parts = bool(
         face_assets["base"]
         and face_assets["eyeopen"]
@@ -281,6 +291,7 @@ def main():
         log("Error: doreamonface parts incomplete; cannot run.")
         return 2
     log("Talk mode: using doreamonface parts.")
+    log("Doreamonface anchor ratios: eyes=%.2f mouth=%.2f" % (eye_y_ratio, mouth_y_ratio))
     log("Doreamonface scale=%.3f | base_raw=%dx%d | base_scaled=%dx%d" % (
         base_scale,
         base_raw.get_width(),
@@ -441,24 +452,6 @@ def main():
         talk_face_mode = is_talking and use_face_parts
         desired_asset = None
         if talk_face_mode:
-            if now >= eye_next_switch:
-                if eye_state == "close":
-                    eye_state = "open"
-                    eye_next_switch = now + random.uniform(1.2, 2.8)
-                else:
-                    roll = random.random()
-                    if roll < 0.2:
-                        eye_state = "close"
-                        eye_next_switch = now + 0.12
-                    elif roll < 0.4:
-                        eye_state = "left"
-                        eye_next_switch = now + random.uniform(0.2, 0.5)
-                    elif roll < 0.6:
-                        eye_state = "right"
-                        eye_next_switch = now + random.uniform(0.2, 0.5)
-                    else:
-                        eye_state = "open"
-                        eye_next_switch = now + random.uniform(0.4, 1.2)
             if now >= mouth_next_switch:
                 if mouth_level > 0.7:
                     mouth_state = "open"
@@ -469,7 +462,14 @@ def main():
                 else:
                     mouth_state = mouth_seq[mouth_seq_idx]
                     mouth_seq_idx = (mouth_seq_idx + 1) % len(mouth_seq)
-                mouth_next_switch = now + max(0.05, args.talk_interval * 0.25)
+
+                if eye_state == "close":
+                    eye_state = "open"
+                else:
+                    eye_state = "close" if random.random() < 0.25 else "open"
+
+                mouth_next_switch = now + max(0.18, args.talk_interval * 0.9)
+                eye_next_switch = now + max(0.4, args.talk_interval * 1.2)
         elif is_talking and (talk_assets or use_mouth_sequence):
             if use_mouth_sequence:
                 if not talk_sequence:
