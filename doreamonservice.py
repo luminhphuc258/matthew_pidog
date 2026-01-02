@@ -50,13 +50,6 @@ def scale_to_fit(surface, target_size):
     return pygame.transform.smoothscale(surface, new_size)
 
 
-def scale_to_exact(surface, target_size):
-    tw, th = target_size
-    if tw <= 0 or th <= 0:
-        return surface
-    return pygame.transform.smoothscale(surface, (int(tw), int(th)))
-
-
 def list_image_files(folder):
     files = []
     for name in os.listdir(folder):
@@ -99,11 +92,24 @@ def load_asset(path, screen_size):
     return scaled, rect
 
 
-def load_part(path, target_size, center):
-    surf = pygame.image.load(path).convert_alpha()
-    scaled = scale_to_exact(surf, target_size)
-    rect = scaled.get_rect(center=center)
-    return scaled, rect
+def scale_by_factor(surface, scale):
+    if scale <= 0:
+        return surface
+    w, h = surface.get_size()
+    return pygame.transform.smoothscale(
+        surface, (max(1, int(w * scale)), max(1, int(h * scale)))
+    )
+
+
+def maybe_set_colorkey(surface):
+    try:
+        c = surface.get_at((0, 0))
+    except Exception:
+        return False
+    if c.a == 255 and c.r >= 245 and c.g >= 245 and c.b >= 245:
+        surface.set_colorkey(c)
+        return True
+    return False
 
 
 def blit_with_alpha(screen, surface, rect, alpha):
@@ -173,11 +179,11 @@ def main():
 
     baseface_path = None
     if face_files:
-        baseface_path = face_path("baseface", record_missing=False)
+        baseface_path = face_path("facebase", record_missing=False)
         if not baseface_path:
             baseface_path = face_path("facebase", record_missing=False)
         if not baseface_path:
-            face_missing.append("baseface")
+            face_missing.append("facebase")
     eyeopen_path = face_path("eyeopen") if face_files else None
     eyeclose_path = face_path("eyeclose") if face_files else None
     eyeleft_path = face_path("eyeleft") if face_files else None
@@ -229,21 +235,35 @@ def main():
         log("Error: doreamonface missing baseface image.")
         return 2
 
-    base_asset = load_asset(baseface_path, screen_size)
-    part_size = base_asset[0].get_size()
-    center = base_asset[1].center
+    base_raw = pygame.image.load(baseface_path).convert_alpha()
+    base_scale = min(
+        float(screen_size[0]) / base_raw.get_width(),
+        float(screen_size[1]) / base_raw.get_height(),
+    )
+    base_scaled = scale_by_factor(base_raw, base_scale)
+    base_rect = base_scaled.get_rect(center=(screen_size[0] // 2, screen_size[1] // 2))
 
-    def load_face_part(path):
-        return load_part(path, part_size, center) if path else None
+    def load_face_part(path, label):
+        if not path:
+            return None
+        part_raw = pygame.image.load(path).convert_alpha()
+        if maybe_set_colorkey(part_raw):
+            log("Doreamonface %s: set colorkey from top-left pixel." % label)
+        part_scaled = scale_by_factor(part_raw, base_scale)
+        if part_raw.get_size() == base_raw.get_size():
+            rect = part_scaled.get_rect(topleft=base_rect.topleft)
+        else:
+            rect = part_scaled.get_rect(center=base_rect.center)
+        return part_scaled, rect
 
-    face_assets["base"] = base_asset
-    face_assets["eyeopen"] = load_face_part(eyeopen_path)
-    face_assets["eyeclose"] = load_face_part(eyeclose_path)
-    face_assets["eyeleft"] = load_face_part(eyeleft_path)
-    face_assets["eyeright"] = load_face_part(eyeright_path)
-    face_assets["mouthopen"] = load_face_part(mouthopen_path)
-    face_assets["mouthmedium"] = load_face_part(mouthmedium_path)
-    face_assets["mouthclose"] = load_face_part(mouthclose_path)
+    face_assets["base"] = (base_scaled, base_rect)
+    face_assets["eyeopen"] = load_face_part(eyeopen_path, "eyeopen")
+    face_assets["eyeclose"] = load_face_part(eyeclose_path, "eyeclose")
+    face_assets["eyeleft"] = load_face_part(eyeleft_path, "eyeleft")
+    face_assets["eyeright"] = load_face_part(eyeright_path, "eyeright")
+    face_assets["mouthopen"] = load_face_part(mouthopen_path, "mouthopen")
+    face_assets["mouthmedium"] = load_face_part(mouthmedium_path, "mouthmedium")
+    face_assets["mouthclose"] = load_face_part(mouthclose_path, "mouthclose")
     use_face_parts = bool(
         face_assets["base"]
         and face_assets["eyeopen"]
@@ -261,6 +281,13 @@ def main():
         log("Error: doreamonface parts incomplete; cannot run.")
         return 2
     log("Talk mode: using doreamonface parts.")
+    log("Doreamonface scale=%.3f | base_raw=%dx%d | base_scaled=%dx%d" % (
+        base_scale,
+        base_raw.get_width(),
+        base_raw.get_height(),
+        base_scaled.get_width(),
+        base_scaled.get_height(),
+    ))
     face_path_map = {
         "baseface": baseface_path,
         "eyeopen": eyeopen_path,
