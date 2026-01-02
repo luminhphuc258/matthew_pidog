@@ -165,17 +165,19 @@ def main():
     face_files = list_image_files(face_dir) if os.path.isdir(face_dir) else []
     face_missing = []
 
-    def face_path(label):
+    def face_path(label, record_missing=True):
         path = find_label_file(face_files, label)
-        if not path:
+        if not path and record_missing:
             face_missing.append(label)
         return path
 
     baseface_path = None
     if face_files:
-        baseface_path = face_path("baseface")
+        baseface_path = face_path("baseface", record_missing=False)
         if not baseface_path:
-            baseface_path = face_path("facebase")
+            baseface_path = face_path("facebase", record_missing=False)
+        if not baseface_path:
+            face_missing.append("baseface")
     eyeopen_path = face_path("eyeopen") if face_files else None
     eyeclose_path = face_path("eyeclose") if face_files else None
     eyeleft_path = face_path("eyeleft") if face_files else None
