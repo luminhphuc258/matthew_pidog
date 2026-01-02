@@ -50,6 +50,13 @@ def scale_to_fit(surface, target_size):
     return pygame.transform.smoothscale(surface, new_size)
 
 
+def scale_to_exact(surface, target_size):
+    tw, th = target_size
+    if tw <= 0 or th <= 0:
+        return surface
+    return pygame.transform.smoothscale(surface, (int(tw), int(th)))
+
+
 def list_image_files(folder):
     files = []
     for name in os.listdir(folder):
@@ -89,6 +96,13 @@ def load_asset(path, screen_size):
     surf = pygame.image.load(path).convert_alpha()
     scaled = scale_to_fit(surf, screen_size)
     rect = scaled.get_rect(center=(screen_size[0] // 2, screen_size[1] // 2))
+    return scaled, rect
+
+
+def load_part(path, target_size, center):
+    surf = pygame.image.load(path).convert_alpha()
+    scaled = scale_to_exact(surf, target_size)
+    rect = scaled.get_rect(center=center)
     return scaled, rect
 
 
@@ -147,6 +161,24 @@ def main():
         return 2
 
     screen_size = screen.get_size()
+    face_dir = os.path.join(os.getcwd(), "doreamonface")
+    face_files = list_image_files(face_dir) if os.path.isdir(face_dir) else []
+    face_missing = []
+
+    def face_path(label):
+        path = find_label_file(face_files, label)
+        if not path:
+            face_missing.append(label)
+        return path
+
+    baseface_path = face_path("baseface") if face_files else None
+    eyeopen_path = face_path("eyeopen") if face_files else None
+    eyeclose_path = face_path("eyeclose") if face_files else None
+    eyeleft_path = face_path("eyeleft") if face_files else None
+    eyeright_path = face_path("eyeright") if face_files else None
+    mouthopen_path = face_path("mouthopen") if face_files else None
+    mouthmedium_path = face_path("mouthmedium") if face_files else None
+    mouthclose_path = face_path("mouthclose") if face_files else None
     emo_files = {}
     missing = []
     for emo in sorted(VALID_EMOS):
@@ -181,6 +213,41 @@ def main():
         mouth_missing.append("mouth_closed")
     if mouth_missing:
         log("Warning: missing mouth images for talk sequence: %s" % ", ".join(mouth_missing))
+
+    face_assets = {}
+    use_face_parts = False
+    if face_files and baseface_path:
+        base_asset = load_asset(baseface_path, screen_size)
+        part_size = base_asset[0].get_size()
+        center = base_asset[1].center
+
+        def load_face_part(path):
+            return load_part(path, part_size, center) if path else None
+
+        face_assets["base"] = base_asset
+        face_assets["eyeopen"] = load_face_part(eyeopen_path)
+        face_assets["eyeclose"] = load_face_part(eyeclose_path)
+        face_assets["eyeleft"] = load_face_part(eyeleft_path)
+        face_assets["eyeright"] = load_face_part(eyeright_path)
+        face_assets["mouthopen"] = load_face_part(mouthopen_path)
+        face_assets["mouthmedium"] = load_face_part(mouthmedium_path)
+        face_assets["mouthclose"] = load_face_part(mouthclose_path)
+        use_face_parts = bool(
+            face_assets["base"]
+            and face_assets["eyeopen"]
+            and face_assets["eyeclose"]
+            and face_assets["eyeleft"]
+            and face_assets["eyeright"]
+            and face_assets["mouthopen"]
+            and face_assets["mouthmedium"]
+            and face_assets["mouthclose"]
+        )
+    if face_files and face_missing:
+        log("Warning: missing doreamonface parts: %s" % ", ".join(sorted(set(face_missing))))
+    if face_files and use_face_parts:
+        log("Talk mode: using doreamonface parts.")
+    elif not face_files:
+        log("Warning: doreamonface folder not found or empty; talk will use legacy images.")
 
     for emo, path in sorted(emo_files.items()):
         log("Asset %s -> %s" % (emo, os.path.basename(path)))
@@ -235,6 +302,12 @@ def main():
     talk_overlay_until = 0.0
     talk_sequence = []
     talk_seq_pos = 0
+    eye_state = "open"
+    eye_next_switch = 0.0
+    mouth_state = "close"
+    mouth_next_switch = 0.0
+    mouth_seq = ["open", "medium", "close", "medium"]
+    mouth_seq_idx = 0
 
     clock = pygame.time.Clock()
 
@@ -298,7 +371,39 @@ def main():
             log("AUTO_TALK -> %s" % ("on" if auto_talk else "off"))
             last_logged_auto_talk = auto_talk
 
-        if is_talking and (talk_assets or use_mouth_sequence):
+        talk_face_mode = is_talking and use_face_parts
+        desired_asset = None
+        if talk_face_mode:
+            if now >= eye_next_switch:
+                if eye_state == "close":
+                    eye_state = "open"
+                    eye_next_switch = now + random.uniform(1.2, 2.8)
+                else:
+                    roll = random.random()
+                    if roll < 0.2:
+                        eye_state = "close"
+                        eye_next_switch = now + 0.12
+                    elif roll < 0.4:
+                        eye_state = "left"
+                        eye_next_switch = now + random.uniform(0.2, 0.5)
+                    elif roll < 0.6:
+                        eye_state = "right"
+                        eye_next_switch = now + random.uniform(0.2, 0.5)
+                    else:
+                        eye_state = "open"
+                        eye_next_switch = now + random.uniform(0.4, 1.2)
+            if now >= mouth_next_switch:
+                if mouth_level > 0.7:
+                    mouth_state = "open"
+                elif mouth_level > 0.35:
+                    mouth_state = "medium"
+                elif mouth_level > 0.1:
+                    mouth_state = random.choice(["medium", "close"])
+                else:
+                    mouth_state = mouth_seq[mouth_seq_idx]
+                    mouth_seq_idx = (mouth_seq_idx + 1) % len(mouth_seq)
+                mouth_next_switch = now + max(0.05, args.talk_interval * 0.25)
+        elif is_talking and (talk_assets or use_mouth_sequence):
             if use_mouth_sequence:
                 if not talk_sequence:
                     tail_asset = None
@@ -358,7 +463,9 @@ def main():
         if current_asset is None:
             current_asset = desired_asset
 
-        if desired_asset != current_asset and desired_asset is not None:
+        if talk_face_mode:
+            next_asset = None
+        elif desired_asset != current_asset and desired_asset is not None:
             if is_talking:
                 current_asset = desired_asset
                 next_asset = None
@@ -366,26 +473,48 @@ def main():
                 if next_asset != desired_asset:
                     next_asset = desired_asset
                     transition_start = now
-        if is_talking:
+        if is_talking and not talk_face_mode:
             next_asset = None
 
         screen.fill(BG)
 
-        if next_asset is not None:
-            alpha = clamp((now - transition_start) / max(0.01, args.fade), 0.0, 1.0)
-            if current_asset:
-                blit_with_alpha(screen, current_asset[0], current_asset[1], int(255 * (1.0 - alpha)))
-            blit_with_alpha(screen, next_asset[0], next_asset[1], int(255 * alpha))
-            if alpha >= 1.0:
-                current_asset = next_asset
-                next_asset = None
+        if talk_face_mode and face_assets:
+            base_asset = face_assets.get("base")
+            if base_asset:
+                screen.blit(base_asset[0], base_asset[1])
+            eye_key = {
+                "open": "eyeopen",
+                "close": "eyeclose",
+                "left": "eyeleft",
+                "right": "eyeright",
+            }.get(eye_state, "eyeopen")
+            mouth_key = {
+                "open": "mouthopen",
+                "medium": "mouthmedium",
+                "close": "mouthclose",
+            }.get(mouth_state, "mouthclose")
+            eye_asset = face_assets.get(eye_key)
+            mouth_asset = face_assets.get(mouth_key)
+            if eye_asset:
+                screen.blit(eye_asset[0], eye_asset[1])
+            if mouth_asset:
+                screen.blit(mouth_asset[0], mouth_asset[1])
         else:
-            if current_asset:
-                screen.blit(current_asset[0], current_asset[1])
-        if is_talking and current_asset and now < talk_overlay_until and args.talk_overlay_alpha > 0:
-            overlay = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
-            overlay.fill((255, 255, 255, clamp(args.talk_overlay_alpha, 0, 255)))
-            screen.blit(overlay, (0, 0))
+            if next_asset is not None:
+                alpha = clamp((now - transition_start) / max(0.01, args.fade), 0.0, 1.0)
+                if current_asset:
+                    blit_with_alpha(screen, current_asset[0], current_asset[1], int(255 * (1.0 - alpha)))
+                blit_with_alpha(screen, next_asset[0], next_asset[1], int(255 * alpha))
+                if alpha >= 1.0:
+                    current_asset = next_asset
+                    next_asset = None
+            else:
+                if current_asset:
+                    screen.blit(current_asset[0], current_asset[1])
+            if is_talking and current_asset and now < talk_overlay_until and args.talk_overlay_alpha > 0:
+                overlay = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
+                overlay.fill((255, 255, 255, clamp(args.talk_overlay_alpha, 0, 255)))
+                screen.blit(overlay, (0, 0))
 
         pygame.display.flip()
         clock.tick(args.fps)
