@@ -216,38 +216,72 @@ def main():
 
     face_assets = {}
     use_face_parts = False
-    if face_files and baseface_path:
-        base_asset = load_asset(baseface_path, screen_size)
-        part_size = base_asset[0].get_size()
-        center = base_asset[1].center
+    if not face_files:
+        log("Error: doreamonface folder not found or empty.")
+        return 2
+    if not baseface_path:
+        log("Error: doreamonface missing baseface image.")
+        return 2
 
-        def load_face_part(path):
-            return load_part(path, part_size, center) if path else None
+    base_asset = load_asset(baseface_path, screen_size)
+    part_size = base_asset[0].get_size()
+    center = base_asset[1].center
 
-        face_assets["base"] = base_asset
-        face_assets["eyeopen"] = load_face_part(eyeopen_path)
-        face_assets["eyeclose"] = load_face_part(eyeclose_path)
-        face_assets["eyeleft"] = load_face_part(eyeleft_path)
-        face_assets["eyeright"] = load_face_part(eyeright_path)
-        face_assets["mouthopen"] = load_face_part(mouthopen_path)
-        face_assets["mouthmedium"] = load_face_part(mouthmedium_path)
-        face_assets["mouthclose"] = load_face_part(mouthclose_path)
-        use_face_parts = bool(
-            face_assets["base"]
-            and face_assets["eyeopen"]
-            and face_assets["eyeclose"]
-            and face_assets["eyeleft"]
-            and face_assets["eyeright"]
-            and face_assets["mouthopen"]
-            and face_assets["mouthmedium"]
-            and face_assets["mouthclose"]
-        )
-    if face_files and face_missing:
-        log("Warning: missing doreamonface parts: %s" % ", ".join(sorted(set(face_missing))))
-    if face_files and use_face_parts:
-        log("Talk mode: using doreamonface parts.")
-    elif not face_files:
-        log("Warning: doreamonface folder not found or empty; talk will use legacy images.")
+    def load_face_part(path):
+        return load_part(path, part_size, center) if path else None
+
+    face_assets["base"] = base_asset
+    face_assets["eyeopen"] = load_face_part(eyeopen_path)
+    face_assets["eyeclose"] = load_face_part(eyeclose_path)
+    face_assets["eyeleft"] = load_face_part(eyeleft_path)
+    face_assets["eyeright"] = load_face_part(eyeright_path)
+    face_assets["mouthopen"] = load_face_part(mouthopen_path)
+    face_assets["mouthmedium"] = load_face_part(mouthmedium_path)
+    face_assets["mouthclose"] = load_face_part(mouthclose_path)
+    use_face_parts = bool(
+        face_assets["base"]
+        and face_assets["eyeopen"]
+        and face_assets["eyeclose"]
+        and face_assets["eyeleft"]
+        and face_assets["eyeright"]
+        and face_assets["mouthopen"]
+        and face_assets["mouthmedium"]
+        and face_assets["mouthclose"]
+    )
+    if face_missing:
+        log("Error: missing doreamonface parts: %s" % ", ".join(sorted(set(face_missing))))
+        return 2
+    if not use_face_parts:
+        log("Error: doreamonface parts incomplete; cannot run.")
+        return 2
+    log("Talk mode: using doreamonface parts.")
+    face_path_map = {
+        "baseface": baseface_path,
+        "eyeopen": eyeopen_path,
+        "eyeclose": eyeclose_path,
+        "eyeleft": eyeleft_path,
+        "eyeright": eyeright_path,
+        "mouthopen": mouthopen_path,
+        "mouthmedium": mouthmedium_path,
+        "mouthclose": mouthclose_path,
+    }
+    for key, asset in (
+        ("baseface", face_assets["base"]),
+        ("eyeopen", face_assets["eyeopen"]),
+        ("eyeclose", face_assets["eyeclose"]),
+        ("eyeleft", face_assets["eyeleft"]),
+        ("eyeright", face_assets["eyeright"]),
+        ("mouthopen", face_assets["mouthopen"]),
+        ("mouthmedium", face_assets["mouthmedium"]),
+        ("mouthclose", face_assets["mouthclose"]),
+    ):
+        if asset:
+            log("Doreamonface %s -> %s (%dx%d)" % (
+                key,
+                os.path.basename(face_path_map.get(key, "")),
+                asset[0].get_width(),
+                asset[0].get_height(),
+            ))
 
     for emo, path in sorted(emo_files.items()):
         log("Asset %s -> %s" % (emo, os.path.basename(path)))
