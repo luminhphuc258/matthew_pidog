@@ -469,7 +469,15 @@ def main():
                 if eye_state == "close":
                     eye_state = "open"
                 else:
-                    eye_state = "close" if random.random() < 0.25 else "open"
+                    roll = random.random()
+                    if roll < 0.22:
+                        eye_state = "close"
+                    elif roll < 0.40:
+                        eye_state = "left"
+                    elif roll < 0.58:
+                        eye_state = "right"
+                    else:
+                        eye_state = "open"
 
                 mouth_next_switch = now + max(0.18, args.talk_interval * 0.9)
                 eye_next_switch = now + max(0.4, args.talk_interval * 1.2)
