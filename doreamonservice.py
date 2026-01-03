@@ -387,8 +387,8 @@ def main():
     eye_next_switch = 0.0
     mouth_state = "close"
     mouth_next_switch = 0.0
-    mouth_seq = ["open", "medium", "close", "medium"]
-    mouth_seq_idx = 0
+    talk_pair_seq = []
+    talk_pair_idx = 0
 
     clock = pygame.time.Clock()
 
@@ -456,31 +456,22 @@ def main():
         desired_asset = None
         if talk_face_mode:
             if now >= mouth_next_switch:
-                if mouth_level > 0.7:
-                    mouth_state = "open"
-                elif mouth_level > 0.35:
-                    mouth_state = "medium"
-                elif mouth_level > 0.1:
-                    mouth_state = random.choice(["medium", "close"])
-                else:
-                    mouth_state = mouth_seq[mouth_seq_idx]
-                    mouth_seq_idx = (mouth_seq_idx + 1) % len(mouth_seq)
+                if not talk_pair_seq or talk_pair_idx >= len(talk_pair_seq):
+                    middle_pairs = [
+                        ("open", "medium"),
+                        ("close", "close"),
+                        ("left", "medium"),
+                        ("right", "close"),
+                    ]
+                    random.shuffle(middle_pairs)
+                    talk_pair_seq = [("open", "open")] + middle_pairs + [("open", "close")]
+                    talk_pair_idx = 0
 
-                if eye_state == "close":
-                    eye_state = "open"
-                else:
-                    roll = random.random()
-                    if roll < 0.22:
-                        eye_state = "close"
-                    elif roll < 0.40:
-                        eye_state = "left"
-                    elif roll < 0.58:
-                        eye_state = "right"
-                    else:
-                        eye_state = "open"
+                eye_state, mouth_state = talk_pair_seq[talk_pair_idx]
+                talk_pair_idx += 1
 
-                mouth_next_switch = now + max(0.18, args.talk_interval * 0.9)
-                eye_next_switch = now + max(0.4, args.talk_interval * 1.2)
+                mouth_next_switch = now + max(0.35, args.talk_interval * 1.1)
+                eye_next_switch = mouth_next_switch
         elif is_talking and (talk_assets or use_mouth_sequence):
             if use_mouth_sequence:
                 if not talk_sequence:
