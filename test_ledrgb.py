@@ -1,3 +1,11 @@
+import os
+import re
+import json
+import shutil
+import subprocess
+from time import sleep
+from pathlib import Path
+
 from pidog.rgb_strip import RGBStrip  
 
 
