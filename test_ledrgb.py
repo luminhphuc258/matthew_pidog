@@ -5,8 +5,7 @@ import time
 import traceback
 
 from pidog.rgb_strip import RGBStrip
-from matthewpidog_boot import MatthewPidogBootClass  # <-- đổi đúng tên file bạn đang lưu class này
-
+from matthewpidogclassinit import MatthewPidogBootClass
 
 def safe_call(name, fn, *args, **kwargs):
     try:
