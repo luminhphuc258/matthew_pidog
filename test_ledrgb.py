@@ -16,7 +16,7 @@ class DummyIMU:
 pidog_mod.Sh3001 = DummyIMU
 # ======================================================
 
-from matthewpidog_boot import MatthewPidogBootClass  # đổi đúng tên file class của bạn
+from matthewpidogclassinit import MatthewPidogBootClass  # đổi đúng tên file class của bạn
 
 def main():
     boot = MatthewPidogBootClass(enable_force_head=False)
