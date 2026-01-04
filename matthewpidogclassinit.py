@@ -15,22 +15,25 @@ from robot_hat import Servo
 
 class _NoIMU:
     """
-    Drop-in replacement for SH3001 so pidog won't touch the real IMU.
-    Important: pidog.pidog._imu_thread calls _sh3001_getimudata().
+    Drop-in replacement for SH3001.
+    IMPORTANT: pidog's _imu_thread expects:
+        data = imu._sh3001_getimudata()
+        accData, gyroData = data
+    so we MUST return exactly a 2-tuple: (acc, gyro)
     """
     def __init__(self, *args, **kwargs):
         print("[BOOT] IMU disabled: using _NoIMU (skip SH3001 init)")
 
-    # Called by pidog's imu thread in your stack trace
     def _sh3001_getimudata(self):
-        # Return a safe structure; pidog usually just stores/uses it for balance.
-        # If your pidog expects a tuple/list, this dict still often works because
-        # many implementations treat it as "data container".
-        return {
-            "acc": (0.0, 0.0, 0.0),
-            "gyro": (0.0, 0.0, 0.0),
-            "euler": (0.0, 0.0, 0.0),
-        }
+        acc = (0.0, 0.0, 0.0)
+        gyro = (0.0, 0.0, 0.0)
+        return (acc, gyro)
+
+
+def _noop_imu_thread(self):
+    """No-op imu thread to avoid touching IMU at all."""
+    # nếu pidog có loop nền khác thì kệ, ở đây mình cho thread kết thúc luôn
+    return
 
 
 class MatthewPidogBootClass:
@@ -39,7 +42,7 @@ class MatthewPidogBootClass:
     - unlock speaker (SPK_EN)
     - load LEG_INIT_ANGLES from pose file (P0..P7)
     - init Pidog
-    - (optional) disable IMU init/read to avoid conflicts with your IMU service
+    - (optional) disable IMU init/read to avoid conflicts with IMU service
     - force head servo after init (bypass pidog)
     - support_stand(): 5-phase slow synchronized servo recovery/stand support
     """
@@ -237,11 +240,6 @@ class MatthewPidogBootClass:
         step: int = 1,
         delay: float = 0.03,
     ):
-        """
-        Di chuyển 2 servo đồng bộ, mượt:
-        - set về start trước (nhẹ)
-        - mỗi tick cập nhật cả A & B rồi sleep(delay)
-        """
         sA = Servo(pA)
         sB = Servo(pB)
 
@@ -251,7 +249,6 @@ class MatthewPidogBootClass:
         a = a_start
         b = b_start
 
-        # set initial
         try:
             sA.angle(a)
             sB.angle(b)
@@ -284,14 +281,6 @@ class MatthewPidogBootClass:
             sleep(delay)
 
     def support_stand(self, step: int = 1, delay: float = 0.03, pause_sec: float = 1.0):
-        """
-        5 phases đúng yêu cầu bạn:
-        Phase 1: P1 +90 -> +5,  P3 -76 -> +5
-        Phase 2: P6 +32 -> +63, P4 +4  -> -39
-        Phase 3: P0 -8  -> -55, P2 +15 -> +74
-        Phase 4: P4 -39 -> -2,  P6 +63 -> +33
-        Phase 5: P0 -55 -> +12, P2 +74 -> -2
-        """
         print("[support_stand] Phase 1: P1 +90 -> +5, P3 -76 -> +5")
         self.smooth_pair("P1", +90, +5, "P3", -76, +5, step=step, delay=delay)
         sleep(pause_sec)
@@ -316,15 +305,29 @@ class MatthewPidogBootClass:
     # ===================== INIT PIDOG =====================
 
     def _patch_disable_imu(self):
-        """Patch pidog internal Sh3001 class to _NoIMU BEFORE Pidog() init."""
+        """
+        Patch pidog internals BEFORE Pidog() init:
+        - Replace Sh3001 driver with _NoIMU
+        - Replace Pidog._imu_thread with no-op to avoid background exceptions
+        """
         if not self.disable_imu:
             return
+
         try:
             import pidog.pidog as pidog_mod
+
+            # 1) patch IMU driver class
             pidog_mod.Sh3001 = _NoIMU
-            print("[BOOT] IMU patch applied: pidog.pidog.Sh3001 -> _NoIMU")
+
+            # 2) patch imu thread to no-op (prevents any read loop)
+            try:
+                pidog_mod.Pidog._imu_thread = _noop_imu_thread
+            except Exception:
+                pass
+
+            print("[BOOT] IMU disabled: patched Sh3001 + patched Pidog._imu_thread (no-op)")
         except Exception as e:
-            print(f"[WARN] IMU patch failed: {e}")
+            print(f"[WARN] IMU disable patch failed: {e}")
 
     def create(self) -> Pidog:
         print("=== PidogBootstrap.create() ===")
