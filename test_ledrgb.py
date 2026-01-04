@@ -28,6 +28,16 @@ def main():
     strip.set_mode("breath", "red", bps=1.2)
     time.sleep(3)
 
+    # Test 2: đổi màu để chắc chắn LED nhận lệnh
+    print("[TEST] breath red")
+    strip.set_mode("breath", "blue", bps=1.2)
+    time.sleep(3)
+
+      # Test 2: đổi màu để chắc chắn LED nhận lệnh
+    print("[TEST] breath red")
+    strip.set_mode("breath", "organe", bps=1.2)
+    time.sleep(3)
+
     # Test 3: off (nếu supported)
     print("[TEST] off")
     try:
