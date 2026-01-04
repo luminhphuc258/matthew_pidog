@@ -20,7 +20,7 @@ def main():
 
     # Test 1: breath blue (như bạn hay dùng)
     print("[TEST] breath blue")
-    strip.set_mode("breath", "blue", bps=1.2)
+    strip.set_mode("breath", "white", bps=1.2)
     time.sleep(3)
 
     # Test 2: đổi màu để chắc chắn LED nhận lệnh
