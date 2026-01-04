@@ -13,12 +13,33 @@ from pidog import Pidog
 from robot_hat import Servo
 
 
+class _NoIMU:
+    """
+    Drop-in replacement for SH3001 so pidog won't touch the real IMU.
+    Important: pidog.pidog._imu_thread calls _sh3001_getimudata().
+    """
+    def __init__(self, *args, **kwargs):
+        print("[BOOT] IMU disabled: using _NoIMU (skip SH3001 init)")
+
+    # Called by pidog's imu thread in your stack trace
+    def _sh3001_getimudata(self):
+        # Return a safe structure; pidog usually just stores/uses it for balance.
+        # If your pidog expects a tuple/list, this dict still often works because
+        # many implementations treat it as "data container".
+        return {
+            "acc": (0.0, 0.0, 0.0),
+            "gyro": (0.0, 0.0, 0.0),
+            "euler": (0.0, 0.0, 0.0),
+        }
+
+
 class MatthewPidogBootClass:
     """
     Reusable helper:
     - unlock speaker (SPK_EN)
     - load LEG_INIT_ANGLES from pose file (P0..P7)
     - init Pidog
+    - (optional) disable IMU init/read to avoid conflicts with your IMU service
     - force head servo after init (bypass pidog)
     - support_stand(): 5-phase slow synchronized servo recovery/stand support
     """
@@ -35,6 +56,7 @@ class MatthewPidogBootClass:
         force_head_port: str = "P10",
         force_head_angle: float = -90,
         enable_force_head: bool = True,
+        disable_imu: bool = True,   # ✅ NEW
     ):
         self.speaker_device = speaker_device
         self.pose_file = Path(pose_file) if not isinstance(pose_file, Path) else pose_file
@@ -50,6 +72,8 @@ class MatthewPidogBootClass:
         self.force_head_port = force_head_port
         self.force_head_angle = force_head_angle
         self.enable_force_head = enable_force_head
+
+        self.disable_imu = disable_imu  # ✅ NEW
 
         self.dog: Pidog | None = None
 
@@ -291,6 +315,17 @@ class MatthewPidogBootClass:
 
     # ===================== INIT PIDOG =====================
 
+    def _patch_disable_imu(self):
+        """Patch pidog internal Sh3001 class to _NoIMU BEFORE Pidog() init."""
+        if not self.disable_imu:
+            return
+        try:
+            import pidog.pidog as pidog_mod
+            pidog_mod.Sh3001 = _NoIMU
+            print("[BOOT] IMU patch applied: pidog.pidog.Sh3001 -> _NoIMU")
+        except Exception as e:
+            print(f"[WARN] IMU patch failed: {e}")
+
     def create(self) -> Pidog:
         print("=== PidogBootstrap.create() ===")
         self.unlock_speaker()
@@ -301,6 +336,9 @@ class MatthewPidogBootClass:
         print("LEG_PINS :", self.leg_pins,  "angles:", leg_init_angles)
         print("HEAD_PINS:", self.head_pins, "angles:", self.head_init_angles)
         print("TAIL_PIN :", self.tail_pin,  "angle :", self.tail_init_angle)
+
+        # ✅ IMPORTANT: disable IMU init/read before creating Pidog
+        self._patch_disable_imu()
 
         self.dog = Pidog(
             leg_pins=self.leg_pins,
