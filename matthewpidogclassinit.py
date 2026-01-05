@@ -203,6 +203,8 @@ class MatthewPidogBootClass:
         fallback = fallback or [-3, 89, 9, -80, 3, 90, 10, -90]
 
         try:
+            if str(os.environ.get("SKIP_POSE_FILE", "0")).lower() in ("1", "true", "yes", "on"):
+                return fallback
             if not self.pose_file.exists():
                 print(f"[WARN] Không thấy {self.pose_file}, dùng fallback LEG_INIT_ANGLES.")
                 return fallback
@@ -224,6 +226,8 @@ class MatthewPidogBootClass:
     def load_head_init_angles(self, fallback=None):
         fallback = fallback or self.head_init_angles or [80, -70, 90]
         try:
+            if str(os.environ.get("SKIP_POSE_FILE", "0")).lower() in ("1", "true", "yes", "on"):
+                return fallback
             if not self.pose_file.exists():
                 return fallback
             pose = self._parse_pose_file(self.pose_file)
