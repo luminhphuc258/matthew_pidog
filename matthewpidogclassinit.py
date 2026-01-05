@@ -62,6 +62,7 @@ class MatthewPidogBootClass:
         disable_imu: bool = True,   # ✅ NEW
         skip_head_init: bool | None = None,
         skip_mcu_reset: bool | None = None,
+        skip_speaker_unlock: bool | None = None,
     ):
         self.speaker_device = speaker_device
         self.pose_file = Path(pose_file) if not isinstance(pose_file, Path) else pose_file
@@ -90,6 +91,12 @@ class MatthewPidogBootClass:
             self.skip_mcu_reset = str(env).strip().lower() in ("1", "true", "yes", "on")
         else:
             self.skip_mcu_reset = bool(skip_mcu_reset)
+
+        if skip_speaker_unlock is None:
+            env = os.environ.get("PIDOG_SKIP_SPK_UNLOCK") or os.environ.get("SKIP_SPK_UNLOCK")
+            self.skip_speaker_unlock = str(env).strip().lower() in ("1", "true", "yes", "on")
+        else:
+            self.skip_speaker_unlock = bool(skip_speaker_unlock)
 
         self.dog: Pidog | None = None
 
@@ -376,7 +383,8 @@ class MatthewPidogBootClass:
 
     def create(self) -> Pidog:
         print("=== PidogBootstrap.create() ===")
-        self.unlock_speaker()
+        if not self.skip_speaker_unlock:
+            self.unlock_speaker()
 
         leg_init_angles = self.load_leg_init_angles()
 
