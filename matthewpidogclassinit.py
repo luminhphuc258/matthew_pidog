@@ -345,7 +345,7 @@ class MatthewPidogBootClass:
         head_init_angles = self.head_init_angles
         if self.skip_head_init:
             head_pins = []
-            head_init_angles = []
+            head_init_angles = [0, 0, 0]
             if self.enable_force_head:
                 print("[BOOT] skip_head_init=1 -> disable force head")
                 self.enable_force_head = False
