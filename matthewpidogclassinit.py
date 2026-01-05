@@ -61,6 +61,7 @@ class MatthewPidogBootClass:
         enable_force_head: bool = True,
         disable_imu: bool = True,   # ✅ NEW
         skip_head_init: bool | None = None,
+        skip_mcu_reset: bool | None = None,
     ):
         self.speaker_device = speaker_device
         self.pose_file = Path(pose_file) if not isinstance(pose_file, Path) else pose_file
@@ -83,6 +84,12 @@ class MatthewPidogBootClass:
             self.skip_head_init = str(env).strip().lower() in ("1", "true", "yes", "on")
         else:
             self.skip_head_init = bool(skip_head_init)
+
+        if skip_mcu_reset is None:
+            env = os.environ.get("PIDOG_SKIP_MCU_RESET") or os.environ.get("SKIP_MCU_RESET")
+            self.skip_mcu_reset = str(env).strip().lower() in ("1", "true", "yes", "on")
+        else:
+            self.skip_mcu_reset = bool(skip_mcu_reset)
 
         self.dog: Pidog | None = None
 
@@ -214,6 +221,19 @@ class MatthewPidogBootClass:
             print(f"[WARN] Lỗi đọc pose file: {e}. Dùng fallback.")
             return fallback
 
+    def load_head_init_angles(self, fallback=None):
+        fallback = fallback or self.head_init_angles or [80, -70, 90]
+        try:
+            if not self.pose_file.exists():
+                return fallback
+            pose = self._parse_pose_file(self.pose_file)
+            missing = [i for i in (8, 9, 10) if i not in pose]
+            if missing:
+                return fallback
+            return [pose[8], pose[9], pose[10]]
+        except Exception:
+            return fallback
+
     # ===================== FORCE SERVO =====================
 
     def force_servo_angle(self, port: str, angle: float, hold=0.3) -> bool:
@@ -335,6 +355,21 @@ class MatthewPidogBootClass:
         except Exception as e:
             print(f"[WARN] IMU disable patch failed: {e}")
 
+    def _patch_skip_mcu_reset(self):
+        if not self.skip_mcu_reset:
+            return
+        try:
+            import robot_hat.utils as rh_utils
+            rh_utils.reset_mcu = lambda: print("[BOOT] MCU reset skipped")
+        except Exception:
+            pass
+        try:
+            import pidog.pidog as pidog_mod
+            if hasattr(pidog_mod, "utils"):
+                pidog_mod.utils.reset_mcu = lambda: print("[BOOT] MCU reset skipped")
+        except Exception:
+            pass
+
     def create(self) -> Pidog:
         print("=== PidogBootstrap.create() ===")
         self.unlock_speaker()
@@ -344,8 +379,7 @@ class MatthewPidogBootClass:
         head_pins = self.head_pins
         head_init_angles = self.head_init_angles
         if self.skip_head_init:
-            head_pins = []
-            head_init_angles = [0, 0, 0]
+            head_init_angles = self.load_head_init_angles()
             if self.enable_force_head:
                 print("[BOOT] skip_head_init=1 -> disable force head")
                 self.enable_force_head = False
@@ -357,6 +391,7 @@ class MatthewPidogBootClass:
 
         # ✅ IMPORTANT: disable IMU init/read before creating Pidog
         self._patch_disable_imu()
+        self._patch_skip_mcu_reset()
 
         self.dog = Pidog(
             leg_pins=self.leg_pins,

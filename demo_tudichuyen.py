@@ -638,6 +638,7 @@ def main():
     os.environ.setdefault("PULSE_SERVER", "")
     os.environ.setdefault("JACK_NO_START_SERVER", "1")
     os.environ.setdefault("PIDOG_SKIP_HEAD_INIT", "1")
+    os.environ.setdefault("PIDOG_SKIP_MCU_RESET", "1")
 
     state = RobotState()
     motion = MotionController(pose_file=POSE_FILE)
