@@ -331,8 +331,10 @@ class MotionController:
         D) start head controller (P8 sweep on MOVE)
         """
         self._pre_move_legs_before_pose()
-        cfg = self.load_pose_config()
-        self.apply_pose_from_cfg(cfg, per_servo_delay=0.03, settle_sec=1.0)
+        skip_pose = str(__import__("os").environ.get("SKIP_APPLY_POSE", "0")).lower() in ("1", "true", "yes", "on")
+        if not skip_pose:
+            cfg = self.load_pose_config()
+            self.apply_pose_from_cfg(cfg, per_servo_delay=0.03, settle_sec=1.0)
 
         boot = MatthewPidogBootClass(skip_head_init=True, enable_force_head=False)
         self._dog = boot.create()
