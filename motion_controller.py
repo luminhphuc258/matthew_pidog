@@ -334,7 +334,7 @@ class MotionController:
         cfg = self.load_pose_config()
         self.apply_pose_from_cfg(cfg, per_servo_delay=0.03, settle_sec=1.0)
 
-        boot = MatthewPidogBootClass()
+        boot = MatthewPidogBootClass(skip_head_init=True, enable_force_head=False)
         self._dog = boot.create()
         time.sleep(1.0)
         self.stand(speed=30)

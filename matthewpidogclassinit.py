@@ -60,6 +60,7 @@ class MatthewPidogBootClass:
         force_head_angle: float = -90,
         enable_force_head: bool = True,
         disable_imu: bool = True,   # ✅ NEW
+        skip_head_init: bool | None = None,
     ):
         self.speaker_device = speaker_device
         self.pose_file = Path(pose_file) if not isinstance(pose_file, Path) else pose_file
@@ -77,6 +78,11 @@ class MatthewPidogBootClass:
         self.enable_force_head = enable_force_head
 
         self.disable_imu = disable_imu  # ✅ NEW
+        if skip_head_init is None:
+            env = os.environ.get("PIDOG_SKIP_HEAD_INIT") or os.environ.get("SKIP_HEAD_INIT")
+            self.skip_head_init = str(env).strip().lower() in ("1", "true", "yes", "on")
+        else:
+            self.skip_head_init = bool(skip_head_init)
 
         self.dog: Pidog | None = None
 
@@ -335,9 +341,18 @@ class MatthewPidogBootClass:
 
         leg_init_angles = self.load_leg_init_angles()
 
+        head_pins = self.head_pins
+        head_init_angles = self.head_init_angles
+        if self.skip_head_init:
+            head_pins = []
+            head_init_angles = []
+            if self.enable_force_head:
+                print("[BOOT] skip_head_init=1 -> disable force head")
+                self.enable_force_head = False
+
         print("Init PiDog...")
         print("LEG_PINS :", self.leg_pins,  "angles:", leg_init_angles)
-        print("HEAD_PINS:", self.head_pins, "angles:", self.head_init_angles)
+        print("HEAD_PINS:", head_pins, "angles:", head_init_angles)
         print("TAIL_PIN :", self.tail_pin,  "angle :", self.tail_init_angle)
 
         # ✅ IMPORTANT: disable IMU init/read before creating Pidog
@@ -345,10 +360,10 @@ class MatthewPidogBootClass:
 
         self.dog = Pidog(
             leg_pins=self.leg_pins,
-            head_pins=self.head_pins,
+            head_pins=head_pins,
             tail_pin=self.tail_pin,
             leg_init_angles=leg_init_angles,
-            head_init_angles=self.head_init_angles,
+            head_init_angles=head_init_angles,
             tail_init_angle=self.tail_init_angle
         )
 

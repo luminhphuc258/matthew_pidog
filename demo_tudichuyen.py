@@ -637,6 +637,7 @@ def main():
     os.environ.setdefault("SDL_AUDIODRIVER", "alsa")
     os.environ.setdefault("PULSE_SERVER", "")
     os.environ.setdefault("JACK_NO_START_SERVER", "1")
+    os.environ.setdefault("PIDOG_SKIP_HEAD_INIT", "1")
 
     state = RobotState()
     motion = MotionController(pose_file=POSE_FILE)
