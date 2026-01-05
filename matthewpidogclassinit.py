@@ -63,6 +63,7 @@ class MatthewPidogBootClass:
         skip_head_init: bool | None = None,
         skip_mcu_reset: bool | None = None,
         skip_speaker_unlock: bool | None = None,
+        skip_pose_file: bool | None = None,
     ):
         self.speaker_device = speaker_device
         self.pose_file = Path(pose_file) if not isinstance(pose_file, Path) else pose_file
@@ -97,6 +98,15 @@ class MatthewPidogBootClass:
             self.skip_speaker_unlock = str(env).strip().lower() in ("1", "true", "yes", "on")
         else:
             self.skip_speaker_unlock = bool(skip_speaker_unlock)
+
+        if skip_pose_file is None:
+            env = os.environ.get("SKIP_POSE_FILE")
+            if env is None:
+                self.skip_pose_file = True
+            else:
+                self.skip_pose_file = str(env).strip().lower() in ("1", "true", "yes", "on")
+        else:
+            self.skip_pose_file = bool(skip_pose_file)
 
         self.dog: Pidog | None = None
 
@@ -210,7 +220,7 @@ class MatthewPidogBootClass:
         fallback = fallback or [-3, 89, 9, -80, 3, 90, 10, -90]
 
         try:
-            if str(os.environ.get("SKIP_POSE_FILE", "0")).lower() in ("1", "true", "yes", "on"):
+            if self.skip_pose_file:
                 return fallback
             if not self.pose_file.exists():
                 print(f"[WARN] Không thấy {self.pose_file}, dùng fallback LEG_INIT_ANGLES.")
@@ -233,7 +243,7 @@ class MatthewPidogBootClass:
     def load_head_init_angles(self, fallback=None):
         fallback = fallback or self.head_init_angles or [80, -70, 90]
         try:
-            if str(os.environ.get("SKIP_POSE_FILE", "0")).lower() in ("1", "true", "yes", "on"):
+            if self.skip_pose_file:
                 return fallback
             if not self.pose_file.exists():
                 return fallback
