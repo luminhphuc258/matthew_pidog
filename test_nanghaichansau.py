@@ -117,6 +117,12 @@ def main():
     print("[TEST] lift front legs")
     apply_angles(FRONT_LIFT_ANGLES, per_servo_delay=0.04)
     print("[TEST] front lift done (hold position)")
+    time.sleep(2.0)
+
+    print("[TEST] boot robot to stand")
+    motion = MotionController(pose_file=POSE_FILE)
+    motion.boot()
+    print("[TEST] boot done")
 
     print("[TEST] done")
 
