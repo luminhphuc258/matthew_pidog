@@ -52,6 +52,7 @@ class MatthewPidogBootClass:
         speaker_device: str = "plughw:0,0",
         pose_file: str | Path = "pidog_pose_config.txt",
         leg_pins=None,
+        leg_init_angles=None,
         head_pins=None,
         tail_pin=None,
         head_init_angles=None,
@@ -69,6 +70,7 @@ class MatthewPidogBootClass:
         self.pose_file = Path(pose_file) if not isinstance(pose_file, Path) else pose_file
 
         self.leg_pins = leg_pins or [0, 1, 2, 3, 4, 5, 6, 7]
+        self.leg_init_angles = leg_init_angles
         self.head_pins = head_pins or [8, 9, 10]
         self.tail_pin  = tail_pin  or [11]
 
@@ -396,7 +398,10 @@ class MatthewPidogBootClass:
         if not self.skip_speaker_unlock:
             self.unlock_speaker()
 
-        leg_init_angles = self.load_leg_init_angles()
+        if self.leg_init_angles is not None:
+            leg_init_angles = self.leg_init_angles
+        else:
+            leg_init_angles = self.load_leg_init_angles()
 
         head_pins = self.head_pins
         head_init_angles = self.head_init_angles

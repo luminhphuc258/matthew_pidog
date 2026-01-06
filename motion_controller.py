@@ -330,11 +330,31 @@ class MotionController:
         C) start head controller (P8 sweep on MOVE)
         """
         skip_pose = str(__import__("os").environ.get("SKIP_APPLY_POSE", "0")).lower() in ("1", "true", "yes", "on")
+        cfg = None
         if not skip_pose:
             cfg = self.load_pose_config()
             self.apply_pose_from_cfg(cfg, per_servo_delay=0.03, settle_sec=1.0)
 
-        boot = MatthewPidogBootClass(skip_head_init=True, enable_force_head=False)
+        leg_init_angles = None
+        head_init_angles = None
+        tail_init_angle = None
+        if cfg:
+            try:
+                leg_init_angles = [cfg.get(f"P{i}", 0) for i in range(8)]
+                head_init_angles = [cfg.get("P8", 0), cfg.get("P9", 0), cfg.get("P10", 0)]
+                tail_init_angle = [cfg.get("P11", 0)]
+            except Exception:
+                leg_init_angles = None
+                head_init_angles = None
+                tail_init_angle = None
+
+        boot = MatthewPidogBootClass(
+            leg_init_angles=leg_init_angles,
+            head_init_angles=head_init_angles,
+            tail_init_angle=tail_init_angle,
+            skip_head_init=True,
+            enable_force_head=False,
+        )
         self._dog = boot.create()
         time.sleep(1.0)
         self.stand(speed=30)
