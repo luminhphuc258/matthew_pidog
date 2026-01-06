@@ -325,12 +325,10 @@ class MotionController:
 
     def boot(self):
         """
-        A) pre-move 4 legs (rear+front) with lock P4/P6
-        B) apply pose from cfg (all servos)
-        C) boot MatthewPidogBootClass -> stand
-        D) start head controller (P8 sweep on MOVE)
+        A) apply pose from cfg (all servos)
+        B) boot MatthewPidogBootClass -> stand
+        C) start head controller (P8 sweep on MOVE)
         """
-        self._pre_move_legs_before_pose()
         skip_pose = str(__import__("os").environ.get("SKIP_APPLY_POSE", "0")).lower() in ("1", "true", "yes", "on")
         if not skip_pose:
             cfg = self.load_pose_config()
