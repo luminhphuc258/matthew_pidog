@@ -88,6 +88,9 @@ class MotionController:
     def dog(self):
         return self._dog
 
+    def get_dog(self):
+        return self._dog
+
     # ---------------- utils ----------------
     def clamp(self, v):
         try:

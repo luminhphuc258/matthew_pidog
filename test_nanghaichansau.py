@@ -229,6 +229,19 @@ def main():
     set_led(motion, "green", bps=0.4)
     print("[TEST] led green")
 
+    dog = motion.get_dog()
+    if dog:
+        try:
+            dog.do_action("forward", speed=250)
+            dog.wait_all_done()
+            time.sleep(2.0)
+            dog.do_action("stand", speed=5)
+            dog.wait_all_done()
+        except Exception:
+            pass
+    set_led(motion, "black", bps=0.4)
+    print("[TEST] led off")
+
     print("[TEST] done")
 
 
