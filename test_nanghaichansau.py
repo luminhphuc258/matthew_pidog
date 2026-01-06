@@ -57,32 +57,15 @@ def main():
     os.environ.setdefault("PIDOG_SKIP_HEAD_INIT", "1")
     os.environ.setdefault("PIDOG_SKIP_MCU_RESET", "1")
 
-    motion = None
-    try:
-        print("[TEST] set head init angles")
-        apply_angles(HEAD_INIT_ANGLES, per_servo_delay=0.04)
-        print("[TEST] head init done")
+    print("[TEST] set head init angles")
+    apply_angles(HEAD_INIT_ANGLES, per_servo_delay=0.04)
+    print("[TEST] head init done (hold position)")
 
-        print("[TEST] lift rear legs")
-        apply_angles(REAR_LIFT_ANGLES, per_servo_delay=0.04)
-        print("[TEST] rear lift done")
-        time.sleep(3.0)
+    print("[TEST] lift front legs")
+    apply_angles(FRONT_LIFT_ANGLES, per_servo_delay=0.04)
+    print("[TEST] front lift done (hold position)")
 
-        print("[TEST] lift front legs")
-        apply_angles(FRONT_LIFT_ANGLES, per_servo_delay=0.04)
-        print("[TEST] front lift done")
-
-        print("[TEST] boot robot after leg tests")
-        motion = MotionController(pose_file=POSE_FILE)
-        motion.boot()
-        print("[TEST] boot done")
-
-    finally:
-        try:
-            if motion is not None:
-                motion.close()
-        except Exception:
-            pass
+    print("[TEST] done")
 
 
 if __name__ == "__main__":
