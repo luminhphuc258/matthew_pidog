@@ -19,10 +19,10 @@ REAR_LIFT_ANGLES = {
 }
 
 FRONT_LIFT_ANGLES = {
-    "P0": -10,  # front hip left
-    "P1": 30,   # front knee left
-    "P2": 10,   # front hip right
-    "P3": -30,  # front knee right
+    "P0": -20,  # front hip left
+    "P1": 90,   # front knee left
+    "P2": 20,   # front hip right
+    "P3": -75,  # front knee right
 }
 
 
