@@ -25,6 +25,12 @@ FRONT_LIFT_ANGLES = {
     "P3": -75,  # front knee right
 }
 
+HEAD_INIT_ANGLES = {
+    "P8": 80,   # head yaw
+    "P9": -70,  # head roll
+    "P10": 90,  # head pitch
+}
+
 
 def clamp(angle: float) -> int:
     try:
@@ -53,6 +59,10 @@ def main():
 
     motion = None
     try:
+        print("[TEST] set head init angles")
+        apply_angles(HEAD_INIT_ANGLES, per_servo_delay=0.04)
+        print("[TEST] head init done")
+
         print("[TEST] lift rear legs")
         apply_angles(REAR_LIFT_ANGLES, per_servo_delay=0.04)
         print("[TEST] rear lift done")
