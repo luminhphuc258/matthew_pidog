@@ -112,9 +112,9 @@ def main():
     apply_angles(FRONT_LIFT_ANGLES, per_servo_delay=0.04)
     print("[TEST] front lift done (hold position)")
 
-    print("[TEST] lift rear legs (smooth)")
-    smooth_pair("P4", 0, REAR_LIFT_ANGLES["P4"], "P6", 0, REAR_LIFT_ANGLES["P6"], step=1, delay=0.03)
-    smooth_pair("P5", 0, REAR_LIFT_ANGLES["P5"], "P7", 0, REAR_LIFT_ANGLES["P7"], step=1, delay=0.03)
+    print("[TEST] lift rear legs (left then right)")
+    smooth_pair("P4", 0, REAR_LIFT_ANGLES["P4"], "P5", 0, REAR_LIFT_ANGLES["P5"], step=1, delay=0.03)
+    smooth_pair("P6", 0, REAR_LIFT_ANGLES["P6"], "P7", 0, REAR_LIFT_ANGLES["P7"], step=1, delay=0.03)
     print("[TEST] rear lift done (hold position)")
 
     print("[TEST] done")
