@@ -94,7 +94,58 @@ def smooth_pair(
         except Exception:
             pass
 
-        time.sleep(delay)
+    time.sleep(delay)
+
+
+def set_led(motion: MotionController, color: str, bps: float = 0.5):
+    dog = getattr(motion, "dog", None)
+    if not dog:
+        return
+
+    # 1) rgb_strip.set_mode("breath", color, bps=?)
+    try:
+        rs = getattr(dog, "rgb_strip", None)
+        if rs:
+            try:
+                rs.set_mode("breath", color, bps=bps)
+                return
+            except TypeError:
+                rs.set_mode("breath", color, bps)
+                return
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 2) rgb_strip.set_color / fill / show
+    try:
+        rs = getattr(dog, "rgb_strip", None)
+        if rs:
+            for fn in ("set_color", "fill"):
+                if hasattr(rs, fn):
+                    try:
+                        getattr(rs, fn)(color)
+                        if hasattr(rs, "show"):
+                            rs.show()
+                        return
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # 3) rgb_led.set_color / set_rgb
+    try:
+        rl = getattr(dog, "rgb_led", None)
+        if rl:
+            for fn in ("set_color", "set_rgb", "setColor"):
+                if hasattr(rl, fn):
+                    try:
+                        getattr(rl, fn)(color)
+                        return
+                    except Exception:
+                        pass
+    except Exception:
+        pass
 
 
 def main():
@@ -123,6 +174,8 @@ def main():
     motion = MotionController(pose_file=POSE_FILE)
     motion.boot()
     print("[TEST] boot done")
+    set_led(motion, "green", bps=0.4)
+    print("[TEST] led green")
 
     print("[TEST] done")
 
