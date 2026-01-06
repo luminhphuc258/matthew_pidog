@@ -3,9 +3,10 @@
 
 import os
 import time
+import wave
 from pathlib import Path
 
-from robot_hat import Servo
+from robot_hat import Servo, Music
 from motion_controller import MotionController
 
 POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
@@ -17,6 +18,7 @@ REAR_LIFT_ANGLES = {
     "P6": -70,  # rear hip right
     "P7": -30,  # rear knee right
 }
+REAR_LIFT_DELAY = 0.04
 
 FRONT_LIFT_ANGLES = {
     "P0": -20,  # front hip left
@@ -138,6 +140,144 @@ def smooth_pair(
         time.sleep(delay)
 
 
+def _try_create_rgb_device():
+    try:
+        import robot_hat
+    except Exception as e:
+        print(f"[LED] robot_hat import failed: {e}")
+        return None
+
+    led_num = int(os.environ.get("PIDOG_LED_NUM", "2"))
+    led_pin = int(os.environ.get("PIDOG_LED_PIN", "12"))
+    candidates = (
+        "RGBStrip",
+        "RGBStripWS2812",
+        "RGBStripAPA102",
+        "RGBLed",
+        "RGBLED",
+    )
+    arg_sets = (
+        (),
+        (led_num,),
+        (led_num, led_pin),
+        (led_pin, led_num),
+    )
+
+    for cls_name in candidates:
+        cls = getattr(robot_hat, cls_name, None)
+        if not cls:
+            continue
+        for args in arg_sets:
+            try:
+                dev = cls(*args)
+                print(f"[LED] init {cls_name} args={args}")
+                return dev
+            except Exception:
+                continue
+
+    return None
+
+
+def set_led(motion: MotionController, color: str, bps: float = 0.5):
+    dog = getattr(motion, "dog", None)
+    if not dog:
+        print("[LED] motion has no dog instance")
+        return
+
+    rs = getattr(dog, "rgb_strip", None)
+    rl = getattr(dog, "rgb_led", None)
+    if not rs and not rl:
+        dev = _try_create_rgb_device()
+        if dev:
+            try:
+                dog.rgb_strip = dev
+                rs = dev
+            except Exception:
+                pass
+        else:
+            print("[LED] no rgb device available (rgb_strip init failed?)")
+            return
+
+    # 1) rgb_strip.set_mode("breath", color, bps=?)
+    try:
+        if rs:
+            try:
+                rs.set_mode("breath", color, bps=bps)
+                return
+            except TypeError:
+                rs.set_mode("breath", color, bps)
+                return
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 2) rgb_strip.set_color / fill / show
+    try:
+        if rs:
+            for fn in ("set_color", "fill"):
+                if hasattr(rs, fn):
+                    try:
+                        getattr(rs, fn)(color)
+                        if hasattr(rs, "show"):
+                            rs.show()
+                        return
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # 3) rgb_led.set_color / set_rgb
+    try:
+        if rl:
+            for fn in ("set_color", "set_rgb", "setColor"):
+                if hasattr(rl, fn):
+                    try:
+                        getattr(rl, fn)(color)
+                        return
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+
+def play_tiengsua(wav_path: str, volume: int = 80):
+    if not os.path.exists(wav_path):
+        print(f"[WARN] sound file not found: {wav_path}")
+        return
+
+    try:
+        os.system("pinctrl set 12 op dh")
+    except Exception:
+        pass
+
+    music = Music()
+    try:
+        music.music_set_volume(int(volume))
+    except Exception:
+        pass
+
+    dur = None
+    try:
+        with wave.open(wav_path, "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate()
+            if rate > 0:
+                dur = float(frames) / float(rate)
+    except Exception:
+        dur = None
+
+    try:
+        music.music_play(str(wav_path), loops=1)
+    except Exception:
+        return
+
+    if dur is not None:
+        time.sleep(dur + 0.15)
+    else:
+        time.sleep(2.5)
+
+
 def ha_hai_chan_truoc():
     print("[PHASE] ha chan truoc: P0->+28, P1->+6, P2->-13, P3->0")
     smooth_single("P0", 0, 28, step=1, delay=0.03)
@@ -196,8 +336,9 @@ def main():
     print("[BOOT] head init done (hold position)")
 
     print("[BOOT] lift rear legs (left then right)")
-    smooth_pair("P4", 0, REAR_LIFT_ANGLES["P4"], "P5", 0, REAR_LIFT_ANGLES["P5"], step=1, delay=0.03)
-    smooth_pair("P6", 0, REAR_LIFT_ANGLES["P6"], "P7", 0, REAR_LIFT_ANGLES["P7"], step=1, delay=0.03)
+    smooth_pair("P4", 0, REAR_LIFT_ANGLES["P4"], "P5", 0, REAR_LIFT_ANGLES["P5"], step=1, delay=REAR_LIFT_DELAY)
+    time.sleep(0.15)
+    smooth_pair("P6", 0, REAR_LIFT_ANGLES["P6"], "P7", 0, REAR_LIFT_ANGLES["P7"], step=1, delay=REAR_LIFT_DELAY)
     print("[BOOT] rear lift done (hold position)")
     time.sleep(2.0)
 
@@ -210,6 +351,9 @@ def main():
     motion = MotionController(pose_file=POSE_FILE)
     motion.boot()
     print("[BOOT] boot done")
+    set_led(motion, "green", bps=0.5)
+    print("[BOOT] led green")
+    play_tiengsua("tiengsua.wav")
 
     print("[RUN] robotvehinhcaro")
     robotvehinhcaro()
