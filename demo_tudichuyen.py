@@ -6,12 +6,14 @@ import time
 import threading
 import socket
 import math
+import subprocess
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Any
 
 import requests
 from flask import Flask, jsonify, Response
 
+from robot_hat import Servo
 from motion_controller import MotionController
 
 # =========================
@@ -37,6 +39,29 @@ CMD_REFRESH_SEC = 0.35
 
 # Debug
 DBG_PRINT_EVERY_SEC = 1.0
+
+# Boot lift angles (same flow as test_nanghaichansau.py)
+REAR_LIFT_ANGLES = {
+    "P4": 80,   # rear hip left
+    "P5": 30,   # rear knee left
+    "P6": -70,  # rear hip right
+    "P7": -30,  # rear knee right
+}
+
+FRONT_LIFT_ANGLES = {
+    "P0": -20,  # front hip left
+    "P1": 90,   # front knee left
+    "P2": 20,   # front hip right
+    "P3": -75,  # front knee right
+}
+
+HEAD_INIT_ANGLES = {
+    "P8": 80,   # head yaw
+    "P9": -70,  # head roll
+    "P10": 90,  # head pitch
+}
+
+SERVICES_TO_START = ["lidarhub.service", "gesture_mqtt.service"]
 
 # =========================
 # FACE UDP (optional)
@@ -182,11 +207,11 @@ class RobotMotion:
             self.motion.execute("STOP")
         except Exception:
             pass
-        self.set_led("red", bps=0.4)
+        self.set_led("black", bps=0.4)
         self.state.set("STOP")
 
     def forward(self):
-        self.set_led("blue", bps=0.6)
+        self.set_led("white", bps=1.0)
         self.state.set("MOVE", "FORWARD")
         try:
             self.motion.execute("FORWARD")
@@ -194,7 +219,7 @@ class RobotMotion:
             pass
 
     def turn_left(self):
-        self.set_led("yellow", bps=0.6)
+        self.set_led("white", bps=1.0)
         self.state.set("TURN", "TURN_LEFT")
         try:
             self.motion.execute("TURN_LEFT")
@@ -202,12 +227,77 @@ class RobotMotion:
             pass
 
     def turn_right(self):
-        self.set_led("yellow", bps=0.6)
+        self.set_led("white", bps=1.0)
         self.state.set("TURN", "TURN_RIGHT")
         try:
             self.motion.execute("TURN_RIGHT")
         except Exception:
             pass
+
+# =========================
+# Servo helpers (boot lift)
+# =========================
+def clamp(angle: float) -> int:
+    try:
+        v = int(angle)
+    except Exception:
+        v = 0
+    return max(-90, min(90, v))
+
+def apply_angles(angles: Dict[str, float], per_servo_delay: float = 0.03):
+    for port, angle in angles.items():
+        try:
+            s = Servo(port)
+            s.angle(clamp(angle))
+        except Exception:
+            pass
+        time.sleep(per_servo_delay)
+
+def smooth_pair(
+    pA: str, a_start: int, a_end: int,
+    pB: str, b_start: int, b_end: int,
+    step: int = 1,
+    delay: float = 0.03,
+):
+    sA = Servo(pA)
+    sB = Servo(pB)
+
+    a_start, a_end = clamp(a_start), clamp(a_end)
+    b_start, b_end = clamp(b_start), clamp(b_end)
+
+    a = a_start
+    b = b_start
+
+    try:
+        sA.angle(a)
+        sB.angle(b)
+    except Exception:
+        pass
+
+    max_steps = max(abs(a_end - a_start), abs(b_end - b_start))
+    if max_steps == 0:
+        return
+
+    step = max(1, int(abs(step)))
+
+    for _ in range(max_steps):
+        if a != a_end:
+            a += step if a_end > a else -step
+            if (a_end > a_start and a > a_end) or (a_end < a_start and a < a_end):
+                a = a_end
+
+        if b != b_end:
+            b += step if b_end > b else -step
+            if (b_end > b_start and b > b_end) or (b_end < b_start and b < b_end):
+                b = b_end
+
+        try:
+            sA.angle(clamp(a))
+            sB.angle(clamp(b))
+        except Exception:
+            pass
+
+        time.sleep(delay)
 
 # =========================
 # LiDAR parsing helpers
@@ -363,6 +453,30 @@ def lidar_scan_points() -> Tuple[List[Tuple[float, float]], Optional[dict]]:
         return [], None
     pts = _extract_points(js)
     return pts, js
+
+# =========================
+# Service helpers
+# =========================
+def _systemctl(args: List[str]) -> bool:
+    try:
+        r = subprocess.run(["systemctl"] + args, check=False, capture_output=True, text=True)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+def start_services(services: List[str]) -> bool:
+    ok = True
+    for svc in services:
+        if not _systemctl(["start", svc]):
+            print(f"[SVC] start failed: {svc}", flush=True)
+            ok = False
+    return ok
+
+def services_ready(services: List[str]) -> bool:
+    for svc in services:
+        if not _systemctl(["is-active", "--quiet", svc]):
+            return False
+    return True
 
 # =========================
 # Map Web (debug only)
@@ -647,8 +761,31 @@ def main():
     map_server = MapServer()
     map_server.run_bg(MAP_PORT)
 
+    print("[BOOT] set head init angles", flush=True)
+    apply_angles(HEAD_INIT_ANGLES, per_servo_delay=0.04)
+    print("[BOOT] lift rear legs (left then right)", flush=True)
+    smooth_pair("P4", 0, REAR_LIFT_ANGLES["P4"], "P5", 0, REAR_LIFT_ANGLES["P5"], step=1, delay=0.03)
+    smooth_pair("P6", 0, REAR_LIFT_ANGLES["P6"], "P7", 0, REAR_LIFT_ANGLES["P7"], step=1, delay=0.03)
+    time.sleep(2.0)
+    print("[BOOT] lift front legs", flush=True)
+    apply_angles(FRONT_LIFT_ANGLES, per_servo_delay=0.04)
+    time.sleep(2.0)
+
     rm.boot_stand()
     set_face("what_is_it")
+
+    time.sleep(2.0)
+
+    print("[SVC] starting services...", flush=True)
+    start_services(SERVICES_TO_START)
+    time.sleep(5.0)
+    if not services_ready(SERVICES_TO_START):
+        print("[SVC] services not ready, stop running", flush=True)
+        try:
+            motion.close()
+        except Exception:
+            pass
+        return
 
     print("[DEMO] waiting lidar ready...", flush=True)
     t0 = time.time()
