@@ -97,14 +97,66 @@ def smooth_pair(
     time.sleep(delay)
 
 
+def _try_create_rgb_device():
+    try:
+        import robot_hat
+    except Exception as e:
+        print(f"[LED] robot_hat import failed: {e}")
+        return None
+
+    led_num = int(os.environ.get("PIDOG_LED_NUM", "2"))
+    led_pin = int(os.environ.get("PIDOG_LED_PIN", "12"))
+    candidates = (
+        "RGBStrip",
+        "RGBStripWS2812",
+        "RGBStripAPA102",
+        "RGBLed",
+        "RGBLED",
+    )
+    arg_sets = (
+        (),
+        (led_num,),
+        (led_num, led_pin),
+        (led_pin, led_num),
+    )
+
+    for cls_name in candidates:
+        cls = getattr(robot_hat, cls_name, None)
+        if not cls:
+            continue
+        for args in arg_sets:
+            try:
+                dev = cls(*args)
+                print(f"[LED] init {cls_name} args={args}")
+                return dev
+            except Exception:
+                continue
+
+    return None
+
+
 def set_led(motion: MotionController, color: str, bps: float = 0.5):
     dog = getattr(motion, "dog", None)
     if not dog:
+        print("[LED] motion has no dog instance")
         return
+
+    rs = getattr(dog, "rgb_strip", None)
+    rl = getattr(dog, "rgb_led", None)
+    if not rs and not rl:
+        dev = _try_create_rgb_device()
+        if dev:
+            try:
+                dog.rgb_strip = dev
+                rs = dev
+            except Exception:
+                pass
+        else:
+            print("[LED] no rgb device available (rgb_strip init failed?)")
+            return
 
     # 1) rgb_strip.set_mode("breath", color, bps=?)
     try:
-        rs = getattr(dog, "rgb_strip", None)
         if rs:
             try:
                 rs.set_mode("breath", color, bps=bps)
