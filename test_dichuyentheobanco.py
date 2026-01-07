@@ -41,7 +41,7 @@ FRONT_LIFT_ANGLES = {
 }
 
 HEAD_INIT_ANGLES = {
-    "P8": 20,
+    "P8": 28,
     "P9": -70,
     "P10": 90,
 }
@@ -355,51 +355,35 @@ def detect_player_orange(frame_bgr, board: BoardState):
                 board.set_player(r, c)
 
 
-def draw_board_overlay(frame_bgr, board: BoardState, board_bbox=None):
+def detect_blue_lines(frame_bgr):
     h, w = frame_bgr.shape[:2]
-    cell_w = w // 3
-    cell_h = h // 3
+    if h < 40 or w < 40:
+        return []
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    blue_mask = cv2.inRange(hsv, (90, 80, 60), (130, 255, 255))
+    edges = cv2.Canny(blue_mask, 40, 120)
+    min_len = int(min(w, h) * 0.20)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=40, minLineLength=min_len, maxLineGap=25)
+    if lines is None:
+        return []
 
-    overlay = frame_bgr.copy()
+    out = []
+    for ln in lines:
+        x1, y1, x2, y2 = ln[0]
+        dx = x2 - x1
+        dy = y2 - y1
+        if (dx * dx + dy * dy) ** 0.5 < min_len:
+            continue
+        out.append((int(x1), int(y1), int(x2), int(y2)))
+    return out
 
-    # white fill for empty cells
-    snap = board.snapshot()
-    for r in range(3):
-        for c in range(3):
-            y0 = r * cell_h
-            x0 = c * cell_w
-            y1 = y0 + cell_h
-            x1 = x0 + cell_w
-            if snap[r][c] == 0:
-                cv2.rectangle(overlay, (x0 + 2, y0 + 2), (x1 - 2, y1 - 2), (255, 255, 255), -1)
 
-    frame_bgr[:] = cv2.addWeighted(overlay, 0.18, frame_bgr, 0.82, 0)
-
-    # grid lines
-    grid_color = (160, 160, 160)
-    for i in range(1, 3):
-        cv2.line(frame_bgr, (i * cell_w, 0), (i * cell_w, h), grid_color, 2)
-        cv2.line(frame_bgr, (0, i * cell_h), (w, i * cell_h), grid_color, 2)
-
-    if board_bbox:
-        bx, by, bw, bh = board_bbox
-        cv2.rectangle(frame_bgr, (bx, by), (bx + bw, by + bh), (255, 0, 0), 2)
-
-    # pieces + borders
-    for r in range(3):
-        for c in range(3):
-            y0 = r * cell_h
-            x0 = c * cell_w
-            y1 = y0 + cell_h
-            x1 = x0 + cell_w
-            cx = x0 + cell_w // 2
-            cy = y0 + cell_h // 2
-            if snap[r][c] == 1:
-                cv2.circle(frame_bgr, (cx, cy), int(min(cell_w, cell_h) * 0.28), (0, 165, 255), 3)
-                cv2.rectangle(frame_bgr, (x0 + 2, y0 + 2), (x1 - 2, y1 - 2), (0, 255, 0), 2)
-            elif snap[r][c] == 2:
-                cv2.line(frame_bgr, (cx - 10, cy), (cx + 10, cy), (120, 120, 120), 3)
-                cv2.rectangle(frame_bgr, (x0 + 2, y0 + 2), (x1 - 2, y1 - 2), (0, 0, 0), 2)
+def draw_board_overlay(frame_bgr, blue_lines=None):
+    h, w = frame_bgr.shape[:2]
+    if not blue_lines:
+        return
+    for x1, y1, x2, y2 in blue_lines:
+        cv2.line(frame_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
 
 class CameraWeb:
@@ -408,8 +392,9 @@ class CameraWeb:
         self.app = Flask("tic_tac_toe_cam")
         self._lock = threading.Lock()
         self._last = None
-        self._board_bbox = None
-        self._p8_angle = 20
+        self._blue_lines = []
+        self._p8_angle = 28
+        self._p10_angle = 90
         self._stop = threading.Event()
         self._thread = None
         self._ready = threading.Event()
@@ -423,6 +408,7 @@ class CameraWeb:
         def state():
             st = self.board.stats()
             st["p8_angle"] = self._p8_angle
+            st["p10_angle"] = self._p10_angle
             return jsonify(st)
 
         @self.app.get("/set_move")
@@ -458,6 +444,26 @@ class CameraWeb:
                 self._p8_angle = int(cur)
             return jsonify({"ok": True, "p8_angle": int(cur)})
 
+        @self.app.get("/p10")
+        def p10():
+            action = str(request.args.get("action", ""))
+            with self._lock:
+                cur = int(self._p10_angle)
+            if action == "inc":
+                cur = min(90, cur + 1)
+            elif action == "dec":
+                cur = max(-90, cur - 1)
+            elif action == "set":
+                try:
+                    cur = int(request.args.get("val", cur))
+                except Exception:
+                    pass
+                cur = max(-90, min(90, cur))
+            set_servo_angle("P10", cur, hold_sec=0.25)
+            with self._lock:
+                self._p10_angle = int(cur)
+            return jsonify({"ok": True, "p10_angle": int(cur)})
+
         @self.app.get("/mjpeg")
         def mjpeg():
             return Response(self._mjpeg_gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
@@ -485,10 +491,15 @@ class CameraWeb:
       <div class="kv"><span class="k">Empty cells:</span> <span id="empty">-</span></div>
       <div class="kv"><span class="k">Robot moves:</span> <span id="robot">-</span></div>
       <div class="kv"><span class="k">Player moves:</span> <span id="player">-</span></div>
-      <div class="kv"><span class="k">P8 angle:</span> <span id="p8">20</span></div>
+      <div class="kv"><span class="k">P8 angle:</span> <span id="p8">28</span></div>
       <div class="row">
         <button class="btn" onclick="p8Dec()">-</button>
         <button class="btn" onclick="p8Inc()">+</button>
+      </div>
+      <div class="kv" style="margin-top:12px;"><span class="k">P10 angle:</span> <span id="p10">90</span></div>
+      <div class="row">
+        <button class="btn" onclick="p10Dec()">-</button>
+        <button class="btn" onclick="p10Inc()">+</button>
       </div>
       <div class="kv" style="font-size:12px;color:#aab;">O = orange circle, robot = short gray line</div>
     </div>
@@ -503,6 +514,7 @@ async function tick() {{
     document.getElementById('robot').textContent = js.robot ?? '-';
     document.getElementById('player').textContent = js.player ?? '-';
     document.getElementById('p8').textContent = js.p8_angle ?? '-';
+    document.getElementById('p10').textContent = js.p10_angle ?? '-';
   }} catch(e) {{}}
 }}
 async function p8Inc() {{
@@ -511,6 +523,14 @@ async function p8Inc() {{
 }}
 async function p8Dec() {{
   try {{ await fetch('/p8?action=dec'); }} catch(e) {{}}
+  tick();
+}}
+async function p10Inc() {{
+  try {{ await fetch('/p10?action=inc'); }} catch(e) {{}}
+  tick();
+}}
+async function p10Dec() {{
+  try {{ await fetch('/p10?action=dec'); }} catch(e) {{}}
   tick();
 }}
 setInterval(tick, 500);
@@ -538,9 +558,9 @@ tick();
         with self._lock:
             return None if self._last is None else self._last.copy()
 
-    def set_board_bbox(self, bbox):
+    def set_blue_lines(self, lines):
         with self._lock:
-            self._board_bbox = bbox
+            self._blue_lines = lines or []
 
     def _capture_loop(self):
         dev = int(CAM_DEV) if str(CAM_DEV).isdigit() else CAM_DEV
@@ -563,9 +583,9 @@ tick();
                 frame = cv2.rotate(frame, cv2.ROTATE_180)
 
             detect_player_orange(frame, self.board)
-            with self._lock:
-                bbox = self._board_bbox
-            draw_board_overlay(frame, self.board, board_bbox=bbox)
+            blue_lines = detect_blue_lines(frame)
+            self.set_blue_lines(blue_lines)
+            draw_board_overlay(frame, blue_lines=blue_lines)
 
             with self._lock:
                 self._last = frame
@@ -598,41 +618,14 @@ def _detect_board_ready(frame_bgr):
     white_mask = cv2.inRange(hsv, (0, 0, 200), (180, 40, 255))
     white_ratio = float(cv2.countNonZero(white_mask)) / float(white_mask.size)
 
-    blue_mask = cv2.inRange(hsv, (90, 80, 60), (130, 255, 255))
-    blue_ratio = float(cv2.countNonZero(blue_mask)) / float(blue_mask.size)
-    if white_ratio < 0.30 or blue_ratio < 0.004:
+    blue_lines = detect_blue_lines(frame_bgr)
+    if white_ratio < 0.15 or not blue_lines:
         return False, None
 
-    edges = cv2.Canny(blue_mask, 50, 150)
-    min_len = int(min(w, h) * 0.35)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=60, minLineLength=min_len, maxLineGap=20)
-    if lines is None:
+    if not blue_lines:
         return False, None
 
-    v_cnt = 0
-    h_cnt = 0
-    for ln in lines:
-        x1, y1, x2, y2 = ln[0]
-        dx = abs(x2 - x1)
-        dy = abs(y2 - y1)
-        if dx < dy * 0.35:
-            v_cnt += 1
-        elif dy < dx * 0.35:
-            h_cnt += 1
-
-    if v_cnt < 2 or h_cnt < 2:
-        return False, None
-
-    contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return True, (0, 0, w - 1, h - 1)
-
-    c = max(contours, key=cv2.contourArea)
-    x, y, bw, bh = cv2.boundingRect(c)
-    if bw <= 10 or bh <= 10:
-        return True, (0, 0, w - 1, h - 1)
-
-    return True, (x, y, bw, bh)
+    return True, blue_lines
 
 
 def searching_tictoeborad(cam: CameraWeb, motion: MotionController, timeout_sec: float = 60.0) -> bool:
@@ -640,19 +633,18 @@ def searching_tictoeborad(cam: CameraWeb, motion: MotionController, timeout_sec:
     s8 = Servo("P8")
 
     try:
-        s8.angle(clamp(20))
+        s8.angle(clamp(28))
     except Exception:
         pass
-    print("[SEARCH] P8 -> 20")
+    print("[SEARCH] P8 -> 28")
 
     t0 = time.time()
     while time.time() - t0 < float(timeout_sec):
         frame = cam.get_last_frame()
         if frame is not None:
             small = cv2.resize(frame, (0, 0), fx=0.8, fy=0.8, interpolation=cv2.INTER_AREA)
-            ok, bbox = _detect_board_ready(small)
+            ok, _lines = _detect_board_ready(small)
             if ok:
-                cam.set_board_bbox(bbox)
                 print("[SEARCH] board ready")
                 set_led(motion, "blue", bps=0.6)
                 return True
@@ -696,9 +688,9 @@ def main():
     os.environ.setdefault("JACK_NO_START_SERVER", "1")
     os.environ.setdefault("PIDOG_SKIP_HEAD_INIT", "1")
     os.environ.setdefault("PIDOG_SKIP_MCU_RESET", "1")
-    os.environ.setdefault("HEAD_P8_IDLE", "20")
-    os.environ.setdefault("HEAD_SWEEP_MIN", "20")
-    os.environ.setdefault("HEAD_SWEEP_MAX", "20")
+    os.environ.setdefault("HEAD_P8_IDLE", "28")
+    os.environ.setdefault("HEAD_SWEEP_MIN", "28")
+    os.environ.setdefault("HEAD_SWEEP_MAX", "28")
 
     board = BoardState()
     cam = CameraWeb(board)
@@ -707,8 +699,10 @@ def main():
         print("[CAM] not ready, stop", flush=True)
         return
 
-    print("[BOOT] set P8 -> 20")
-    set_servo_angle("P8", 20, hold_sec=0.4)
+    print("[BOOT] set P8 -> 28")
+    set_servo_angle("P8", 28, hold_sec=0.4)
+    print("[BOOT] set P10 -> 90")
+    set_servo_angle("P10", 90, hold_sec=0.4)
     time.sleep(0.2)
 
     print("[BOOT] set head init angles")
