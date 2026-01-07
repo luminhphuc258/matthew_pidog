@@ -24,6 +24,8 @@ CAM_H = int(os.environ.get("CAM_H", "240"))
 CAM_FPS = int(os.environ.get("CAM_FPS", "15"))
 JPEG_QUALITY = int(os.environ.get("CAM_JPEG_QUALITY", "70"))
 ROTATE_180 = str(os.environ.get("CAM_ROTATE_180", "1")).lower() in ("1", "true", "yes", "on")
+GRID_COLS = int(os.environ.get("GRID_COLS", "6"))
+GRID_ROWS = int(os.environ.get("GRID_ROWS", "4"))
 
 # Boot lift angles (same flow as test_nanghaichansau.py)
 REAR_LIFT_ANGLES = {
@@ -295,9 +297,11 @@ def set_led(motion: MotionController, color: str, bps: float = 0.5):
 
 
 class BoardState:
-    def __init__(self):
+    def __init__(self, rows: int = GRID_ROWS, cols: int = GRID_COLS):
         self._lock = threading.Lock()
-        self._board = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]  # 0 empty, 1 player(O), 2 robot(|)
+        self.rows = int(rows)
+        self.cols = int(cols)
+        self._board = [[0 for _ in range(self.cols)] for _ in range(self.rows)]  # 0 empty, 1 player(O), 2 robot(|)
 
     def snapshot(self) -> List[List[int]]:
         with self._lock:
@@ -330,28 +334,33 @@ class BoardState:
 
     def first_empty(self) -> Tuple[int, int]:
         with self._lock:
-            for r in range(3):
-                for c in range(3):
+            for r in range(self.rows):
+                for c in range(self.cols):
                     if self._board[r][c] == 0:
                         return r, c
         return -1, -1
 
 
-def detect_player_orange(frame_bgr, board: BoardState):
-    h, w = frame_bgr.shape[:2]
-    cell_w = w // 3
-    cell_h = h // 3
+def detect_player_orange(frame_bgr, board: BoardState, grid=None):
+    if not grid:
+        return
+    x_lines = grid.get("x") or []
+    y_lines = grid.get("y") or []
+    if len(x_lines) < board.cols + 1 or len(y_lines) < board.rows + 1:
+        return
 
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     lo = (5, 80, 80)
     hi = (25, 255, 255)
     mask = cv2.inRange(hsv, lo, hi)
 
-    for r in range(3):
-        for c in range(3):
-            y0 = r * cell_h
-            x0 = c * cell_w
-            roi = mask[y0:y0 + cell_h, x0:x0 + cell_w]
+    for r in range(board.rows):
+        for c in range(board.cols):
+            x0, x1 = x_lines[c], x_lines[c + 1]
+            y0, y1 = y_lines[r], y_lines[r + 1]
+            if x1 <= x0 or y1 <= y0:
+                continue
+            roi = mask[y0:y1, x0:x1]
             if roi.size == 0:
                 continue
             ratio = float(cv2.countNonZero(roi)) / float(roi.size)
@@ -382,12 +391,14 @@ def detect_blue_lines(frame_bgr):
     return out
 
 
-def draw_board_overlay(frame_bgr, blue_lines=None):
-    h, w = frame_bgr.shape[:2]
-    if not blue_lines:
-        return
-    for x1, y1, x2, y2 in blue_lines:
-        cv2.line(frame_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
+def draw_board_overlay(frame_bgr, blue_lines=None, cells=None):
+    if blue_lines:
+        for x1, y1, x2, y2 in blue_lines:
+            cv2.line(frame_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    if cells:
+        for cell in cells:
+            x0, y0, x1, y1 = cell["x0"], cell["y0"], cell["x1"], cell["y1"]
+            cv2.rectangle(frame_bgr, (x0, y0), (x1, y1), (0, 255, 255), 1)
 
 
 def _cluster_positions(pos, tol):
@@ -403,17 +414,29 @@ def _cluster_positions(pos, tol):
     return [int(sum(g) / len(g)) for g in groups]
 
 
-def _pick_four(vals):
+def _pick_n(vals, n):
     if not vals:
         return []
     vals = sorted(vals)
-    if len(vals) <= 4:
+    if len(vals) <= n:
         return vals
-    n = len(vals)
-    return [vals[0], vals[(n - 1) // 3], vals[(2 * (n - 1)) // 3], vals[-1]]
+    if n == 1:
+        return [vals[len(vals) // 2]]
+    last = len(vals) - 1
+    idxs = [int(round(i * last / (n - 1))) for i in range(n)]
+    return [vals[i] for i in idxs]
 
 
-def build_grid_from_lines(lines, frame_shape):
+def _evenly_spaced(min_v: int, max_v: int, count: int):
+    if count <= 1:
+        return [int(min_v)]
+    if max_v <= min_v:
+        return [int(min_v) for _ in range(count)]
+    step = float(max_v - min_v) / float(count - 1)
+    return [int(round(min_v + step * i)) for i in range(count)]
+
+
+def build_grid_from_lines(lines, frame_shape, cols: int = GRID_COLS, rows: int = GRID_ROWS):
     h, w = frame_shape[:2]
     if not lines:
         return None
@@ -427,17 +450,17 @@ def build_grid_from_lines(lines, frame_shape):
         elif dy < dx * 0.35:
             h_pos.append(int((y1 + y2) / 2))
     tol = max(6, int(min(w, h) * 0.03))
-    v_lines = _pick_four(_cluster_positions(v_pos, tol))
-    h_lines = _pick_four(_cluster_positions(h_pos, tol))
+    v_lines = _pick_n(_cluster_positions(v_pos, tol), cols + 1)
+    h_lines = _pick_n(_cluster_positions(h_pos, tol), rows + 1)
     if len(v_lines) < 2 or len(h_lines) < 2:
         return None
 
-    if len(v_lines) < 4:
+    if len(v_lines) < cols + 1:
         vmin, vmax = min(v_lines), max(v_lines)
-        v_lines = [vmin, vmin + (vmax - vmin) // 3, vmin + 2 * (vmax - vmin) // 3, vmax]
-    if len(h_lines) < 4:
+        v_lines = _evenly_spaced(vmin, vmax, cols + 1)
+    if len(h_lines) < rows + 1:
         hmin, hmax = min(h_lines), max(h_lines)
-        h_lines = [hmin, hmin + (hmax - hmin) // 3, hmin + 2 * (hmax - hmin) // 3, hmax]
+        h_lines = _evenly_spaced(hmin, hmax, rows + 1)
 
     v_lines = sorted([max(0, min(w - 1, x)) for x in v_lines])
     h_lines = sorted([max(0, min(h - 1, y)) for y in h_lines])
@@ -450,22 +473,42 @@ def build_grid_from_lines(lines, frame_shape):
     for y in h_lines:
         out_lines.append((x0, y, x3, y))
 
-    return {"x": v_lines, "y": h_lines, "lines": out_lines}
+    cells = []
+    for r in range(rows):
+        for c in range(cols):
+            x_a, x_b = v_lines[c], v_lines[c + 1]
+            y_a, y_b = h_lines[r], h_lines[r + 1]
+            if x_b <= x_a or y_b <= y_a:
+                continue
+            cells.append({
+                "r": r,
+                "c": c,
+                "x0": int(x_a),
+                "y0": int(y_a),
+                "x1": int(x_b),
+                "y1": int(y_b),
+                "cx": int((x_a + x_b) / 2),
+                "cy": int((y_a + y_b) / 2),
+            })
+
+    return {"x": v_lines, "y": h_lines, "lines": out_lines, "cells": cells, "rows": rows, "cols": cols}
 
 
-def detect_cell_states(frame_bgr, grid):
+def detect_cell_states(frame_bgr, grid, rows: int, cols: int):
     x_lines = grid["x"]
     y_lines = grid["y"]
-    board = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
+    board = [[0 for _ in range(cols)] for _ in range(rows)]
 
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     orange_mask = cv2.inRange(hsv, (5, 80, 80), (25, 255, 255))
     gray_mask = cv2.inRange(hsv, (0, 0, 50), (180, 40, 200))
 
-    for r in range(3):
-        for c in range(3):
+    for r in range(rows):
+        for c in range(cols):
             x0, x1 = x_lines[c], x_lines[c + 1]
             y0, y1 = y_lines[r], y_lines[r + 1]
+            if x1 <= x0 or y1 <= y0:
+                continue
             roi_o = orange_mask[y0:y1, x0:x1]
             roi_g = gray_mask[y0:y1, x0:x1]
             if roi_o.size == 0 or roi_g.size == 0:
@@ -486,6 +529,8 @@ class CameraWeb:
         self._lock = threading.Lock()
         self._last = None
         self._blue_lines = []
+        self._grid = None
+        self._cells = []
         self._p8_angle = 28
         self._p10_angle = 90
         self._lock_board_state = False
@@ -503,6 +548,9 @@ class CameraWeb:
             st = self.board.stats()
             st["p8_angle"] = self._p8_angle
             st["p10_angle"] = self._p10_angle
+            with self._lock:
+                st["grid_ok"] = self._grid is not None
+                st["cells"] = self._cells
             return jsonify(st)
 
         @self.app.get("/set_move")
@@ -511,7 +559,7 @@ class CameraWeb:
             r = int(request.args.get("r", "0"))
             c = int(request.args.get("c", "0"))
             ok = False
-            if 0 <= r <= 2 and 0 <= c <= 2:
+            if 0 <= r < self.board.rows and 0 <= c < self.board.cols:
                 if who == "robot":
                     ok = self.board.set_robot(r, c)
                 else:
@@ -577,6 +625,7 @@ class CameraWeb:
     .row {{ display:flex; gap:8px; align-items:center; margin-top:10px; }}
     .btn {{ background:#1f2937; border:1px solid #334155; color:#e7eef7; padding:6px 10px; border-radius:8px; cursor:pointer; }}
     .video {{ border:1px solid #223; border-radius:8px; width:{CAM_W}px; height:{CAM_H}px; }}
+    .cells {{ font-size:11px; color:#cbd5f5; white-space:pre; max-height:260px; overflow:auto; }}
   </style>
 </head>
 <body>
@@ -585,6 +634,8 @@ class CameraWeb:
       <div class="kv"><span class="k">Empty cells:</span> <span id="empty">-</span></div>
       <div class="kv"><span class="k">Robot moves:</span> <span id="robot">-</span></div>
       <div class="kv"><span class="k">Player moves:</span> <span id="player">-</span></div>
+      <div class="kv"><span class="k">Detected cells:</span> <span id="cells_count">-</span></div>
+      <div id="cells" class="cells">-</div>
       <div class="kv"><span class="k">P8 angle:</span> <span id="p8">28</span></div>
       <div class="row">
         <button class="btn" onclick="p8Dec()">-</button>
@@ -607,9 +658,16 @@ async function tick() {{
     document.getElementById('empty').textContent = js.empty ?? '-';
     document.getElementById('robot').textContent = js.robot ?? '-';
     document.getElementById('player').textContent = js.player ?? '-';
+    const cells = js.cells || [];
+    document.getElementById('cells_count').textContent = cells.length ?? '-';
+    document.getElementById('cells').textContent = formatCells(cells);
     document.getElementById('p8').textContent = js.p8_angle ?? '-';
     document.getElementById('p10').textContent = js.p10_angle ?? '-';
   }} catch(e) {{}}
+}}
+function formatCells(cells) {{
+  if (!cells || !cells.length) return '-';
+  return cells.map(c => `(${c.r},${c.c}) [${c.x0},${c.y0}]-[${c.x1},${c.y1}]`).join('\\n');
 }}
 async function p8Inc() {{
   try {{ await fetch('/p8?action=inc'); }} catch(e) {{}}
@@ -656,6 +714,11 @@ tick();
         with self._lock:
             self._blue_lines = lines or []
 
+    def set_grid(self, grid):
+        with self._lock:
+            self._grid = grid
+            self._cells = [] if not grid else grid.get("cells", [])
+
     def set_p8_angle(self, val: int):
         with self._lock:
             self._p8_angle = int(val)
@@ -667,6 +730,10 @@ tick();
     def lock_board_state(self, on: bool = True):
         with self._lock:
             self._lock_board_state = bool(on)
+
+    def get_grid(self):
+        with self._lock:
+            return None if self._grid is None else dict(self._grid)
 
     def _capture_loop(self):
         dev = int(CAM_DEV) if str(CAM_DEV).isdigit() else CAM_DEV
@@ -690,11 +757,18 @@ tick();
 
             with self._lock:
                 lock_board = self._lock_board_state
-            if not lock_board:
-                detect_player_orange(frame, self.board)
-            blue_lines = detect_blue_lines(frame)
-            self.set_blue_lines(blue_lines)
-            draw_board_overlay(frame, blue_lines=blue_lines)
+            grid = self.get_grid()
+            if grid:
+                if not lock_board:
+                    board = detect_cell_states(frame, grid, self.board.rows, self.board.cols)
+                    self.board.set_board(board)
+                draw_board_overlay(frame, blue_lines=grid.get("lines"), cells=grid.get("cells"))
+            else:
+                if not lock_board:
+                    detect_player_orange(frame, self.board, grid=None)
+                blue_lines = detect_blue_lines(frame)
+                self.set_blue_lines(blue_lines)
+                draw_board_overlay(frame, blue_lines=blue_lines)
 
             with self._lock:
                 self._last = frame
@@ -766,7 +840,7 @@ def create_virtual_caroboard(cam: CameraWeb, motion: MotionController) -> bool:
     print("[VIRTUAL] start create_virtual_caroboard")
     lines_all = []
 
-    def _scan(p8_angle: int):
+    def _scan_low_once(p8_angle: int):
         print(f"[VIRTUAL] P8 -> {p8_angle}")
         set_servo_angle("P8", p8_angle, hold_sec=0.4)
         cam.set_p8_angle(p8_angle)
@@ -784,9 +858,7 @@ def create_virtual_caroboard(cam: CameraWeb, motion: MotionController) -> bool:
                 for x1, y1, x2, y2 in det:
                     lines_all.append((int(x1 * scale), int(y1 * scale), int(x2 * scale), int(y2 * scale)))
 
-    _scan(15)
-    time.sleep(2.0)
-    _scan(38)
+    _scan_low_once(15)
 
     if not lines_all:
         print("[VIRTUAL] no lines detected")
@@ -796,18 +868,18 @@ def create_virtual_caroboard(cam: CameraWeb, motion: MotionController) -> bool:
     frame_last = cam.get_last_frame()
     if frame_last is None:
         frame_last = np.zeros((CAM_H, CAM_W, 3), dtype=np.uint8)
-    grid = build_grid_from_lines(lines_all, frame_last)
+    grid = build_grid_from_lines(lines_all, frame_last, cols=GRID_COLS, rows=GRID_ROWS)
     if not grid:
         print("[VIRTUAL] cannot build grid from lines")
         set_led(motion, "red", bps=0.8)
         return False
 
-    cam.set_blue_lines(grid["lines"])
+    cam.set_grid(grid)
     set_led(motion, "blue", bps=0.6)
 
     frame = cam.get_last_frame()
     if frame is not None:
-        board = detect_cell_states(frame, grid)
+        board = detect_cell_states(frame, grid, GRID_ROWS, GRID_COLS)
         cam.board.set_board(board)
         cam.lock_board_state(True)
         print("[VIRTUAL] board updated")
