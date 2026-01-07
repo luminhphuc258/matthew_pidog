@@ -41,7 +41,7 @@ FRONT_LIFT_ANGLES = {
 }
 
 HEAD_INIT_ANGLES = {
-    "P8": 80,
+    "P8": 62,
     "P9": -70,
     "P10": 90,
 }
@@ -346,7 +346,7 @@ def detect_player_orange(frame_bgr, board: BoardState):
                 board.set_player(r, c)
 
 
-def draw_board_overlay(frame_bgr, board: BoardState):
+def draw_board_overlay(frame_bgr, board: BoardState, board_bbox=None):
     h, w = frame_bgr.shape[:2]
     cell_w = w // 3
     cell_h = h // 3
@@ -372,6 +372,10 @@ def draw_board_overlay(frame_bgr, board: BoardState):
         cv2.line(frame_bgr, (i * cell_w, 0), (i * cell_w, h), grid_color, 2)
         cv2.line(frame_bgr, (0, i * cell_h), (w, i * cell_h), grid_color, 2)
 
+    if board_bbox:
+        bx, by, bw, bh = board_bbox
+        cv2.rectangle(frame_bgr, (bx, by), (bx + bw, by + bh), (255, 0, 0), 2)
+
     # pieces + borders
     for r in range(3):
         for c in range(3):
@@ -395,6 +399,7 @@ class CameraWeb:
         self.app = Flask("tic_tac_toe_cam")
         self._lock = threading.Lock()
         self._last = None
+        self._board_bbox = None
         self._stop = threading.Event()
         self._thread = None
         self._ready = threading.Event()
@@ -485,6 +490,10 @@ tick();
         with self._lock:
             return None if self._last is None else self._last.copy()
 
+    def set_board_bbox(self, bbox):
+        with self._lock:
+            self._board_bbox = bbox
+
     def _capture_loop(self):
         dev = int(CAM_DEV) if str(CAM_DEV).isdigit() else CAM_DEV
         cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
@@ -506,7 +515,9 @@ tick();
                 frame = cv2.rotate(frame, cv2.ROTATE_180)
 
             detect_player_orange(frame, self.board)
-            draw_board_overlay(frame, self.board)
+            with self._lock:
+                bbox = self._board_bbox
+            draw_board_overlay(frame, self.board, board_bbox=bbox)
 
             with self._lock:
                 self._last = frame
@@ -529,10 +540,10 @@ tick();
         return self._ready.is_set() and not self._failed.is_set()
 
 
-def _detect_board_ready(frame_bgr) -> bool:
+def _detect_board_ready(frame_bgr):
     h, w = frame_bgr.shape[:2]
     if h < 60 or w < 60:
-        return False
+        return False, None
 
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
 
@@ -542,13 +553,13 @@ def _detect_board_ready(frame_bgr) -> bool:
     blue_mask = cv2.inRange(hsv, (90, 80, 60), (130, 255, 255))
     blue_ratio = float(cv2.countNonZero(blue_mask)) / float(blue_mask.size)
     if white_ratio < 0.30 or blue_ratio < 0.004:
-        return False
+        return False, None
 
     edges = cv2.Canny(blue_mask, 50, 150)
     min_len = int(min(w, h) * 0.35)
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=60, minLineLength=min_len, maxLineGap=20)
     if lines is None:
-        return False
+        return False, None
 
     v_cnt = 0
     h_cnt = 0
@@ -561,7 +572,19 @@ def _detect_board_ready(frame_bgr) -> bool:
         elif dy < dx * 0.35:
             h_cnt += 1
 
-    return v_cnt >= 2 and h_cnt >= 2
+    if v_cnt < 2 or h_cnt < 2:
+        return False, None
+
+    contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return True, (0, 0, w - 1, h - 1)
+
+    c = max(contours, key=cv2.contourArea)
+    x, y, bw, bh = cv2.boundingRect(c)
+    if bw <= 10 or bh <= 10:
+        return True, (0, 0, w - 1, h - 1)
+
+    return True, (x, y, bw, bh)
 
 
 def searching_tictoeborad(cam: CameraWeb, motion: MotionController, timeout_sec: float = 60.0) -> bool:
@@ -573,6 +596,7 @@ def searching_tictoeborad(cam: CameraWeb, motion: MotionController, timeout_sec:
         s8.angle(clamp(62))
     except Exception:
         pass
+    print("[SEARCH] P8 -> 62")
 
     angle = 70
     t0 = time.time()
@@ -583,10 +607,15 @@ def searching_tictoeborad(cam: CameraWeb, motion: MotionController, timeout_sec:
             pass
 
         frame = cam.get_last_frame()
-        if frame is not None and _detect_board_ready(frame):
-            print("[SEARCH] board ready")
-            set_led(motion, "blue", bps=0.6)
-            return True
+        if frame is not None:
+            ok, bbox = _detect_board_ready(frame)
+            if ok:
+                cam.set_board_bbox(bbox)
+                print("[SEARCH] board ready")
+                set_led(motion, "blue", bps=0.6)
+                return True
+
+        print(f"[SEARCH] sweep P10 -> {angle}")
 
         time.sleep(2.0)
         angle = 90 if angle == 70 else 70
@@ -636,6 +665,13 @@ def main():
         print("[CAM] not ready, stop", flush=True)
         return
 
+    print("[BOOT] set P8 -> 62")
+    try:
+        Servo("P8").angle(clamp(62))
+    except Exception:
+        pass
+    time.sleep(0.2)
+
     print("[BOOT] set head init angles")
     apply_angles(HEAD_INIT_ANGLES, per_servo_delay=0.04)
     print("[BOOT] head init done")
@@ -669,36 +705,12 @@ def main():
                 pass
         return
 
-    dog = motion.get_dog()
-    if dog:
-        r, c = board.first_empty()
-        print(f"[MOVE] go to empty cell r={r} c={c}")
-        try:
-            dog.do_action("forward", speed=250)
-            dog.wait_all_done()
-        except Exception:
-            pass
-        board.set_robot(r, c)
-
-        print("[MOVE] robot action")
-        robotvehinhcaro()
-
-        print("[MOVE] lift rear + front, then boot stand")
-        smooth_pair("P4", 0, REAR_LIFT_ANGLES["P4"], "P5", 0, REAR_LIFT_ANGLES["P5"], step=1, delay=0.04)
-        smooth_pair("P6", 0, REAR_LIFT_ANGLES["P6"], "P7", 0, REAR_LIFT_ANGLES["P7"], step=1, delay=0.04)
-        apply_angles(FRONT_LIFT_ANGLES, per_servo_delay=0.04)
-        motion.boot()
-
-        print("[MOVE] backward 3s then stop")
-        try:
-            dog.do_action("backward", speed=250)
-            time.sleep(3.0)
-            dog.do_action("stand", speed=5)
-            dog.wait_all_done()
-        except Exception:
-            pass
-
-    print("[DONE]")
+    print("[SEARCH] board ready -> keep web running")
+    try:
+        while True:
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("\n[EXIT] Ctrl+C", flush=True)
 
 
 if __name__ == "__main__":
