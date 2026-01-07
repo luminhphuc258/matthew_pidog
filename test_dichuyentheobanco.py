@@ -41,7 +41,7 @@ FRONT_LIFT_ANGLES = {
 }
 
 HEAD_INIT_ANGLES = {
-    "P8": 20,
+    "P8": 50,
     "P9": -70,
     "P10": 90,
 }
@@ -409,6 +409,7 @@ class CameraWeb:
         self._lock = threading.Lock()
         self._last = None
         self._board_bbox = None
+        self._p8_angle = 50
         self._stop = threading.Event()
         self._thread = None
         self._ready = threading.Event()
@@ -420,7 +421,9 @@ class CameraWeb:
 
         @self.app.get("/state.json")
         def state():
-            return jsonify(self.board.stats())
+            st = self.board.stats()
+            st["p8_angle"] = self._p8_angle
+            return jsonify(st)
 
         @self.app.get("/set_move")
         def set_move():
@@ -434,6 +437,29 @@ class CameraWeb:
                 else:
                     ok = self.board.set_player(r, c)
             return jsonify({"ok": ok})
+
+        @self.app.get("/p8")
+        def p8():
+            action = str(request.args.get("action", ""))
+            with self._lock:
+                cur = int(self._p8_angle)
+            if action == "inc":
+                cur = min(90, cur + 1)
+            elif action == "dec":
+                cur = max(-90, cur - 1)
+            elif action == "set":
+                try:
+                    cur = int(request.args.get("val", cur))
+                except Exception:
+                    pass
+                cur = max(-90, min(90, cur))
+            try:
+                Servo("P8").angle(clamp(cur))
+            except Exception:
+                pass
+            with self._lock:
+                self._p8_angle = int(cur)
+            return jsonify({"ok": True, "p8_angle": int(cur)})
 
         @self.app.get("/mjpeg")
         def mjpeg():
@@ -451,6 +477,8 @@ class CameraWeb:
     .card {{ background:#111827; border:1px solid #223; border-radius:12px; padding:12px; min-width:260px; }}
     .kv {{ margin:8px 0; }}
     .k {{ color:#93c5fd; }}
+    .row {{ display:flex; gap:8px; align-items:center; margin-top:10px; }}
+    .btn {{ background:#1f2937; border:1px solid #334155; color:#e7eef7; padding:6px 10px; border-radius:8px; cursor:pointer; }}
     .video {{ border:1px solid #223; border-radius:8px; width:{CAM_W}px; height:{CAM_H}px; }}
   </style>
 </head>
@@ -460,6 +488,11 @@ class CameraWeb:
       <div class="kv"><span class="k">Empty cells:</span> <span id="empty">-</span></div>
       <div class="kv"><span class="k">Robot moves:</span> <span id="robot">-</span></div>
       <div class="kv"><span class="k">Player moves:</span> <span id="player">-</span></div>
+      <div class="kv"><span class="k">P8 angle:</span> <span id="p8">50</span></div>
+      <div class="row">
+        <button class="btn" onclick="p8Dec()">-</button>
+        <button class="btn" onclick="p8Inc()">+</button>
+      </div>
       <div class="kv" style="font-size:12px;color:#aab;">O = orange circle, robot = short gray line</div>
     </div>
     <img class="video" id="cam" src="/mjpeg" />
@@ -472,7 +505,16 @@ async function tick() {{
     document.getElementById('empty').textContent = js.empty ?? '-';
     document.getElementById('robot').textContent = js.robot ?? '-';
     document.getElementById('player').textContent = js.player ?? '-';
+    document.getElementById('p8').textContent = js.p8_angle ?? '-';
   }} catch(e) {{}}
+}}
+async function p8Inc() {{
+  try {{ await fetch('/p8?action=inc'); }} catch(e) {{}}
+  tick();
+}}
+async function p8Dec() {{
+  try {{ await fetch('/p8?action=dec'); }} catch(e) {{}}
+  tick();
 }}
 setInterval(tick, 500);
 tick();
@@ -601,10 +643,10 @@ def searching_tictoeborad(cam: CameraWeb, motion: MotionController, timeout_sec:
     s8 = Servo("P8")
 
     try:
-        s8.angle(clamp(20))
+        s8.angle(clamp(50))
     except Exception:
         pass
-    print("[SEARCH] P8 -> 20")
+    print("[SEARCH] P8 -> 50")
 
     t0 = time.time()
     while time.time() - t0 < float(timeout_sec):
@@ -657,9 +699,9 @@ def main():
     os.environ.setdefault("JACK_NO_START_SERVER", "1")
     os.environ.setdefault("PIDOG_SKIP_HEAD_INIT", "1")
     os.environ.setdefault("PIDOG_SKIP_MCU_RESET", "1")
-    os.environ.setdefault("HEAD_P8_IDLE", "20")
-    os.environ.setdefault("HEAD_SWEEP_MIN", "20")
-    os.environ.setdefault("HEAD_SWEEP_MAX", "20")
+    os.environ.setdefault("HEAD_P8_IDLE", "50")
+    os.environ.setdefault("HEAD_SWEEP_MIN", "50")
+    os.environ.setdefault("HEAD_SWEEP_MAX", "50")
 
     board = BoardState()
     cam = CameraWeb(board)
@@ -668,8 +710,8 @@ def main():
         print("[CAM] not ready, stop", flush=True)
         return
 
-    print("[BOOT] set P8 -> 20")
-    set_servo_angle("P8", 20, hold_sec=0.4)
+    print("[BOOT] set P8 -> 50")
+    set_servo_angle("P8", 50, hold_sec=0.4)
     time.sleep(0.2)
 
     print("[BOOT] set head init angles")
