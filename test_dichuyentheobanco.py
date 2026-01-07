@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 import cv2
+import numpy as np
 from flask import Flask, Response, jsonify, request
 
 from robot_hat import Servo, Music
@@ -181,6 +182,107 @@ def play_tiengsua(wav_path: str, volume: int = 80):
         time.sleep(dur + 0.15)
     else:
         time.sleep(2.5)
+
+
+def _try_create_rgb_device():
+    try:
+        import robot_hat
+    except Exception as e:
+        print(f"[LED] robot_hat import failed: {e}")
+        return None
+
+    led_num = int(os.environ.get("PIDOG_LED_NUM", "2"))
+    led_pin = int(os.environ.get("PIDOG_LED_PIN", "12"))
+    candidates = (
+        "RGBStrip",
+        "RGBStripWS2812",
+        "RGBStripAPA102",
+        "RGBLed",
+        "RGBLED",
+    )
+    arg_sets = (
+        (),
+        (led_num,),
+        (led_num, led_pin),
+        (led_pin, led_num),
+    )
+
+    for cls_name in candidates:
+        cls = getattr(robot_hat, cls_name, None)
+        if not cls:
+            continue
+        for args in arg_sets:
+            try:
+                dev = cls(*args)
+                print(f"[LED] init {cls_name} args={args}")
+                return dev
+            except Exception:
+                continue
+
+    return None
+
+
+def set_led(motion: MotionController, color: str, bps: float = 0.5):
+    dog = getattr(motion, "dog", None)
+    if not dog:
+        print("[LED] motion has no dog instance")
+        return
+
+    rs = getattr(dog, "rgb_strip", None)
+    rl = getattr(dog, "rgb_led", None)
+    if not rs and not rl:
+        dev = _try_create_rgb_device()
+        if dev:
+            try:
+                dog.rgb_strip = dev
+                rs = dev
+            except Exception:
+                pass
+        else:
+            print("[LED] no rgb device available (rgb_strip init failed?)")
+            return
+
+    # 1) rgb_strip.set_mode("breath", color, bps=?)
+    try:
+        if rs:
+            try:
+                rs.set_mode("breath", color, bps=bps)
+                return
+            except TypeError:
+                rs.set_mode("breath", color, bps)
+                return
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 2) rgb_strip.set_color / fill / show
+    try:
+        if rs:
+            for fn in ("set_color", "fill"):
+                if hasattr(rs, fn):
+                    try:
+                        getattr(rs, fn)(color)
+                        if hasattr(rs, "show"):
+                            rs.show()
+                        return
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # 3) rgb_led.set_color / set_rgb
+    try:
+        if rl:
+            for fn in ("set_color", "set_rgb", "setColor"):
+                if hasattr(rl, fn):
+                    try:
+                        getattr(rl, fn)(color)
+                        return
+                    except Exception:
+                        pass
+    except Exception:
+        pass
 
 
 class BoardState:
@@ -377,6 +479,10 @@ tick();
             yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
             time.sleep(0.03)
 
+    def get_last_frame(self):
+        with self._lock:
+            return None if self._last is None else self._last.copy()
+
     def _capture_loop(self):
         dev = int(CAM_DEV) if str(CAM_DEV).isdigit() else CAM_DEV
         cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
@@ -412,6 +518,81 @@ tick();
             daemon=True,
         ).start()
         print(f"[WEB] http://<pi_ip>:{WEB_PORT}/", flush=True)
+
+
+def _detect_board_ready(frame_bgr) -> bool:
+    h, w = frame_bgr.shape[:2]
+    if h < 60 or w < 60:
+        return False
+
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+
+    white_mask = cv2.inRange(hsv, (0, 0, 200), (180, 40, 255))
+    white_ratio = float(cv2.countNonZero(white_mask)) / float(white_mask.size)
+
+    blue_mask = cv2.inRange(hsv, (90, 80, 60), (130, 255, 255))
+    blue_ratio = float(cv2.countNonZero(blue_mask)) / float(blue_mask.size)
+    if white_ratio < 0.30 or blue_ratio < 0.004:
+        return False
+
+    edges = cv2.Canny(blue_mask, 50, 150)
+    min_len = int(min(w, h) * 0.35)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=60, minLineLength=min_len, maxLineGap=20)
+    if lines is None:
+        return False
+
+    v_cnt = 0
+    h_cnt = 0
+    for ln in lines:
+        x1, y1, x2, y2 = ln[0]
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+        if dx < dy * 0.35:
+            v_cnt += 1
+        elif dy < dx * 0.35:
+            h_cnt += 1
+
+    return v_cnt >= 2 and h_cnt >= 2
+
+
+def searching_tictoeborad(cam: CameraWeb, motion: MotionController, timeout_sec: float = 60.0) -> bool:
+    print("[SEARCH] start scanning for tictoe board")
+    s8 = Servo("P8")
+    s10 = Servo("P10")
+
+    try:
+        s8.angle(clamp(65))
+    except Exception:
+        pass
+
+    angle = 65
+    direction = 1
+    t0 = time.time()
+    while time.time() - t0 < float(timeout_sec):
+        try:
+            s10.angle(clamp(angle))
+        except Exception:
+            pass
+
+        frame = cam.get_last_frame()
+        if frame is not None and _detect_board_ready(frame):
+            print("[SEARCH] board ready")
+            set_led(motion, "blue", bps=0.6)
+            return True
+
+        angle += direction
+        if angle >= 90:
+            angle = 90
+            direction = -1
+        elif angle <= 65:
+            angle = 65
+            direction = 1
+
+        time.sleep(0.03)
+
+    print("[SEARCH] timeout -> not found")
+    set_led(motion, "red", bps=0.8)
+    return False
 
 
 def robotvehinhcaro():
@@ -471,6 +652,17 @@ def main():
     print("[BOOT] boot done")
 
     play_tiengsua("tiengsua.wav")
+
+    if not searching_tictoeborad(cam, motion, timeout_sec=60.0):
+        print("[SEARCH] stop due to no board")
+        dog = motion.get_dog()
+        if dog:
+            try:
+                dog.do_action("stand", speed=5)
+                dog.wait_all_done()
+            except Exception:
+                pass
+        return
 
     dog = motion.get_dog()
     if dog:
