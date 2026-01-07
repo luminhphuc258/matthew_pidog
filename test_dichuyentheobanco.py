@@ -541,6 +541,8 @@ class CameraWeb:
         self._thread = None
         self._ready = threading.Event()
         self._failed = threading.Event()
+        self._play_requested = threading.Event()
+        self._scan_status = "idle"
 
         @self.app.get("/")
         def index():
@@ -554,6 +556,7 @@ class CameraWeb:
             with self._lock:
                 st["grid_ok"] = self._grid is not None
                 st["cells"] = self._cells
+                st["scan_status"] = self._scan_status
             return jsonify(st)
 
         @self.app.get("/set_move")
@@ -568,6 +571,11 @@ class CameraWeb:
                 else:
                     ok = self.board.set_player(r, c)
             return jsonify({"ok": ok})
+
+        @self.app.get("/play")
+        def play():
+            self.request_scan()
+            return jsonify({"ok": True})
 
         @self.app.get("/p8")
         def p8():
@@ -639,6 +647,10 @@ class CameraWeb:
       <div class="kv"><span class="k">Player moves:</span> <span id="player">-</span></div>
       <div class="kv"><span class="k">Detected cells:</span> <span id="cells_count">-</span></div>
       <div id="cells" class="cells">-</div>
+      <div class="kv"><span class="k">Scan status:</span> <span id="scan_status">idle</span></div>
+      <div class="row">
+        <button class="btn" onclick="playScan()">Play</button>
+      </div>
       <div class="kv"><span class="k">P8 angle:</span> <span id="p8">28</span></div>
       <div class="row">
         <button class="btn" onclick="p8Dec()">-</button>
@@ -666,11 +678,16 @@ async function tick() {{
     document.getElementById('cells').textContent = formatCells(cells);
     document.getElementById('p8').textContent = js.p8_angle ?? '-';
     document.getElementById('p10').textContent = js.p10_angle ?? '-';
+    document.getElementById('scan_status').textContent = js.scan_status ?? '-';
   }} catch(e) {{}}
 }}
 function formatCells(cells) {{
   if (!cells || !cells.length) return '-';
-  return cells.map(c => `(${c.r},${c.c}) [${c.x0},${c.y0}]-[${c.x1},${c.y1}]`).join('\\n');
+  return cells.map(c => `(${{c.r}},${{c.c}}) [${{c.x0}},${{c.y0}}]-[${{c.x1}},${{c.y1}}]`).join('\n');
+}}
+async function playScan() {{
+  try {{ await fetch('/play'); }} catch(e) {{}}
+  tick();
 }}
 async function p8Inc() {{
   try {{ await fetch('/p8?action=inc'); }} catch(e) {{}}
@@ -729,6 +746,19 @@ tick();
     def set_p10_angle(self, val: int):
         with self._lock:
             self._p10_angle = int(val)
+
+    def request_scan(self):
+        self._play_requested.set()
+
+    def consume_scan_request(self) -> bool:
+        if self._play_requested.is_set():
+            self._play_requested.clear()
+            return True
+        return False
+
+    def set_scan_status(self, status: str):
+        with self._lock:
+            self._scan_status = str(status)
 
     def lock_board_state(self, on: bool = True):
         with self._lock:
@@ -848,7 +878,19 @@ def create_virtual_caroboard(cam: CameraWeb, motion: MotionController) -> bool:
         set_servo_angle("P8", p8_angle, hold_sec=0.4)
         cam.set_p8_angle(p8_angle)
         time.sleep(1.0)
-        for ang in range(90, 19, -1):
+        for ang in range(10, 86):
+            set_servo_angle("P10", ang, hold_sec=0.05)
+            cam.set_p10_angle(ang)
+            frame = cam.get_last_frame()
+            if frame is None:
+                continue
+            small = cv2.resize(frame, (0, 0), fx=0.8, fy=0.8, interpolation=cv2.INTER_AREA)
+            det = detect_blue_lines(small)
+            if det:
+                scale = 1.0 / 0.8
+                for x1, y1, x2, y2 in det:
+                    lines_all.append((int(x1 * scale), int(y1 * scale), int(x2 * scale), int(y2 * scale)))
+        for ang in range(85, -1, -1):
             set_servo_angle("P10", ang, hold_sec=0.05)
             cam.set_p10_angle(ang)
             frame = cam.get_last_frame()
@@ -963,21 +1005,20 @@ def main():
 
     play_tiengsua("tiengsua.wav")
 
-    if not create_virtual_caroboard(cam, motion):
-        print("[VIRTUAL] stop due to no board")
-        dog = motion.get_dog()
-        if dog:
-            try:
-                dog.do_action("stand", speed=5)
-                dog.wait_all_done()
-            except Exception:
-                pass
-        return
-
-    print("[SEARCH] board ready -> keep web running")
+    cam.set_scan_status("idle")
+    print("[WEB] waiting for Play button to scan")
     try:
         while True:
-            time.sleep(1.0)
+            if cam.consume_scan_request():
+                cam.set_scan_status("scanning")
+                ok = create_virtual_caroboard(cam, motion)
+                if ok:
+                    cam.set_scan_status("ready")
+                    print("[VIRTUAL] board ready -> keep web running")
+                else:
+                    cam.set_scan_status("failed")
+                    print("[VIRTUAL] scan failed, press Play to retry")
+            time.sleep(0.2)
     except KeyboardInterrupt:
         print("\n[EXIT] Ctrl+C", flush=True)
 
