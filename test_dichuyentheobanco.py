@@ -324,6 +324,10 @@ class BoardState:
             robot = sum(1 for r in self._board for v in r if v == 2)
         return {"empty": empty, "player": player, "robot": robot}
 
+    def set_board(self, board: List[List[int]]):
+        with self._lock:
+            self._board = [row[:] for row in board]
+
     def first_empty(self) -> Tuple[int, int]:
         with self._lock:
             for r in range(3):
@@ -386,6 +390,95 @@ def draw_board_overlay(frame_bgr, blue_lines=None):
         cv2.line(frame_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
 
+def _cluster_positions(pos, tol):
+    if not pos:
+        return []
+    pos = sorted(pos)
+    groups = [[pos[0]]]
+    for p in pos[1:]:
+        if abs(p - groups[-1][-1]) <= tol:
+            groups[-1].append(p)
+        else:
+            groups.append([p])
+    return [int(sum(g) / len(g)) for g in groups]
+
+
+def _pick_four(vals):
+    if not vals:
+        return []
+    vals = sorted(vals)
+    if len(vals) <= 4:
+        return vals
+    n = len(vals)
+    return [vals[0], vals[(n - 1) // 3], vals[(2 * (n - 1)) // 3], vals[-1]]
+
+
+def build_grid_from_lines(lines, frame_shape):
+    h, w = frame_shape[:2]
+    if not lines:
+        return None
+    v_pos = []
+    h_pos = []
+    for x1, y1, x2, y2 in lines:
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+        if dx < dy * 0.35:
+            v_pos.append(int((x1 + x2) / 2))
+        elif dy < dx * 0.35:
+            h_pos.append(int((y1 + y2) / 2))
+    tol = max(6, int(min(w, h) * 0.03))
+    v_lines = _pick_four(_cluster_positions(v_pos, tol))
+    h_lines = _pick_four(_cluster_positions(h_pos, tol))
+    if len(v_lines) < 2 or len(h_lines) < 2:
+        return None
+
+    if len(v_lines) < 4:
+        vmin, vmax = min(v_lines), max(v_lines)
+        v_lines = [vmin, vmin + (vmax - vmin) // 3, vmin + 2 * (vmax - vmin) // 3, vmax]
+    if len(h_lines) < 4:
+        hmin, hmax = min(h_lines), max(h_lines)
+        h_lines = [hmin, hmin + (hmax - hmin) // 3, hmin + 2 * (hmax - hmin) // 3, hmax]
+
+    v_lines = sorted([max(0, min(w - 1, x)) for x in v_lines])
+    h_lines = sorted([max(0, min(h - 1, y)) for y in h_lines])
+
+    out_lines = []
+    x0, x3 = v_lines[0], v_lines[-1]
+    y0, y3 = h_lines[0], h_lines[-1]
+    for x in v_lines:
+        out_lines.append((x, y0, x, y3))
+    for y in h_lines:
+        out_lines.append((x0, y, x3, y))
+
+    return {"x": v_lines, "y": h_lines, "lines": out_lines}
+
+
+def detect_cell_states(frame_bgr, grid):
+    x_lines = grid["x"]
+    y_lines = grid["y"]
+    board = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
+
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    orange_mask = cv2.inRange(hsv, (5, 80, 80), (25, 255, 255))
+    gray_mask = cv2.inRange(hsv, (0, 0, 50), (180, 40, 200))
+
+    for r in range(3):
+        for c in range(3):
+            x0, x1 = x_lines[c], x_lines[c + 1]
+            y0, y1 = y_lines[r], y_lines[r + 1]
+            roi_o = orange_mask[y0:y1, x0:x1]
+            roi_g = gray_mask[y0:y1, x0:x1]
+            if roi_o.size == 0 or roi_g.size == 0:
+                continue
+            o_ratio = float(cv2.countNonZero(roi_o)) / float(roi_o.size)
+            g_ratio = float(cv2.countNonZero(roi_g)) / float(roi_g.size)
+            if o_ratio > 0.01:
+                board[r][c] = 1
+            elif g_ratio > 0.01:
+                board[r][c] = 2
+    return board
+
+
 class CameraWeb:
     def __init__(self, board: BoardState):
         self.board = board
@@ -395,6 +488,7 @@ class CameraWeb:
         self._blue_lines = []
         self._p8_angle = 28
         self._p10_angle = 90
+        self._lock_board_state = False
         self._stop = threading.Event()
         self._thread = None
         self._ready = threading.Event()
@@ -501,7 +595,7 @@ class CameraWeb:
         <button class="btn" onclick="p10Dec()">-</button>
         <button class="btn" onclick="p10Inc()">+</button>
       </div>
-      <div class="kv" style="font-size:12px;color:#aab;">O = orange circle, robot = short gray line</div>
+      <div class="kv" style="font-size:12px;color:#aab;">Player = orange X, robot = short gray line</div>
     </div>
     <img class="video" id="cam" src="/mjpeg" />
   </div>
@@ -562,6 +656,18 @@ tick();
         with self._lock:
             self._blue_lines = lines or []
 
+    def set_p8_angle(self, val: int):
+        with self._lock:
+            self._p8_angle = int(val)
+
+    def set_p10_angle(self, val: int):
+        with self._lock:
+            self._p10_angle = int(val)
+
+    def lock_board_state(self, on: bool = True):
+        with self._lock:
+            self._lock_board_state = bool(on)
+
     def _capture_loop(self):
         dev = int(CAM_DEV) if str(CAM_DEV).isdigit() else CAM_DEV
         cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
@@ -582,7 +688,10 @@ tick();
             if ROTATE_180:
                 frame = cv2.rotate(frame, cv2.ROTATE_180)
 
-            detect_player_orange(frame, self.board)
+            with self._lock:
+                lock_board = self._lock_board_state
+            if not lock_board:
+                detect_player_orange(frame, self.board)
             blue_lines = detect_blue_lines(frame)
             self.set_blue_lines(blue_lines)
             draw_board_overlay(frame, blue_lines=blue_lines)
@@ -619,10 +728,7 @@ def _detect_board_ready(frame_bgr):
     white_ratio = float(cv2.countNonZero(white_mask)) / float(white_mask.size)
 
     blue_lines = detect_blue_lines(frame_bgr)
-    if white_ratio < 0.15 or not blue_lines:
-        return False, None
-
-    if not blue_lines:
+    if white_ratio < 0.10 or not blue_lines:
         return False, None
 
     return True, blue_lines
@@ -654,6 +760,56 @@ def searching_tictoeborad(cam: CameraWeb, motion: MotionController, timeout_sec:
     print("[SEARCH] timeout -> not found")
     set_led(motion, "red", bps=0.8)
     return False
+
+
+def create_virtual_caroboard(cam: CameraWeb, motion: MotionController) -> bool:
+    print("[VIRTUAL] start create_virtual_caroboard")
+    lines_all = []
+
+    def _scan(p8_angle: int):
+        print(f"[VIRTUAL] P8 -> {p8_angle}")
+        set_servo_angle("P8", p8_angle, hold_sec=0.4)
+        cam.set_p8_angle(p8_angle)
+        time.sleep(1.0)
+        for ang in range(90, 19, -1):
+            set_servo_angle("P10", ang, hold_sec=0.05)
+            cam.set_p10_angle(ang)
+            frame = cam.get_last_frame()
+            if frame is None:
+                continue
+            small = cv2.resize(frame, (0, 0), fx=0.8, fy=0.8, interpolation=cv2.INTER_AREA)
+            det = detect_blue_lines(small)
+            if det:
+                scale = 1.0 / 0.8
+                for x1, y1, x2, y2 in det:
+                    lines_all.append((int(x1 * scale), int(y1 * scale), int(x2 * scale), int(y2 * scale)))
+
+    _scan(15)
+    time.sleep(2.0)
+    _scan(38)
+
+    if not lines_all:
+        print("[VIRTUAL] no lines detected")
+        set_led(motion, "red", bps=0.8)
+        return False
+
+    grid = build_grid_from_lines(lines_all, cam.get_last_frame() or np.zeros((CAM_H, CAM_W, 3), dtype=np.uint8))
+    if not grid:
+        print("[VIRTUAL] cannot build grid from lines")
+        set_led(motion, "red", bps=0.8)
+        return False
+
+    cam.set_blue_lines(grid["lines"])
+    set_led(motion, "blue", bps=0.6)
+
+    frame = cam.get_last_frame()
+    if frame is not None:
+        board = detect_cell_states(frame, grid)
+        cam.board.set_board(board)
+        cam.lock_board_state(True)
+        print("[VIRTUAL] board updated")
+
+    return True
 
 
 def robotvehinhcaro():
@@ -729,8 +885,8 @@ def main():
 
     play_tiengsua("tiengsua.wav")
 
-    if not searching_tictoeborad(cam, motion, timeout_sec=60.0):
-        print("[SEARCH] stop due to no board")
+    if not create_virtual_caroboard(cam, motion):
+        print("[VIRTUAL] stop due to no board")
         dog = motion.get_dog()
         if dog:
             try:
