@@ -635,7 +635,9 @@ def detect_cell_states(frame_bgr, grid, rows: int, cols: int):
     warped = cv2.warpPerspective(frame_bgr, H, (size, size))
     hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
     orange_mask = cv2.inRange(hsv, (5, 80, 80), (25, 255, 255))
-    gray_mask = cv2.inRange(hsv, (0, 0, 50), (180, 40, 200))
+    blue_mask = cv2.inRange(hsv, (90, 60, 60), (140, 255, 255))
+    player_mask = cv2.bitwise_or(orange_mask, blue_mask)
+    dark_mask = cv2.inRange(hsv, (0, 0, 0), (180, 60, 90))
 
     for r in range(rows):
         for c in range(cols):
@@ -643,15 +645,21 @@ def detect_cell_states(frame_bgr, grid, rows: int, cols: int):
             y0, y1 = y_lines[r], y_lines[r + 1]
             if x1 <= x0 or y1 <= y0:
                 continue
-            roi_o = orange_mask[y0:y1, x0:x1]
-            roi_g = gray_mask[y0:y1, x0:x1]
-            if roi_o.size == 0 or roi_g.size == 0:
+            mx = max(2, int((x1 - x0) * 0.12))
+            my = max(2, int((y1 - y0) * 0.12))
+            xa, xb = x0 + mx, x1 - mx
+            ya, yb = y0 + my, y1 - my
+            if xb <= xa or yb <= ya:
                 continue
-            o_ratio = float(cv2.countNonZero(roi_o)) / float(roi_o.size)
-            g_ratio = float(cv2.countNonZero(roi_g)) / float(roi_g.size)
-            if o_ratio > 0.01:
+            roi_p = player_mask[ya:yb, xa:xb]
+            roi_d = dark_mask[ya:yb, xa:xb]
+            if roi_p.size == 0 or roi_d.size == 0:
+                continue
+            p_ratio = float(cv2.countNonZero(roi_p)) / float(roi_p.size)
+            d_ratio = float(cv2.countNonZero(roi_d)) / float(roi_d.size)
+            if p_ratio > 0.03:
                 board[r][c] = 1
-            elif g_ratio > 0.01:
+            elif d_ratio > 0.02:
                 board[r][c] = 2
     return board
 
