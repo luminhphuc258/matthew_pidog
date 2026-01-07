@@ -561,12 +561,11 @@ def searching_tictoeborad(cam: CameraWeb, motion: MotionController, timeout_sec:
     s10 = Servo("P10")
 
     try:
-        s8.angle(clamp(65))
+        s8.angle(clamp(62))
     except Exception:
         pass
 
-    angle = 65
-    direction = 1
+    angle = 70
     t0 = time.time()
     while time.time() - t0 < float(timeout_sec):
         try:
@@ -580,15 +579,8 @@ def searching_tictoeborad(cam: CameraWeb, motion: MotionController, timeout_sec:
             set_led(motion, "blue", bps=0.6)
             return True
 
-        angle += direction
-        if angle >= 90:
-            angle = 90
-            direction = -1
-        elif angle <= 65:
-            angle = 65
-            direction = 1
-
-        time.sleep(0.03)
+        time.sleep(2.0)
+        angle = 90 if angle == 70 else 70
 
     print("[SEARCH] timeout -> not found")
     set_led(motion, "red", bps=0.8)
