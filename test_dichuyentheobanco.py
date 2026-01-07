@@ -64,6 +64,15 @@ def apply_angles(angles: dict[str, float], per_servo_delay: float = 0.03):
             pass
         time.sleep(per_servo_delay)
 
+def set_servo_angle(port: str, angle: float, hold_sec: float = 0.4):
+    try:
+        s = Servo(port)
+        s.angle(clamp(angle))
+        time.sleep(max(0.05, float(hold_sec)))
+        s.angle(clamp(angle))
+    except Exception:
+        pass
+
 
 def smooth_pair(
     pA: str, a_start: int, a_end: int,
@@ -657,6 +666,9 @@ def main():
     os.environ.setdefault("JACK_NO_START_SERVER", "1")
     os.environ.setdefault("PIDOG_SKIP_HEAD_INIT", "1")
     os.environ.setdefault("PIDOG_SKIP_MCU_RESET", "1")
+    os.environ.setdefault("HEAD_P8_IDLE", "62")
+    os.environ.setdefault("HEAD_SWEEP_MIN", "62")
+    os.environ.setdefault("HEAD_SWEEP_MAX", "62")
 
     board = BoardState()
     cam = CameraWeb(board)
@@ -666,10 +678,7 @@ def main():
         return
 
     print("[BOOT] set P8 -> 62")
-    try:
-        Servo("P8").angle(clamp(62))
-    except Exception:
-        pass
+    set_servo_angle("P8", 62, hold_sec=0.4)
     time.sleep(0.2)
 
     print("[BOOT] set head init angles")
