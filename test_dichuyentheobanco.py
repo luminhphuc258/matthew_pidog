@@ -818,11 +818,11 @@ async function tick() {{
 }}
 function formatCells(cells) {{
   if (!cells || !cells.length) return '-';
-  return cells.map(c => `(${{c.r}},${{c.c}}) [${{c.x0}},${{c.y0}}]-[${{c.x1}},${{c.y1}}]`).join('\n');
+  return cells.map(c => `(${{c.r}},${{c.c}}) [${{c.x0}},${{c.y0}}]-[${{c.x1}},${{c.y1}}]`).join('\\n');
 }}
 function formatBoard(board) {{
   if (!board || !board.length) return '-';
-  return board.map(row => row.join(' ')).join('\n');
+  return board.map(row => row.join(' ')).join('\\n');
 }}
 async function playScan() {{
   try {{ await fetch('/play'); }} catch(e) {{}}
