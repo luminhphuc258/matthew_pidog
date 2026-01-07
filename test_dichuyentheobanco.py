@@ -47,7 +47,7 @@ FRONT_LIFT_ANGLES = {
 HEAD_INIT_ANGLES = {
     "P8": 38,
     "P9": -70,
-    "P10": 90,
+    "P10": 75,
 }
 
 
@@ -412,7 +412,7 @@ def detect_blue_lines(frame_bgr):
 def draw_board_overlay(frame_bgr, blue_lines=None, cells=None):
     if blue_lines:
         for x1, y1, x2, y2 in blue_lines:
-            cv2.line(frame_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.line(frame_bgr, (x1, y1), (x2, y2), (80, 220, 80), 1)
     if cells:
         for cell in cells:
             x0, y0, x1, y1 = cell["x0"], cell["y0"], cell["x1"], cell["y1"]
@@ -666,7 +666,7 @@ class CameraWeb:
         self._grid = None
         self._cells = []
         self._p8_angle = 38
-        self._p10_angle = 90
+        self._p10_angle = 75
         self._lock_board_state = False
         self._stop = threading.Event()
         self._thread = None
@@ -790,7 +790,7 @@ class CameraWeb:
         <button class="btn" onclick="p8Dec()">-</button>
         <button class="btn" onclick="p8Inc()">+</button>
       </div>
-      <div class="kv" style="margin-top:12px;"><span class="k">P10 angle:</span> <span id="p10">90</span></div>
+      <div class="kv" style="margin-top:12px;"><span class="k">P10 angle:</span> <span id="p10">75</span></div>
       <div class="row">
         <button class="btn" onclick="p10Dec()">-</button>
         <button class="btn" onclick="p10Inc()">+</button>
@@ -1085,8 +1085,8 @@ def main():
 
     print("[BOOT] set P8 -> 38")
     set_servo_angle("P8", 38, hold_sec=0.4)
-    print("[BOOT] set P10 -> 90")
-    set_servo_angle("P10", 90, hold_sec=0.4)
+    print("[BOOT] set P10 -> 75")
+    set_servo_angle("P10", 75, hold_sec=0.4)
     time.sleep(0.2)
 
     print("[BOOT] set head init angles")
@@ -1108,8 +1108,7 @@ def main():
     motion = MotionController(pose_file=POSE_FILE)
     motion.boot()
     print("[BOOT] boot done")
-    motion.close()
-    print("[BOOT] head controller stopped")
+    print("[BOOT] keep motion controller active for web servo control")
 
     play_tiengsua("tiengsua.wav")
 
