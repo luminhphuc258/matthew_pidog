@@ -23,7 +23,7 @@ CAM_W = int(os.environ.get("CAM_W", "320"))
 CAM_H = int(os.environ.get("CAM_H", "240"))
 CAM_FPS = int(os.environ.get("CAM_FPS", "15"))
 JPEG_QUALITY = int(os.environ.get("CAM_JPEG_QUALITY", "70"))
-ROTATE_180 = str(os.environ.get("CAM_ROTATE_180", "0")).lower() in ("1", "true", "yes", "on")
+ROTATE_180 = str(os.environ.get("CAM_ROTATE_180", "1")).lower() in ("1", "true", "yes", "on")
 
 # Boot lift angles (same flow as test_nanghaichansau.py)
 REAR_LIFT_ANGLES = {
@@ -41,7 +41,7 @@ FRONT_LIFT_ANGLES = {
 }
 
 HEAD_INIT_ANGLES = {
-    "P8": 62,
+    "P8": 20,
     "P9": -70,
     "P10": 90,
 }
@@ -599,35 +599,26 @@ def _detect_board_ready(frame_bgr):
 def searching_tictoeborad(cam: CameraWeb, motion: MotionController, timeout_sec: float = 60.0) -> bool:
     print("[SEARCH] start scanning for tictoe board")
     s8 = Servo("P8")
-    s10 = Servo("P10")
 
     try:
-        s8.angle(clamp(62))
+        s8.angle(clamp(20))
     except Exception:
         pass
-    print("[SEARCH] P8 -> 62")
+    print("[SEARCH] P8 -> 20")
 
-    angle = 70
     t0 = time.time()
     while time.time() - t0 < float(timeout_sec):
-        try:
-            s10.angle(clamp(angle))
-        except Exception:
-            pass
-
         frame = cam.get_last_frame()
         if frame is not None:
-            ok, bbox = _detect_board_ready(frame)
+            small = cv2.resize(frame, (0, 0), fx=0.8, fy=0.8, interpolation=cv2.INTER_AREA)
+            ok, bbox = _detect_board_ready(small)
             if ok:
                 cam.set_board_bbox(bbox)
                 print("[SEARCH] board ready")
                 set_led(motion, "blue", bps=0.6)
                 return True
 
-        print(f"[SEARCH] sweep P10 -> {angle}")
-
         time.sleep(2.0)
-        angle = 90 if angle == 70 else 70
 
     print("[SEARCH] timeout -> not found")
     set_led(motion, "red", bps=0.8)
@@ -666,9 +657,9 @@ def main():
     os.environ.setdefault("JACK_NO_START_SERVER", "1")
     os.environ.setdefault("PIDOG_SKIP_HEAD_INIT", "1")
     os.environ.setdefault("PIDOG_SKIP_MCU_RESET", "1")
-    os.environ.setdefault("HEAD_P8_IDLE", "62")
-    os.environ.setdefault("HEAD_SWEEP_MIN", "62")
-    os.environ.setdefault("HEAD_SWEEP_MAX", "62")
+    os.environ.setdefault("HEAD_P8_IDLE", "20")
+    os.environ.setdefault("HEAD_SWEEP_MIN", "20")
+    os.environ.setdefault("HEAD_SWEEP_MAX", "20")
 
     board = BoardState()
     cam = CameraWeb(board)
@@ -677,8 +668,8 @@ def main():
         print("[CAM] not ready, stop", flush=True)
         return
 
-    print("[BOOT] set P8 -> 62")
-    set_servo_angle("P8", 62, hold_sec=0.4)
+    print("[BOOT] set P8 -> 20")
+    set_servo_angle("P8", 20, hold_sec=0.4)
     time.sleep(0.2)
 
     print("[BOOT] set head init angles")
