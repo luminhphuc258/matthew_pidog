@@ -793,7 +793,10 @@ def create_virtual_caroboard(cam: CameraWeb, motion: MotionController) -> bool:
         set_led(motion, "red", bps=0.8)
         return False
 
-    grid = build_grid_from_lines(lines_all, cam.get_last_frame() or np.zeros((CAM_H, CAM_W, 3), dtype=np.uint8))
+    frame_last = cam.get_last_frame()
+    if frame_last is None:
+        frame_last = np.zeros((CAM_H, CAM_W, 3), dtype=np.uint8)
+    grid = build_grid_from_lines(lines_all, frame_last)
     if not grid:
         print("[VIRTUAL] cannot build grid from lines")
         set_led(motion, "red", bps=0.8)
