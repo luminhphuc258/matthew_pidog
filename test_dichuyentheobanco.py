@@ -397,6 +397,8 @@ class CameraWeb:
         self._last = None
         self._stop = threading.Event()
         self._thread = None
+        self._ready = threading.Event()
+        self._failed = threading.Event()
 
         @self.app.get("/")
         def index():
@@ -488,6 +490,8 @@ tick();
         cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
         if not cap.isOpened():
             print(f"[CAM] cannot open camera: {dev}")
+            self._failed.set()
+            self._ready.set()
             return
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_W)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
@@ -506,6 +510,7 @@ tick();
 
             with self._lock:
                 self._last = frame
+            self._ready.set()
             time.sleep(0.01)
 
         cap.release()
@@ -518,6 +523,10 @@ tick();
             daemon=True,
         ).start()
         print(f"[WEB] http://<pi_ip>:{WEB_PORT}/", flush=True)
+
+    def wait_ready(self, timeout_sec: float = 5.0) -> bool:
+        self._ready.wait(timeout=max(0.1, float(timeout_sec)))
+        return self._ready.is_set() and not self._failed.is_set()
 
 
 def _detect_board_ready(frame_bgr) -> bool:
@@ -613,6 +622,7 @@ def robotvehinhcaro():
 
 
 def main():
+    print("[START] test_dichuyentheobanco", flush=True)
     os.environ.setdefault("SDL_AUDIODRIVER", "alsa")
     os.environ.setdefault("PULSE_SERVER", "")
     os.environ.setdefault("JACK_NO_START_SERVER", "1")
@@ -622,6 +632,9 @@ def main():
     board = BoardState()
     cam = CameraWeb(board)
     cam.start()
+    if not cam.wait_ready(timeout_sec=5.0):
+        print("[CAM] not ready, stop", flush=True)
+        return
 
     print("[BOOT] set head init angles")
     apply_angles(HEAD_INIT_ANGLES, per_servo_delay=0.04)
