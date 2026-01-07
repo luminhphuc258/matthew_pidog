@@ -527,6 +527,65 @@ def build_grid_from_rectangle(frame_bgr, cols: int = GRID_COLS, rows: int = GRID
     return grid
 
 
+def detect_x_centers(warped_bgr, player_mask):
+    if warped_bgr is None or player_mask is None:
+        return []
+    h, w = warped_bgr.shape[:2]
+    if h < 40 or w < 40:
+        return []
+    edges = cv2.Canny(player_mask, 60, 180)
+    min_len = int(min(w, h) * 0.10)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=35, minLineLength=min_len, maxLineGap=10)
+    if lines is None:
+        return []
+
+    pos = []
+    neg = []
+    for ln in lines:
+        x1, y1, x2, y2 = ln[0]
+        dx = x2 - x1
+        dy = y2 - y1
+        if dx == 0:
+            continue
+        slope = dy / float(dx)
+        if 0.7 <= slope <= 1.3:
+            pos.append((x1, y1, x2, y2))
+        elif -1.3 <= slope <= -0.7:
+            neg.append((x1, y1, x2, y2))
+
+    centers = []
+    for ax1, ay1, ax2, ay2 in pos:
+        for bx1, by1, bx2, by2 in neg:
+            den = (ax1 - ax2) * (by1 - by2) - (ay1 - ay2) * (bx1 - bx2)
+            if abs(den) < 1e-6:
+                continue
+            px = ((ax1 * ay2 - ay1 * ax2) * (bx1 - bx2) - (ax1 - ax2) * (bx1 * by2 - by1 * bx2)) / den
+            py = ((ax1 * ay2 - ay1 * ax2) * (by1 - by2) - (ay1 - ay2) * (bx1 * by2 - by1 * bx2)) / den
+            if 0 <= px < w and 0 <= py < h:
+                centers.append((float(px), float(py)))
+
+    if not centers:
+        return []
+
+    # Cluster nearby intersections to a single X center.
+    centers.sort(key=lambda p: (p[0], p[1]))
+    clustered = []
+    tol = max(8, int(min(w, h) * 0.03))
+    for cx, cy in centers:
+        merged = False
+        for i, (mx, my, cnt) in enumerate(clustered):
+            if abs(cx - mx) <= tol and abs(cy - my) <= tol:
+                nx = (mx * cnt + cx) / (cnt + 1)
+                ny = (my * cnt + cy) / (cnt + 1)
+                clustered[i] = (nx, ny, cnt + 1)
+                merged = True
+                break
+        if not merged:
+            clustered.append((cx, cy, 1))
+
+    return [(float(x), float(y)) for x, y, _ in clustered]
+
+
 def _cluster_positions(pos, tol):
     if not pos:
         return []
@@ -639,6 +698,14 @@ def detect_cell_states(frame_bgr, grid, rows: int, cols: int):
     player_mask = cv2.bitwise_or(orange_mask, blue_mask)
     dark_mask = cv2.inRange(hsv, (0, 0, 0), (180, 60, 90))
 
+    # Detect X centers on the whole warped board and map to cells.
+    x_centers = detect_x_centers(warped, player_mask)
+    for cx, cy in x_centers:
+        col = int(cx * cols / float(size))
+        row = int(cy * rows / float(size))
+        if 0 <= row < rows and 0 <= col < cols:
+            board[row][col] = 1
+
     for r in range(rows):
         for c in range(cols):
             x0, x1 = x_lines[c], x_lines[c + 1]
@@ -655,9 +722,11 @@ def detect_cell_states(frame_bgr, grid, rows: int, cols: int):
             roi_d = dark_mask[ya:yb, xa:xb]
             if roi_p.size == 0 or roi_d.size == 0:
                 continue
+            if board[r][c] == 1:
+                continue
             p_ratio = float(cv2.countNonZero(roi_p)) / float(roi_p.size)
             d_ratio = float(cv2.countNonZero(roi_d)) / float(roi_d.size)
-            if p_ratio > 0.03:
+            if p_ratio > 0.05:
                 board[r][c] = 1
             elif d_ratio > 0.02:
                 board[r][c] = 2
@@ -1018,9 +1087,9 @@ def searching_tictoeborad(cam: CameraWeb, motion: MotionController, timeout_sec:
 
 def create_virtual_caroboard(cam: CameraWeb, motion: MotionController) -> bool:
     print("[VIRTUAL] start create_virtual_caroboard (rectangle)")
-    t0 = time.time()
+    set_led(motion, "blue", bps=0.6)
     grid = None
-    while time.time() - t0 < 8.0:
+    while True:
         frame = cam.get_last_frame()
         if frame is None:
             time.sleep(0.1)
