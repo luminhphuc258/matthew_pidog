@@ -437,7 +437,10 @@ def _evenly_spaced(min_v: int, max_v: int, count: int):
 
 
 def build_grid_from_lines(lines, frame_shape, cols: int = GRID_COLS, rows: int = GRID_ROWS):
-    h, w = frame_shape[:2]
+    if hasattr(frame_shape, 'shape'):
+        h, w = frame_shape.shape[:2]
+    else:
+        h, w = frame_shape[:2]
     if not lines:
         return None
     v_pos = []
