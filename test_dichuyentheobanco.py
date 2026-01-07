@@ -5,6 +5,7 @@ import os
 import time
 import threading
 import wave
+import subprocess
 from pathlib import Path
 from typing import List, Tuple
 
@@ -12,7 +13,7 @@ import cv2
 import numpy as np
 from flask import Flask, Response, jsonify, request
 
-from robot_hat import Servo, Music
+from robot_hat import Servo
 from motion_controller import MotionController
 
 POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
@@ -27,8 +28,6 @@ ROTATE_180 = str(os.environ.get("CAM_ROTATE_180", "1")).lower() in ("1", "true",
 GRID_COLS = int(os.environ.get("GRID_COLS", "6"))
 GRID_ROWS = int(os.environ.get("GRID_ROWS", "4"))
 WARP_SIZE = int(os.environ.get("WARP_SIZE", "600"))
-ARUCO_DICT_NAME = os.environ.get("ARUCO_DICT", "DICT_4X4_50")
-TAG_IDS = [int(x) for x in os.environ.get("TAG_IDS", "0,1,2,3").split(",") if x.strip().isdigit()]
 
 # Boot lift angles (same flow as test_nanghaichansau.py)
 REAR_LIFT_ANGLES = {
@@ -161,6 +160,27 @@ def smooth_single_duration(port: str, start: int, end: int, duration_sec: float)
     smooth_single(port, start, end, step=1, delay=delay)
 
 
+
+
+def _run_cmd(cmd):
+    try:
+        return subprocess.run(cmd, check=False)
+    except Exception:
+        return None
+
+
+def set_volumes():
+    _run_cmd(["amixer", "-q", "sset", "robot-hat speaker", "100%"])
+    _run_cmd(["amixer", "-q", "sset", "robot-hat speaker Playback Volume", "100%"])
+    _run_cmd(["amixer", "-q", "sset", "robot-hat mic", "100%"])
+    _run_cmd(["amixer", "-q", "sset", "robot-hat mic Capture Volume", "100%"])
+
+
+def play_wav(path: str) -> bool:
+    p = _run_cmd(["aplay", "-D", "default", "-q", path])
+    return p is not None and p.returncode == 0
+
+
 def play_tiengsua(wav_path: str, volume: int = 80):
     if not os.path.exists(wav_path):
         print(f"[WARN] sound file not found: {wav_path}")
@@ -171,15 +191,7 @@ def play_tiengsua(wav_path: str, volume: int = 80):
     except Exception:
         pass
 
-    try:
-        music = Music()
-    except Exception as e:
-        print(f"[WARN] audio init failed: {e}")
-        return
-    try:
-        music.music_set_volume(int(volume))
-    except Exception:
-        pass
+    set_volumes()
 
     dur = None
     try:
@@ -191,9 +203,8 @@ def play_tiengsua(wav_path: str, volume: int = 80):
     except Exception:
         dur = None
 
-    try:
-        music.music_play(str(wav_path), loops=1)
-    except Exception:
+    if not play_wav(str(wav_path)):
+        print("[WARN] aplay failed")
         return
 
     if dur is not None:
@@ -410,54 +421,6 @@ def draw_board_overlay(frame_bgr, blue_lines=None, cells=None):
 
 
 
-def _get_aruco_detector():
-    if not hasattr(cv2, "aruco"):
-        return None, None
-    aruco = cv2.aruco
-    dict_id = getattr(aruco, ARUCO_DICT_NAME, None)
-    if dict_id is None:
-        dict_id = aruco.DICT_4X4_50
-    aruco_dict = aruco.getPredefinedDictionary(dict_id)
-    if hasattr(aruco, "ArucoDetector"):
-        params = aruco.DetectorParameters()
-        detector = aruco.ArucoDetector(aruco_dict, params)
-        return detector, aruco_dict
-    return None, aruco_dict
-
-
-def _detect_aruco(frame_bgr, required_ids):
-    if not hasattr(cv2, "aruco"):
-        return {}, []
-    detector, aruco_dict = _get_aruco_detector()
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    if detector is not None:
-        corners, ids, _rej = detector.detectMarkers(gray)
-    else:
-        corners, ids, _rej = cv2.aruco.detectMarkers(gray, aruco_dict)
-    if ids is None or len(ids) == 0:
-        return {}, []
-    ids = [int(i) for i in ids.flatten().tolist()]
-    corners_by_id = {}
-    centers = []
-    for idx, mid in enumerate(ids):
-        if required_ids and mid not in required_ids:
-            continue
-        pts = corners[idx][0].astype(float)
-        corners_by_id[mid] = pts
-        centers.append(pts.mean(axis=0))
-    return corners_by_id, centers
-
-
-def _pick_outer_corners(corners_by_id):
-    if len(corners_by_id) != 4:
-        return None
-    centers = [pts.mean(axis=0) for pts in corners_by_id.values()]
-    board_center = np.mean(np.array(centers), axis=0)
-    outer_pts = []
-    for pts in corners_by_id.values():
-        dists = [np.linalg.norm(p - board_center) for p in pts]
-        outer_pts.append(pts[int(np.argmax(dists))])
-    return outer_pts
 
 
 def _order_points(pts):
@@ -469,6 +432,41 @@ def _order_points(pts):
     tr = pts[int(np.argmin(diff))]
     bl = pts[int(np.argmax(diff))]
     return [tl, tr, br, bl]
+
+
+def _find_board_rectangle(frame_bgr):
+    h, w = frame_bgr.shape[:2]
+    if h < 60 or w < 60:
+        return None
+
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 50, 150)
+    edges = cv2.dilate(edges, None, iterations=1)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    best = None
+    best_area = 0
+    for cnt in contours:
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        if len(approx) != 4:
+            continue
+        if not cv2.isContourConvex(approx):
+            continue
+        area = abs(cv2.contourArea(approx))
+        if area < (h * w * 0.08):
+            continue
+        if area > best_area:
+            best_area = area
+            best = approx.reshape(4, 2)
+
+    if best is None:
+        return None
+    return _order_points(best)
 
 
 def _grid_lines_from_homography(grid):
@@ -495,18 +493,12 @@ def _grid_lines_from_homography(grid):
     return lines
 
 
-def build_grid_from_markers(frame_bgr, cols: int = GRID_COLS, rows: int = GRID_ROWS):
-    corners_by_id, _centers = _detect_aruco(frame_bgr, TAG_IDS)
-    if TAG_IDS and len(corners_by_id) != len(TAG_IDS):
+def build_grid_from_rectangle(frame_bgr, cols: int = GRID_COLS, rows: int = GRID_ROWS):
+    corners = _find_board_rectangle(frame_bgr)
+    if not corners:
         return None
-    if len(corners_by_id) != 4:
-        return None
-    outer = _pick_outer_corners(corners_by_id)
-    if not outer:
-        return None
-    ordered = _order_points(outer)
     dst = np.array([[0, 0], [WARP_SIZE - 1, 0], [WARP_SIZE - 1, WARP_SIZE - 1], [0, WARP_SIZE - 1]], dtype=np.float32)
-    src = np.array(ordered, dtype=np.float32)
+    src = np.array(corners, dtype=np.float32)
     H = cv2.getPerspectiveTransform(src, dst)
 
     x_lines = _evenly_spaced(0, WARP_SIZE - 1, cols + 1)
@@ -1009,7 +1001,7 @@ def searching_tictoeborad(cam: CameraWeb, motion: MotionController, timeout_sec:
 
 
 def create_virtual_caroboard(cam: CameraWeb, motion: MotionController) -> bool:
-    print("[VIRTUAL] start create_virtual_caroboard (aruco)")
+    print("[VIRTUAL] start create_virtual_caroboard (rectangle)")
     t0 = time.time()
     grid = None
     while time.time() - t0 < 8.0:
@@ -1017,13 +1009,13 @@ def create_virtual_caroboard(cam: CameraWeb, motion: MotionController) -> bool:
         if frame is None:
             time.sleep(0.1)
             continue
-        grid = build_grid_from_markers(frame, cols=GRID_COLS, rows=GRID_ROWS)
+        grid = build_grid_from_rectangle(frame, cols=GRID_COLS, rows=GRID_ROWS)
         if grid:
             break
         time.sleep(0.1)
 
     if not grid:
-        print("[VIRTUAL] cannot build grid from markers")
+        print("[VIRTUAL] cannot build grid from rectangle")
         set_led(motion, "red", bps=0.8)
         return False
 
