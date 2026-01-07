@@ -41,7 +41,7 @@ FRONT_LIFT_ANGLES = {
 }
 
 HEAD_INIT_ANGLES = {
-    "P8": 50,
+    "P8": 20,
     "P9": -70,
     "P10": 90,
 }
@@ -409,7 +409,7 @@ class CameraWeb:
         self._lock = threading.Lock()
         self._last = None
         self._board_bbox = None
-        self._p8_angle = 50
+        self._p8_angle = 20
         self._stop = threading.Event()
         self._thread = None
         self._ready = threading.Event()
@@ -453,10 +453,7 @@ class CameraWeb:
                 except Exception:
                     pass
                 cur = max(-90, min(90, cur))
-            try:
-                Servo("P8").angle(clamp(cur))
-            except Exception:
-                pass
+            set_servo_angle("P8", cur, hold_sec=0.25)
             with self._lock:
                 self._p8_angle = int(cur)
             return jsonify({"ok": True, "p8_angle": int(cur)})
@@ -488,7 +485,7 @@ class CameraWeb:
       <div class="kv"><span class="k">Empty cells:</span> <span id="empty">-</span></div>
       <div class="kv"><span class="k">Robot moves:</span> <span id="robot">-</span></div>
       <div class="kv"><span class="k">Player moves:</span> <span id="player">-</span></div>
-      <div class="kv"><span class="k">P8 angle:</span> <span id="p8">50</span></div>
+      <div class="kv"><span class="k">P8 angle:</span> <span id="p8">20</span></div>
       <div class="row">
         <button class="btn" onclick="p8Dec()">-</button>
         <button class="btn" onclick="p8Inc()">+</button>
@@ -643,10 +640,10 @@ def searching_tictoeborad(cam: CameraWeb, motion: MotionController, timeout_sec:
     s8 = Servo("P8")
 
     try:
-        s8.angle(clamp(50))
+        s8.angle(clamp(20))
     except Exception:
         pass
-    print("[SEARCH] P8 -> 50")
+    print("[SEARCH] P8 -> 20")
 
     t0 = time.time()
     while time.time() - t0 < float(timeout_sec):
@@ -699,9 +696,9 @@ def main():
     os.environ.setdefault("JACK_NO_START_SERVER", "1")
     os.environ.setdefault("PIDOG_SKIP_HEAD_INIT", "1")
     os.environ.setdefault("PIDOG_SKIP_MCU_RESET", "1")
-    os.environ.setdefault("HEAD_P8_IDLE", "50")
-    os.environ.setdefault("HEAD_SWEEP_MIN", "50")
-    os.environ.setdefault("HEAD_SWEEP_MAX", "50")
+    os.environ.setdefault("HEAD_P8_IDLE", "20")
+    os.environ.setdefault("HEAD_SWEEP_MIN", "20")
+    os.environ.setdefault("HEAD_SWEEP_MAX", "20")
 
     board = BoardState()
     cam = CameraWeb(board)
@@ -710,8 +707,8 @@ def main():
         print("[CAM] not ready, stop", flush=True)
         return
 
-    print("[BOOT] set P8 -> 50")
-    set_servo_angle("P8", 50, hold_sec=0.4)
+    print("[BOOT] set P8 -> 20")
+    set_servo_angle("P8", 20, hold_sec=0.4)
     time.sleep(0.2)
 
     print("[BOOT] set head init angles")
@@ -733,6 +730,8 @@ def main():
     motion = MotionController(pose_file=POSE_FILE)
     motion.boot()
     print("[BOOT] boot done")
+    motion.close()
+    print("[BOOT] head controller stopped")
 
     play_tiengsua("tiengsua.wav")
 
