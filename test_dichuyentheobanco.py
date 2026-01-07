@@ -45,7 +45,7 @@ FRONT_LIFT_ANGLES = {
 }
 
 HEAD_INIT_ANGLES = {
-    "P8": 28,
+    "P8": 38,
     "P9": -70,
     "P10": 90,
 }
@@ -665,7 +665,7 @@ class CameraWeb:
         self._blue_lines = []
         self._grid = None
         self._cells = []
-        self._p8_angle = 28
+        self._p8_angle = 38
         self._p10_angle = 90
         self._lock_board_state = False
         self._stop = threading.Event()
@@ -688,6 +688,7 @@ class CameraWeb:
                 st["grid_ok"] = self._grid is not None
                 st["cells"] = self._cells
                 st["scan_status"] = self._scan_status
+            st["board"] = self.board.snapshot()
             return jsonify(st)
 
         @self.app.get("/set_move")
@@ -778,11 +779,13 @@ class CameraWeb:
       <div class="kv"><span class="k">Player moves:</span> <span id="player">-</span></div>
       <div class="kv"><span class="k">Detected cells:</span> <span id="cells_count">-</span></div>
       <div id="cells" class="cells">-</div>
+      <div class="kv"><span class="k">Board state:</span></div>
+      <div id="board" class="cells">-</div>
       <div class="kv"><span class="k">Scan status:</span> <span id="scan_status">idle</span></div>
       <div class="row">
         <button class="btn" onclick="playScan()">Play</button>
       </div>
-      <div class="kv"><span class="k">P8 angle:</span> <span id="p8">28</span></div>
+      <div class="kv"><span class="k">P8 angle:</span> <span id="p8">38</span></div>
       <div class="row">
         <button class="btn" onclick="p8Dec()">-</button>
         <button class="btn" onclick="p8Inc()">+</button>
@@ -807,6 +810,7 @@ async function tick() {{
     const cells = js.cells || [];
     document.getElementById('cells_count').textContent = cells.length ?? '-';
     document.getElementById('cells').textContent = formatCells(cells);
+    document.getElementById('board').textContent = formatBoard(js.board);
     document.getElementById('p8').textContent = js.p8_angle ?? '-';
     document.getElementById('p10').textContent = js.p10_angle ?? '-';
     document.getElementById('scan_status').textContent = js.scan_status ?? '-';
@@ -815,6 +819,10 @@ async function tick() {{
 function formatCells(cells) {{
   if (!cells || !cells.length) return '-';
   return cells.map(c => `(${{c.r}},${{c.c}}) [${{c.x0}},${{c.y0}}]-[${{c.x1}},${{c.y1}}]`).join('\n');
+}}
+function formatBoard(board) {{
+  if (!board || !board.length) return '-';
+  return board.map(row => row.join(' ')).join('\n');
 }}
 async function playScan() {{
   try {{ await fetch('/play'); }} catch(e) {{}}
@@ -1064,9 +1072,9 @@ def main():
     os.environ.setdefault("JACK_NO_START_SERVER", "1")
     os.environ.setdefault("PIDOG_SKIP_HEAD_INIT", "1")
     os.environ.setdefault("PIDOG_SKIP_MCU_RESET", "1")
-    os.environ.setdefault("HEAD_P8_IDLE", "28")
-    os.environ.setdefault("HEAD_SWEEP_MIN", "28")
-    os.environ.setdefault("HEAD_SWEEP_MAX", "28")
+    os.environ.setdefault("HEAD_P8_IDLE", "38")
+    os.environ.setdefault("HEAD_SWEEP_MIN", "38")
+    os.environ.setdefault("HEAD_SWEEP_MAX", "38")
 
     board = BoardState()
     cam = CameraWeb(board)
@@ -1075,8 +1083,8 @@ def main():
         print("[CAM] not ready, stop", flush=True)
         return
 
-    print("[BOOT] set P8 -> 28")
-    set_servo_angle("P8", 28, hold_sec=0.4)
+    print("[BOOT] set P8 -> 38")
+    set_servo_angle("P8", 38, hold_sec=0.4)
     print("[BOOT] set P10 -> 90")
     set_servo_angle("P10", 90, hold_sec=0.4)
     time.sleep(0.2)
