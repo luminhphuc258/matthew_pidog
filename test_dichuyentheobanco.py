@@ -26,6 +26,9 @@ JPEG_QUALITY = int(os.environ.get("CAM_JPEG_QUALITY", "70"))
 ROTATE_180 = str(os.environ.get("CAM_ROTATE_180", "1")).lower() in ("1", "true", "yes", "on")
 GRID_COLS = int(os.environ.get("GRID_COLS", "6"))
 GRID_ROWS = int(os.environ.get("GRID_ROWS", "4"))
+WARP_SIZE = int(os.environ.get("WARP_SIZE", "600"))
+ARUCO_DICT_NAME = os.environ.get("ARUCO_DICT", "DICT_4X4_50")
+TAG_IDS = [int(x) for x in os.environ.get("TAG_IDS", "0,1,2,3").split(",") if x.strip().isdigit()]
 
 # Boot lift angles (same flow as test_nanghaichansau.py)
 REAR_LIFT_ANGLES = {
@@ -168,7 +171,11 @@ def play_tiengsua(wav_path: str, volume: int = 80):
     except Exception:
         pass
 
-    music = Music()
+    try:
+        music = Music()
+    except Exception as e:
+        print(f"[WARN] audio init failed: {e}")
+        return
     try:
         music.music_set_volume(int(volume))
     except Exception:
@@ -401,6 +408,133 @@ def draw_board_overlay(frame_bgr, blue_lines=None, cells=None):
             cv2.rectangle(frame_bgr, (x0, y0), (x1, y1), (0, 255, 255), 1)
 
 
+
+
+def _get_aruco_detector():
+    if not hasattr(cv2, "aruco"):
+        return None, None
+    aruco = cv2.aruco
+    dict_id = getattr(aruco, ARUCO_DICT_NAME, None)
+    if dict_id is None:
+        dict_id = aruco.DICT_4X4_50
+    aruco_dict = aruco.getPredefinedDictionary(dict_id)
+    if hasattr(aruco, "ArucoDetector"):
+        params = aruco.DetectorParameters()
+        detector = aruco.ArucoDetector(aruco_dict, params)
+        return detector, aruco_dict
+    return None, aruco_dict
+
+
+def _detect_aruco(frame_bgr, required_ids):
+    if not hasattr(cv2, "aruco"):
+        return {}, []
+    detector, aruco_dict = _get_aruco_detector()
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    if detector is not None:
+        corners, ids, _rej = detector.detectMarkers(gray)
+    else:
+        corners, ids, _rej = cv2.aruco.detectMarkers(gray, aruco_dict)
+    if ids is None or len(ids) == 0:
+        return {}, []
+    ids = [int(i) for i in ids.flatten().tolist()]
+    corners_by_id = {}
+    centers = []
+    for idx, mid in enumerate(ids):
+        if required_ids and mid not in required_ids:
+            continue
+        pts = corners[idx][0].astype(float)
+        corners_by_id[mid] = pts
+        centers.append(pts.mean(axis=0))
+    return corners_by_id, centers
+
+
+def _pick_outer_corners(corners_by_id):
+    if len(corners_by_id) != 4:
+        return None
+    centers = [pts.mean(axis=0) for pts in corners_by_id.values()]
+    board_center = np.mean(np.array(centers), axis=0)
+    outer_pts = []
+    for pts in corners_by_id.values():
+        dists = [np.linalg.norm(p - board_center) for p in pts]
+        outer_pts.append(pts[int(np.argmax(dists))])
+    return outer_pts
+
+
+def _order_points(pts):
+    pts = np.array(pts, dtype=float)
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1).flatten()
+    tl = pts[int(np.argmin(s))]
+    br = pts[int(np.argmax(s))]
+    tr = pts[int(np.argmin(diff))]
+    bl = pts[int(np.argmax(diff))]
+    return [tl, tr, br, bl]
+
+
+def _grid_lines_from_homography(grid):
+    H = grid.get("H")
+    if H is None:
+        return []
+    inv = np.linalg.inv(H)
+    size = int(grid.get("warp_size", WARP_SIZE))
+    x_lines = grid.get("x") or []
+    y_lines = grid.get("y") or []
+    lines = []
+    for x in x_lines:
+        src = np.array([[[x, 0]], [[x, size - 1]]], dtype=np.float32)
+        dst = cv2.perspectiveTransform(src, inv)
+        x1, y1 = dst[0][0]
+        x2, y2 = dst[1][0]
+        lines.append((int(x1), int(y1), int(x2), int(y2)))
+    for y in y_lines:
+        src = np.array([[[0, y]], [[size - 1, y]]], dtype=np.float32)
+        dst = cv2.perspectiveTransform(src, inv)
+        x1, y1 = dst[0][0]
+        x2, y2 = dst[1][0]
+        lines.append((int(x1), int(y1), int(x2), int(y2)))
+    return lines
+
+
+def build_grid_from_markers(frame_bgr, cols: int = GRID_COLS, rows: int = GRID_ROWS):
+    corners_by_id, _centers = _detect_aruco(frame_bgr, TAG_IDS)
+    if TAG_IDS and len(corners_by_id) != len(TAG_IDS):
+        return None
+    if len(corners_by_id) != 4:
+        return None
+    outer = _pick_outer_corners(corners_by_id)
+    if not outer:
+        return None
+    ordered = _order_points(outer)
+    dst = np.array([[0, 0], [WARP_SIZE - 1, 0], [WARP_SIZE - 1, WARP_SIZE - 1], [0, WARP_SIZE - 1]], dtype=np.float32)
+    src = np.array(ordered, dtype=np.float32)
+    H = cv2.getPerspectiveTransform(src, dst)
+
+    x_lines = _evenly_spaced(0, WARP_SIZE - 1, cols + 1)
+    y_lines = _evenly_spaced(0, WARP_SIZE - 1, rows + 1)
+
+    cells = []
+    for r in range(rows):
+        for c in range(cols):
+            x_a, x_b = x_lines[c], x_lines[c + 1]
+            y_a, y_b = y_lines[r], y_lines[r + 1]
+            if x_b <= x_a or y_b <= y_a:
+                continue
+            cells.append({
+                "r": r,
+                "c": c,
+                "x0": int(x_a),
+                "y0": int(y_a),
+                "x1": int(x_b),
+                "y1": int(y_b),
+                "cx": int((x_a + x_b) / 2),
+                "cy": int((y_a + y_b) / 2),
+            })
+
+    grid = {"x": x_lines, "y": y_lines, "cells": cells, "rows": rows, "cols": cols, "H": H, "warp_size": WARP_SIZE}
+    grid["lines"] = _grid_lines_from_homography(grid)
+    return grid
+
+
 def _cluster_positions(pos, tol):
     if not pos:
         return []
@@ -502,7 +636,12 @@ def detect_cell_states(frame_bgr, grid, rows: int, cols: int):
     y_lines = grid["y"]
     board = [[0 for _ in range(cols)] for _ in range(rows)]
 
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    H = grid.get("H")
+    size = int(grid.get("warp_size", WARP_SIZE))
+    if H is None:
+        return board
+    warped = cv2.warpPerspective(frame_bgr, H, (size, size))
+    hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
     orange_mask = cv2.inRange(hsv, (5, 80, 80), (25, 255, 255))
     gray_mask = cv2.inRange(hsv, (0, 0, 50), (180, 40, 200))
 
@@ -870,52 +1009,21 @@ def searching_tictoeborad(cam: CameraWeb, motion: MotionController, timeout_sec:
 
 
 def create_virtual_caroboard(cam: CameraWeb, motion: MotionController) -> bool:
-    print("[VIRTUAL] start create_virtual_caroboard")
-    lines_all = []
+    print("[VIRTUAL] start create_virtual_caroboard (aruco)")
+    t0 = time.time()
+    grid = None
+    while time.time() - t0 < 8.0:
+        frame = cam.get_last_frame()
+        if frame is None:
+            time.sleep(0.1)
+            continue
+        grid = build_grid_from_markers(frame, cols=GRID_COLS, rows=GRID_ROWS)
+        if grid:
+            break
+        time.sleep(0.1)
 
-    def _scan_low_once(p8_angle: int):
-        print(f"[VIRTUAL] P8 -> {p8_angle}")
-        set_servo_angle("P8", p8_angle, hold_sec=0.4)
-        cam.set_p8_angle(p8_angle)
-        time.sleep(1.0)
-        for ang in range(10, 86):
-            set_servo_angle("P10", ang, hold_sec=0.05)
-            cam.set_p10_angle(ang)
-            frame = cam.get_last_frame()
-            if frame is None:
-                continue
-            small = cv2.resize(frame, (0, 0), fx=0.8, fy=0.8, interpolation=cv2.INTER_AREA)
-            det = detect_blue_lines(small)
-            if det:
-                scale = 1.0 / 0.8
-                for x1, y1, x2, y2 in det:
-                    lines_all.append((int(x1 * scale), int(y1 * scale), int(x2 * scale), int(y2 * scale)))
-        for ang in range(85, -1, -1):
-            set_servo_angle("P10", ang, hold_sec=0.05)
-            cam.set_p10_angle(ang)
-            frame = cam.get_last_frame()
-            if frame is None:
-                continue
-            small = cv2.resize(frame, (0, 0), fx=0.8, fy=0.8, interpolation=cv2.INTER_AREA)
-            det = detect_blue_lines(small)
-            if det:
-                scale = 1.0 / 0.8
-                for x1, y1, x2, y2 in det:
-                    lines_all.append((int(x1 * scale), int(y1 * scale), int(x2 * scale), int(y2 * scale)))
-
-    _scan_low_once(15)
-
-    if not lines_all:
-        print("[VIRTUAL] no lines detected")
-        set_led(motion, "red", bps=0.8)
-        return False
-
-    frame_last = cam.get_last_frame()
-    if frame_last is None:
-        frame_last = np.zeros((CAM_H, CAM_W, 3), dtype=np.uint8)
-    grid = build_grid_from_lines(lines_all, frame_last, cols=GRID_COLS, rows=GRID_ROWS)
     if not grid:
-        print("[VIRTUAL] cannot build grid from lines")
+        print("[VIRTUAL] cannot build grid from markers")
         set_led(motion, "red", bps=0.8)
         return False
 
