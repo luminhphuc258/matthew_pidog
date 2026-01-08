@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+cho mình full code mới từ code hiện tai, chỉnh theo ý của bạn sao cho nó dò tìm duoc tat cả quan x tren bàn cờ , chỉ vẽ quân x đã nhận dạng được còn lại ko vẽ gì hết #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import os
