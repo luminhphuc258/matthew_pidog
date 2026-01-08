@@ -24,10 +24,10 @@ CAM_H = int(os.environ.get("CAM_H", "480"))
 CAM_FPS = int(os.environ.get("CAM_FPS", "15"))
 JPEG_QUALITY = int(os.environ.get("CAM_JPEG_QUALITY", "70"))
 
-# ✅ Force rotate 180 by default (camera is upside down)
+# Force rotate 180 by default
 ROTATE_180 = str(os.environ.get("CAM_ROTATE_180", "1")).lower() in ("1", "true", "yes", "on")
 
-# ✅ Board size: 4x6
+# Board size: 4x6
 GRID_COLS = int(os.environ.get("GRID_COLS", "4"))
 GRID_ROWS = int(os.environ.get("GRID_ROWS", "6"))
 
@@ -36,15 +36,29 @@ SCAN_API_URL = os.environ.get(
     "https://embeddedprogramming-healtheworldserver.up.railway.app/scan_chess",
 )
 
-# Warp output size (top-down). Keep square for easier mapping.
+# Warp output size
 WARP_SIZE = int(os.environ.get("WARP_SIZE", "520"))
 
 # Highlight alpha
 HILITE_ALPHA = float(os.environ.get("HILITE_ALPHA", "0.28"))
 
-# Circle radius filter relative to cell size
+# Circle radius filter relative to cell size (for local O detection preview)
 MIN_R_RATIO = float(os.environ.get("MIN_R_RATIO", "0.12"))
 MAX_R_RATIO = float(os.environ.get("MAX_R_RATIO", "0.30"))
+
+# HSV blue range (tuned for blue marker tape/pen)
+BLUE_H_LO = int(os.environ.get("BLUE_H_LO", "85"))
+BLUE_H_HI = int(os.environ.get("BLUE_H_HI", "140"))
+BLUE_S_LO = int(os.environ.get("BLUE_S_LO", "55"))
+BLUE_V_LO = int(os.environ.get("BLUE_V_LO", "50"))
+
+# Adaptive threshold params
+ADAPT_BLOCK = int(os.environ.get("ADAPT_BLOCK", "31"))  # must be odd
+ADAPT_C = int(os.environ.get("ADAPT_C", "2"))
+
+# Edge morphology tuning
+EDGE_DILATE = int(os.environ.get("EDGE_DILATE", "1"))
+EDGE_CLOSE = int(os.environ.get("EDGE_CLOSE", "2"))
 
 # =========================
 # HTTP upload helper
@@ -100,13 +114,9 @@ def _post_image_to_api(image_bytes: bytes) -> Optional[Dict[str, Any]]:
 # Geometry helpers
 # =========================
 def order_points(pts: np.ndarray) -> np.ndarray:
-    """
-    pts: (4,2) float32 -> order tl, tr, br, bl
-    """
-    pts = np.asarray(pts, dtype=np.float32)
+    pts = np.asarray(pts, dtype=np.float32).reshape(4, 2)
     s = pts.sum(axis=1)
     diff = np.diff(pts, axis=1).reshape(-1)
-
     tl = pts[np.argmin(s)]
     br = pts[np.argmax(s)]
     tr = pts[np.argmin(diff)]
@@ -118,63 +128,13 @@ def polygon_area(pts: np.ndarray) -> float:
     x = pts[:, 0]; y = pts[:, 1]
     return float(0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
 
-def find_board_quad(edges: np.ndarray) -> Optional[np.ndarray]:
-    """
-    edges: binary canny image
-    return quad points (4,2) float32 in image coords
-    """
-    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return None
-
-    H, W = edges.shape[:2]
-    img_area = float(H * W)
-
-    best = None
-    best_area = 0.0
-
-    for c in cnts:
-        peri = cv2.arcLength(c, True)
-        if peri < 250:
-            continue
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) != 4:
-            continue
-
-        pts = approx.reshape(4, 2).astype(np.float32)
-        area = polygon_area(pts)
-        if area < 0.02 * img_area:
-            continue
-
-        x, y, w, h = cv2.boundingRect(approx)
-        if h <= 1 or w <= 1:
-            continue
-        ar = w / float(h)
-        if not (0.65 <= ar <= 1.6):
-            continue
-
-        if area > best_area:
-            best_area = area
-            best = pts
-
-    if best is None:
-        return None
-    return order_points(best)
-
 def compute_angle_deg(quad: np.ndarray) -> float:
-    """
-    quad order tl,tr,br,bl
-    angle of top edge
-    """
     tl, tr = quad[0], quad[1]
     dx = float(tr[0] - tl[0])
     dy = float(tr[1] - tl[1])
     return float(np.degrees(np.arctan2(dy, dx)))
 
 def warp_board(frame_bgr: np.ndarray, quad: np.ndarray, size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    return warped_bgr, H (img->warp), Hinv (warp->img)
-    """
     dst = np.array([[0, 0], [size - 1, 0], [size - 1, size - 1], [0, size - 1]], dtype=np.float32)
     H = cv2.getPerspectiveTransform(quad.astype(np.float32), dst)
     Hinv = cv2.getPerspectiveTransform(dst, quad.astype(np.float32))
@@ -187,7 +147,133 @@ def map_points(H: np.ndarray, pts: np.ndarray) -> np.ndarray:
     return out.reshape(-1, 2)
 
 # =========================
-# Vision helpers (stages)
+# Robust edge helpers
+# =========================
+def auto_canny(gray: np.ndarray, sigma: float = 0.33) -> np.ndarray:
+    v = float(np.median(gray))
+    lo = int(max(0, (1.0 - sigma) * v))
+    hi = int(min(255, (1.0 + sigma) * v))
+    return cv2.Canny(gray, lo, hi)
+
+def hsv_blue_mask(bgr: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    lower = np.array([BLUE_H_LO, BLUE_S_LO, BLUE_V_LO], dtype=np.uint8)
+    upper = np.array([BLUE_H_HI, 255, 255], dtype=np.uint8)
+    mask = cv2.inRange(hsv, lower, upper)
+    k = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
+    return mask
+
+def adaptive_lines(gray: np.ndarray) -> np.ndarray:
+    blk = ADAPT_BLOCK if ADAPT_BLOCK % 2 == 1 else ADAPT_BLOCK + 1
+    th = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        blk,
+        ADAPT_C
+    )
+    k = np.ones((3, 3), np.uint8)
+    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, k, iterations=1)
+    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, k, iterations=1)
+    return th
+
+def edges_combo(frame_bgr: np.ndarray) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    stages = {}
+
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    stages["1_gray"] = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+    # blur nhẹ hơn để không mất nét
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    stages["2_blur"] = cv2.cvtColor(blur, cv2.COLOR_GRAY2BGR)
+
+    # auto canny trên gray
+    e_gray = auto_canny(blur, sigma=0.33)
+    stages["3_edges_gray"] = cv2.cvtColor(e_gray, cv2.COLOR_GRAY2BGR)
+
+    # adaptive threshold bắt nét bút / đường tối
+    th = adaptive_lines(gray)
+    stages["2b_adapt_thresh"] = cv2.cvtColor(th, cv2.COLOR_GRAY2BGR)
+
+    # blue mask bắt đường xanh (grid)
+    m_blue = hsv_blue_mask(frame_bgr)
+    stages["2hsv_blue_mask"] = cv2.cvtColor(m_blue, cv2.COLOR_GRAY2BGR)
+
+    # edges từ blue mask (bằng canny hoặc gradient)
+    m_blur = cv2.GaussianBlur(m_blue, (5, 5), 0)
+    e_blue = cv2.Canny(m_blur, 40, 120)
+    stages["3b_edges_blue"] = cv2.cvtColor(e_blue, cv2.COLOR_GRAY2BGR)
+
+    # OR tất cả lại
+    combo = cv2.bitwise_or(e_gray, e_blue)
+    combo = cv2.bitwise_or(combo, th)
+    stages["3c_edges_combo"] = cv2.cvtColor(combo, cv2.COLOR_GRAY2BGR)
+
+    # nối cạnh bị đứt
+    k = np.ones((3, 3), np.uint8)
+    if EDGE_DILATE > 0:
+        combo = cv2.dilate(combo, k, iterations=EDGE_DILATE)
+    if EDGE_CLOSE > 0:
+        combo = cv2.morphologyEx(combo, cv2.MORPH_CLOSE, k, iterations=EDGE_CLOSE)
+    stages["3d_edges_closed"] = cv2.cvtColor(combo, cv2.COLOR_GRAY2BGR)
+
+    return combo, stages
+
+def find_board_quad_from_edges(edges: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Tìm contour lớn nhất và approx 4 điểm.
+    Dùng edges đã được "closed" => ổn định hơn.
+    """
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+
+    H, W = edges.shape[:2]
+    img_area = float(H * W)
+
+    best = None
+    best_area = 0.0
+
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if area < 0.03 * img_area:
+            continue
+
+        peri = cv2.arcLength(c, True)
+        if peri < 400:
+            continue
+
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) != 4:
+            # thử nới lỏng chút
+            approx2 = cv2.approxPolyDP(c, 0.03 * peri, True)
+            if len(approx2) != 4:
+                continue
+            approx = approx2
+
+        pts = approx.reshape(4, 2).astype(np.float32)
+
+        # aspect ratio check
+        x, y, w, h = cv2.boundingRect(approx)
+        if h <= 1 or w <= 1:
+            continue
+        ar = w / float(h)
+        if not (0.55 <= ar <= 1.9):
+            continue
+
+        polyA = polygon_area(pts)
+        if polyA > best_area:
+            best_area = polyA
+            best = pts
+
+    if best is None:
+        return None
+    return order_points(best)
+
+# =========================
+# Vision helpers (warp stages)
 # =========================
 def enhance_for_server(warp_bgr: np.ndarray) -> np.ndarray:
     blur = cv2.GaussianBlur(warp_bgr, (5, 5), 0)
@@ -204,7 +290,6 @@ def mask_white_objects(warp_bgr: np.ndarray) -> np.ndarray:
     lower = np.array([0, 0, 160], dtype=np.uint8)
     upper = np.array([180, 70, 255], dtype=np.uint8)
     mask = cv2.inRange(hsv, lower, upper)
-
     k = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
@@ -222,24 +307,22 @@ def detect_O_centers(warp_bgr: np.ndarray, rows: int, cols: int) -> List[Tuple[i
     centers = []
     for c in cnts:
         area = cv2.contourArea(c)
-        if area < 60:
+        if area < 80:
             continue
         (x, y), r = cv2.minEnclosingCircle(c)
         if r < min_r or r > max_r:
             continue
-
         peri = cv2.arcLength(c, True) + 1e-6
         circ = 4.0 * np.pi * area / (peri * peri)
-        if circ < 0.42:
+        if circ < 0.45:
             continue
-
         centers.append((int(round(x)), int(round(y))))
     return centers
 
 def detect_X_cells_simple(warp_bgr: np.ndarray, rows: int, cols: int) -> List[Tuple[int, int]]:
     gray = cv2.cvtColor(warp_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 60, 140)
+    edges = auto_canny(blur, sigma=0.33)
 
     H, W = edges.shape[:2]
     cell_w = W / float(cols)
@@ -256,12 +339,10 @@ def detect_X_cells_simple(warp_bgr: np.ndarray, rows: int, cols: int) -> List[Tu
                 continue
 
             lines = cv2.HoughLinesP(
-                roi,
-                rho=1,
-                theta=np.pi / 180,
-                threshold=25,
+                roi, 1, np.pi / 180,
+                threshold=22,
                 minLineLength=int(0.35 * min(roi.shape[:2])),
-                maxLineGap=10,
+                maxLineGap=12
             )
             if lines is None:
                 continue
@@ -274,14 +355,13 @@ def detect_X_cells_simple(warp_bgr: np.ndarray, rows: int, cols: int) -> List[Tu
                 dy = yB - yA
                 a = np.degrees(np.arctan2(dy, dx))
                 a = (a + 180) % 180
-                if 25 <= a <= 65:
+                if 25 <= a <= 70:
                     ang1 += 1
-                elif 115 <= a <= 155:
+                elif 110 <= a <= 155:
                     ang2 += 1
 
             if ang1 >= 1 and ang2 >= 1:
                 hits.append((r, c))
-
     return hits
 
 # =========================
@@ -296,21 +376,18 @@ class ScanPipeline:
     def run(self, frame_bgr: np.ndarray) -> Dict[str, Any]:
         stages: Dict[str, np.ndarray] = {}
 
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        stages["1_gray"] = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        # Build robust edges
+        edges, st = edges_combo(frame_bgr)
+        stages.update(st)
 
-        blur = cv2.GaussianBlur(gray, (7, 7), 0)
-        stages["2_blur"] = cv2.cvtColor(blur, cv2.COLOR_GRAY2BGR)
-
-        edges = cv2.Canny(blur, 70, 160)
-        k = np.ones((3, 3), np.uint8)
-        edges2 = cv2.dilate(edges, k, iterations=1)
-        edges2 = cv2.erode(edges2, k, iterations=1)
-        stages["3_edges"] = cv2.cvtColor(edges2, cv2.COLOR_GRAY2BGR)
-
-        quad = find_board_quad(edges2)
+        # find quad
+        quad = find_board_quad_from_edges(cv2.cvtColor(stages["3d_edges_closed"], cv2.COLOR_BGR2GRAY))
         if quad is None:
-            stages["4_board"] = frame_bgr.copy()
+            # show debug board stage
+            dbg = frame_bgr.copy()
+            cv2.putText(dbg, "board quad NOT found", (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            stages["4_board"] = dbg
             return {"found": False, "stages": stages}
 
         angle = compute_angle_deg(quad)
@@ -324,15 +401,15 @@ class ScanPipeline:
         warp_bgr, H, Hinv = warp_board(frame_bgr, quad, self.warp_size)
         stages["5_warp"] = warp_bgr.copy()
 
+        # local previews
         mask = mask_white_objects(warp_bgr)
-        stages["6_mask"] = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        stages["6_mask_white"] = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 
         o_centers = detect_O_centers(warp_bgr, self.rows, self.cols)
         x_cells = detect_X_cells_simple(warp_bgr, self.rows, self.cols)
 
         pieces_vis = warp_bgr.copy()
         s = self.warp_size
-
         for c in range(1, self.cols):
             xx = int(round(c * s / self.cols))
             cv2.line(pieces_vis, (xx, 0), (xx, s - 1), (255, 255, 0), 1)
@@ -343,7 +420,6 @@ class ScanPipeline:
         for (x, y) in o_centers:
             cv2.circle(pieces_vis, (x, y), 12, (0, 255, 0), 2)
             cv2.circle(pieces_vis, (x, y), 2, (0, 255, 0), -1)
-
         for (r, c) in x_cells:
             cx = int((c + 0.5) * s / self.cols)
             cy = int((r + 0.5) * s / self.rows)
@@ -352,6 +428,7 @@ class ScanPipeline:
 
         stages["7_pieces_local"] = pieces_vis
 
+        # Prepare for server confirm
         warp_send = enhance_for_server(warp_bgr)
         stages["8_send"] = warp_send.copy()
 
@@ -359,7 +436,6 @@ class ScanPipeline:
             "found": True,
             "quad": quad,
             "angle": angle,
-            "warp": warp_bgr,
             "warp_send": warp_send,
             "Hinv": Hinv,
             "stages": stages
@@ -370,7 +446,6 @@ class ScanPipeline:
 # =========================
 def draw_grid_perspective(frame_bgr: np.ndarray, Hinv: np.ndarray, rows: int, cols: int, size: int):
     overlay = frame_bgr.copy()
-
     for c in range(cols + 1):
         x = c * (size - 1) / float(cols)
         pts_w = np.array([[x, 0], [x, size - 1]], dtype=np.float32)
@@ -445,8 +520,8 @@ class CameraWeb:
         self.app = Flask("scan_board")
 
         self._lock = threading.Lock()
-        self._last = None                 # live frame (with final overlay)
-        self._raw = None                  # raw camera frame
+        self._last = None
+        self._raw = None
         self._scan_status = "idle"
         self._stop = threading.Event()
         self._thread = None
@@ -516,7 +591,7 @@ class CameraWeb:
     .cells { font-size:11px; color:#cbd5f5; white-space:pre; max-height:220px; overflow:auto; }
 
     .stages {
-      width: 360px;
+      width: 380px;
       background:#111827; border:1px solid #223; border-radius:12px; padding:12px;
     }
     .stageTitle { color:#93c5fd; margin:0 0 10px 0; font-weight:600; }
@@ -542,7 +617,7 @@ class CameraWeb:
   <div class="wrap">
     <div>
       <img class="video" id="cam" src="/mjpeg" />
-      <div class="note">Tip: nếu camera đang ngược, rotate180=true (đang: <span id="rot">?</span>)</div>
+      <div class="note">rotate180: <span id="rot">?</span></div>
     </div>
 
     <div class="card">
@@ -702,14 +777,12 @@ tick();
                 time.sleep(0.05)
                 continue
 
-            # ✅ rotate 180 if needed
             if ROTATE_180:
                 frame = cv2.rotate(frame, cv2.ROTATE_180)
 
             with self._lock:
                 self._raw = frame.copy()
 
-            # default stream raw
             self.set_live_frame(frame)
             self._ready.set()
             time.sleep(0.01)
@@ -741,11 +814,13 @@ tick();
 # Main
 # =========================
 def main():
-    print("[START] scan_board_4x6_pipeline", flush=True)
-    print(f"[CFG] SCAN_API_URL={SCAN_API_URL}", flush=True)
+    print("[START] scan_board_4x6_pipeline (robust edges)", flush=True)
     print(f"[CFG] GRID_ROWS={GRID_ROWS} GRID_COLS={GRID_COLS}", flush=True)
     print(f"[CFG] CAM={CAM_W}x{CAM_H}@{CAM_FPS} rotate180={ROTATE_180}", flush=True)
-    print(f"[CFG] WARP_SIZE={WARP_SIZE}", flush=True)
+    print(f"[CFG] HSV blue H[{BLUE_H_LO},{BLUE_H_HI}] S>={BLUE_S_LO} V>={BLUE_V_LO}", flush=True)
+    print(f"[CFG] ADAPT block={ADAPT_BLOCK} C={ADAPT_C}", flush=True)
+    print(f"[CFG] EDGE dilate={EDGE_DILATE} close={EDGE_CLOSE}", flush=True)
+    print(f"[CFG] SCAN_API_URL={SCAN_API_URL}", flush=True)
 
     board = BoardState(rows=GRID_ROWS, cols=GRID_COLS)
     cam = CameraWeb(board)
@@ -774,28 +849,33 @@ def main():
 
                 if not out.get("found"):
                     cam.set_pipeline_outputs(angle=None, cells=[], stages=stages)
-                    cam.set_live_frame(raw)
+                    cam.set_live_frame(stages.get("4_board", raw))
                     cam.set_scan_status("failed")
-                    print("[SCAN] board not found", flush=True)
+                    print("[SCAN] board quad not found", flush=True)
                     time.sleep(0.2)
                     continue
 
-                quad = out["quad"]
                 angle = out["angle"]
+                quad = out["quad"]
                 Hinv = out["Hinv"]
                 warp_send = out["warp_send"]
 
                 cam.set_pipeline_outputs(angle=angle, cells=[], stages=stages)
 
+                # send to server confirm
                 img_bytes = _encode_frame_jpeg(warp_send)
                 result = _post_image_to_api(img_bytes)
 
+                live = raw.copy()
+                cv2.polylines(live, [quad.astype(np.int32)], True, (0, 255, 255), 2)
+                cv2.putText(live, f"angle={angle:.1f}", (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
                 if not result or not result.get("found"):
+                    cam.set_pipeline_outputs(angle=angle, cells=[], stages=stages)
+                    cam.set_live_frame(live)
                     cam.set_scan_status("failed")
                     print("[SCAN] server confirm failed", flush=True)
-                    live = raw.copy()
-                    cv2.polylines(live, [quad.astype(np.int32)], True, (0, 255, 255), 2)
-                    cam.set_live_frame(live)
                     time.sleep(0.2)
                     continue
 
@@ -806,22 +886,16 @@ def main():
                 board_mat = board_from_server_cells(rows, cols, cells)
                 board.set_board(board_mat)
 
-                live = raw.copy()
+                # draw perspective grid and fill detected cells
                 draw_grid_perspective(live, Hinv, rows, cols, WARP_SIZE)
-
                 for r in range(rows):
                     for c in range(cols):
                         if board_mat[r][c] != 0:
                             fill_cell_perspective(live, Hinv, r, c, rows, cols, WARP_SIZE)
 
-                cv2.polylines(live, [quad.astype(np.int32)], True, (0, 255, 255), 2)
-                cv2.putText(live, f"angle={angle:.1f}", (10, 25),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
                 cam.set_live_frame(live)
                 cam.set_pipeline_outputs(angle=angle, cells=cells, stages=stages)
                 cam.set_scan_status("ready")
-
                 print("[SCAN] done", {"rows": rows, "cols": cols, "cells": len(cells), "angle": angle}, flush=True)
 
             time.sleep(0.08)
