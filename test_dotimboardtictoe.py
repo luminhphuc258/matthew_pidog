@@ -586,7 +586,7 @@ function formatBoard(board) {{
 
 function formatCells(cells) {{
   if (!cells || !cells.length) return '-';
-  return cells.map(c => `(${c.row ?? c.r},${c.col ?? c.c}) ${c.state}`).join('\\n');
+  return cells.map(c => `(${{c.row ?? c.r}},${{c.col ?? c.c}}) ${{c.state}}`).join('\\n');
 }}
 
 function renderStages(names) {{
@@ -595,7 +595,7 @@ function renderStages(names) {{
   names.forEach(n => {{
     const d = document.createElement('div');
     d.className = 'thumb';
-    d.innerHTML = `<h4>${n}</h4><img src="/stage/${n}.jpg?ts=${Date.now()}" />`;
+    d.innerHTML = `<h4>${{n}}</h4><img src="/stage/${{n}}.jpg?ts=${{Date.now()}}" />`;
     grid.appendChild(d);
   }});
 }}
