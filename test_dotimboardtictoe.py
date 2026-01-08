@@ -506,42 +506,42 @@ class CameraWeb:
             return Response(buf.tobytes(), mimetype="image/jpeg")
 
     def _html(self) -> str:
-        html = """<!doctype html>
+    html = """<!doctype html>
 <html>
 <head>
   <meta charset="utf-8"/>
   <title>Scan Board 4x6</title>
   <style>
-    body {{ font-family: Arial, sans-serif; background:#0b0f14; color:#e7eef7; margin:0; }}
-    .wrap {{ display:flex; gap:16px; padding:16px; align-items:flex-start; }}
-    .card {{ background:#111827; border:1px solid #223; border-radius:12px; padding:12px; min-width:340px; }}
-    .kv {{ margin:8px 0; }}
-    .k {{ color:#93c5fd; }}
-    .row {{ display:flex; gap:8px; align-items:center; margin-top:10px; }}
-    .btn {{ background:#1f2937; border:1px solid #334155; color:#e7eef7; padding:6px 10px; border-radius:8px; cursor:pointer; }}
-    .video {{ border:1px solid #223; border-radius:8px; width:{cam_w}px; height:{cam_h}px; object-fit:cover; }}
-    .cells {{ font-size:11px; color:#cbd5f5; white-space:pre; max-height:220px; overflow:auto; }}
+    body { font-family: Arial, sans-serif; background:#0b0f14; color:#e7eef7; margin:0; }
+    .wrap { display:flex; gap:16px; padding:16px; align-items:flex-start; }
+    .card { background:#111827; border:1px solid #223; border-radius:12px; padding:12px; min-width:340px; }
+    .kv { margin:8px 0; }
+    .k { color:#93c5fd; }
+    .row { display:flex; gap:8px; align-items:center; margin-top:10px; }
+    .btn { background:#1f2937; border:1px solid #334155; color:#e7eef7; padding:6px 10px; border-radius:8px; cursor:pointer; }
+    .video { border:1px solid #223; border-radius:8px; width:__CAM_W__px; height:__CAM_H__px; object-fit:cover; }
+    .cells { font-size:11px; color:#cbd5f5; white-space:pre; max-height:220px; overflow:auto; }
 
-    .stages {{
+    .stages {
       width: 360px;
       background:#111827; border:1px solid #223; border-radius:12px; padding:12px;
-    }}
-    .stageTitle {{ color:#93c5fd; margin:0 0 10px 0; font-weight:600; }}
-    .grid {{
+    }
+    .stageTitle { color:#93c5fd; margin:0 0 10px 0; font-weight:600; }
+    .grid {
       display:grid;
       grid-template-columns: 1fr;
       gap:10px;
       max-height: calc(100vh - 80px);
       overflow:auto;
-    }}
-    .thumb {{
+    }
+    .thumb {
       border:1px solid #223;
       border-radius:10px;
       padding:8px;
       background:#0f1624;
-    }}
-    .thumb h4 {{ margin:0 0 6px 0; font-size:12px; color:#cbd5f5; }}
-    .thumb img {{ width:100%; height:auto; border-radius:8px; display:block; }}
+    }
+    .thumb h4 { margin:0 0 6px 0; font-size:12px; color:#cbd5f5; }
+    .thumb img { width:100%; height:auto; border-radius:8px; display:block; }
   </style>
 </head>
 <body>
@@ -579,30 +579,30 @@ class CameraWeb:
 <script>
 let stageNames = [];
 
-function formatBoard(board) {{
+function formatBoard(board) {
   if (!board || !board.length) return '-';
   return board.map(row => row.join(' ')).join('\\n');
-}}
+}
 
-function formatCells(cells) {{
+function formatCells(cells) {
   if (!cells || !cells.length) return '-';
-  return cells.map(c => `(${{c.row ?? c.r}},${{c.col ?? c.c}}) ${{c.state}}`).join('\\n');
-}}
+  return cells.map(c => `(${c.row ?? c.r},${c.col ?? c.c}) ${c.state}`).join('\\n');
+}
 
-function renderStages(names) {{
+function renderStages(names) {
   const grid = document.getElementById('stageGrid');
   grid.innerHTML = '';
-  names.forEach(n => {{
+  names.forEach(n => {
     const d = document.createElement('div');
     d.className = 'thumb';
-    d.innerHTML = `<h4>${{n}}</h4><img src="/stage/${{n}}.jpg?ts=${{Date.now()}}" />`;
+    d.innerHTML = `<h4>${n}</h4><img src="/stage/${n}.jpg?ts=${Date.now()}" />`;
     grid.appendChild(d);
-  }});
-}}
+  });
+}
 
-async function tick() {{
-  try {{
-    const r = await fetch('/state.json', {{cache:'no-store'}});
+async function tick() {
+  try {
+    const r = await fetch('/state.json', {cache:'no-store'});
     const js = await r.json();
 
     document.getElementById('gridrc').textContent = `rows=${js.rows}, cols=${js.cols}`;
@@ -617,23 +617,23 @@ async function tick() {{
     document.getElementById('cells').textContent = formatCells(js.cells || []);
 
     const names = js.stages || [];
-    if (JSON.stringify(names) !== JSON.stringify(stageNames)) {{
+    if (JSON.stringify(names) !== JSON.stringify(stageNames)) {
       stageNames = names;
       renderStages(stageNames);
-    }} else {{
+    } else {
       const imgs = document.querySelectorAll('#stageGrid img');
-      imgs.forEach(img => {{
+      imgs.forEach(img => {
         const base = img.src.split('?')[0];
         img.src = base + '?ts=' + Date.now();
-      }});
-    }}
-  }} catch(e) {{}}
-}}
+      });
+    }
+  } catch(e) {}
+}
 
-async function playScan() {{
-  try {{ await fetch('/play'); }} catch(e) {{}}
+async function playScan() {
+  try { await fetch('/play'); } catch(e) {}
   tick();
-}}
+}
 
 setInterval(tick, 450);
 tick();
@@ -641,7 +641,8 @@ tick();
 </body>
 </html>
 """
-        return html.format(cam_w=CAM_W, cam_h=CAM_H)
+    return html.replace("__CAM_W__", str(CAM_W)).replace("__CAM_H__", str(CAM_H))
+
 
     def _mjpeg_gen(self):
         while not self._stop.is_set():
