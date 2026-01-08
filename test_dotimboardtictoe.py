@@ -23,7 +23,9 @@ CAM_W = int(os.environ.get("CAM_W", "640"))
 CAM_H = int(os.environ.get("CAM_H", "480"))
 CAM_FPS = int(os.environ.get("CAM_FPS", "15"))
 JPEG_QUALITY = int(os.environ.get("CAM_JPEG_QUALITY", "70"))
-ROTATE_180 = str(os.environ.get("CAM_ROTATE_180", "0")).lower() in ("1", "true", "yes", "on")
+
+# ✅ Force rotate 180 by default (camera is upside down)
+ROTATE_180 = str(os.environ.get("CAM_ROTATE_180", "1")).lower() in ("1", "true", "yes", "on")
 
 # ✅ Board size: 4x6
 GRID_COLS = int(os.environ.get("GRID_COLS", "4"))
@@ -41,7 +43,6 @@ WARP_SIZE = int(os.environ.get("WARP_SIZE", "520"))
 HILITE_ALPHA = float(os.environ.get("HILITE_ALPHA", "0.28"))
 
 # Circle radius filter relative to cell size
-# (tune a bit depending camera distance)
 MIN_R_RATIO = float(os.environ.get("MIN_R_RATIO", "0.12"))
 MAX_R_RATIO = float(os.environ.get("MAX_R_RATIO", "0.30"))
 
@@ -145,8 +146,6 @@ def find_board_quad(edges: np.ndarray) -> Optional[np.ndarray]:
         if area < 0.02 * img_area:
             continue
 
-        # aspect ratio roughly square-ish because we warp to square,
-        # but board itself in camera might be not square; still ok.
         x, y, w, h = cv2.boundingRect(approx)
         if h <= 1 or w <= 1:
             continue
@@ -212,9 +211,6 @@ def mask_white_objects(warp_bgr: np.ndarray) -> np.ndarray:
     return mask
 
 def detect_O_centers(warp_bgr: np.ndarray, rows: int, cols: int) -> List[Tuple[int, int]]:
-    """
-    GitHub-like: mask + contours + minEnclosingCircle + radius filter
-    """
     mask = mask_white_objects(warp_bgr)
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -241,9 +237,6 @@ def detect_O_centers(warp_bgr: np.ndarray, rows: int, cols: int) -> List[Tuple[i
     return centers
 
 def detect_X_cells_simple(warp_bgr: np.ndarray, rows: int, cols: int) -> List[Tuple[int, int]]:
-    """
-    Per-cell X check: HoughLinesP, need both diagonal groups.
-    """
     gray = cv2.cvtColor(warp_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blur, 60, 140)
@@ -340,7 +333,6 @@ class ScanPipeline:
         pieces_vis = warp_bgr.copy()
         s = self.warp_size
 
-        # draw grid lines in warp (debug)
         for c in range(1, self.cols):
             xx = int(round(c * s / self.cols))
             cv2.line(pieces_vis, (xx, 0), (xx, s - 1), (255, 255, 0), 1)
@@ -480,6 +472,7 @@ class CameraWeb:
                 st["stages"] = list(self._stages.keys())
                 st["rows"] = GRID_ROWS
                 st["cols"] = GRID_COLS
+                st["rotate180"] = ROTATE_180
             st["board"] = self.board.snapshot()
             return jsonify(st)
 
@@ -542,12 +535,14 @@ class CameraWeb:
     }
     .thumb h4 { margin:0 0 6px 0; font-size:12px; color:#cbd5f5; }
     .thumb img { width:100%; height:auto; border-radius:8px; display:block; }
+    .note { font-size:12px; color:#aab7cf; margin-top:8px; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div>
       <img class="video" id="cam" src="/mjpeg" />
+      <div class="note">Tip: nếu camera đang ngược, rotate180=true (đang: <span id="rot">?</span>)</div>
     </div>
 
     <div class="card">
@@ -608,6 +603,7 @@ async function tick() {
     document.getElementById('gridrc').textContent = `rows=${js.rows}, cols=${js.cols}`;
     document.getElementById('scan_status').textContent = js.scan_status ?? '-';
     document.getElementById('angle').textContent = (js.angle ?? '-') + '';
+    document.getElementById('rot').textContent = (js.rotate180 ? 'true' : 'false');
 
     document.getElementById('empty').textContent = js.empty ?? '-';
     document.getElementById('player').textContent = js.player ?? '-';
@@ -642,7 +638,6 @@ tick();
 </html>
 """
         return html.replace("__CAM_W__", str(CAM_W)).replace("__CAM_H__", str(CAM_H))
-
 
     def _mjpeg_gen(self):
         while not self._stop.is_set():
@@ -707,6 +702,7 @@ tick();
                 time.sleep(0.05)
                 continue
 
+            # ✅ rotate 180 if needed
             if ROTATE_180:
                 frame = cv2.rotate(frame, cv2.ROTATE_180)
 
@@ -789,10 +785,8 @@ def main():
                 Hinv = out["Hinv"]
                 warp_send = out["warp_send"]
 
-                # show stages right away
                 cam.set_pipeline_outputs(angle=angle, cells=[], stages=stages)
 
-                # send processed warp to server
                 img_bytes = _encode_frame_jpeg(warp_send)
                 result = _post_image_to_api(img_bytes)
 
@@ -812,7 +806,6 @@ def main():
                 board_mat = board_from_server_cells(rows, cols, cells)
                 board.set_board(board_mat)
 
-                # final overlay on real frame using perspective
                 live = raw.copy()
                 draw_grid_perspective(live, Hinv, rows, cols, WARP_SIZE)
 
