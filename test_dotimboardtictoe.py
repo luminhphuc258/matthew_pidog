@@ -24,7 +24,6 @@ CAM_H = int(os.environ.get("CAM_H", "480"))
 CAM_FPS = int(os.environ.get("CAM_FPS", "15"))
 JPEG_QUALITY = int(os.environ.get("CAM_JPEG_QUALITY", "70"))
 
-# Force rotate 180 by default
 ROTATE_180 = str(os.environ.get("CAM_ROTATE_180", "1")).lower() in ("1", "true", "yes", "on")
 
 # Board size: 4x6
@@ -36,40 +35,42 @@ SCAN_API_URL = os.environ.get(
     "https://embeddedprogramming-healtheworldserver.up.railway.app/scan_chess",
 )
 
-# Warp output size
 WARP_SIZE = int(os.environ.get("WARP_SIZE", "520"))
 
-# Highlight alpha
 HILITE_ALPHA = float(os.environ.get("HILITE_ALPHA", "0.28"))
 
-# Circle radius filter relative to cell size (for local O detection preview)
-MIN_R_RATIO = float(os.environ.get("MIN_R_RATIO", "0.12"))
-MAX_R_RATIO = float(os.environ.get("MAX_R_RATIO", "0.30"))
-
-# HSV blue range (grid line)
+# ===== Blue mask (grid lines) =====
 BLUE_H_LO = int(os.environ.get("BLUE_H_LO", "85"))
 BLUE_H_HI = int(os.environ.get("BLUE_H_HI", "140"))
 BLUE_S_LO = int(os.environ.get("BLUE_S_LO", "55"))
 BLUE_V_LO = int(os.environ.get("BLUE_V_LO", "50"))
 
-# ===== NEW: HSV yellow corner marker range =====
-# (tune nếu marker vàng khác tông)
-YEL_H_LO = int(os.environ.get("YEL_H_LO", "18"))
-YEL_H_HI = int(os.environ.get("YEL_H_HI", "45"))
-YEL_S_LO = int(os.environ.get("YEL_S_LO", "70"))
-YEL_V_LO = int(os.environ.get("YEL_V_LO", "80"))
+# ===== Yellow marker HSV (tune) =====
+# Marker nhỏ -> thường bị nhạt S/V, nên default nới rộng + hạ S/V
+YEL_H_LO = int(os.environ.get("YEL_H_LO", "15"))
+YEL_H_HI = int(os.environ.get("YEL_H_HI", "55"))
+YEL_S_LO = int(os.environ.get("YEL_S_LO", "35"))
+YEL_V_LO = int(os.environ.get("YEL_V_LO", "40"))
 
-# Minimum marker area ratio (so it won't pick noise)
-MIN_MARKER_AREA_RATIO = float(os.environ.get("MIN_MARKER_AREA_RATIO", "0.0015"))  # ~0.15% frame
-MAX_MARKER_AREA_RATIO = float(os.environ.get("MAX_MARKER_AREA_RATIO", "0.08"))    # ~8% frame
+# Marker nhỏ -> area threshold phải rất thấp
+MIN_MARKER_AREA_RATIO = float(os.environ.get("MIN_MARKER_AREA_RATIO", "0.00012"))  # 0.012% frame
+MAX_MARKER_AREA_RATIO = float(os.environ.get("MAX_MARKER_AREA_RATIO", "0.02"))     # 2% frame
+
+# Tìm theo corner ROI: mỗi góc chiếm bao nhiêu ảnh
+CORNER_ROI_RATIO = float(os.environ.get("CORNER_ROI_RATIO", "0.30"))  # 30% width/height
+
+# Morph kernel nhỏ để khỏi mất marker
+YEL_OPEN_IT = int(os.environ.get("YEL_OPEN_IT", "0"))
+YEL_CLOSE_IT = int(os.environ.get("YEL_CLOSE_IT", "1"))
+YEL_K = int(os.environ.get("YEL_K", "3"))  # kernel size (odd)
 
 # Adaptive threshold params
 ADAPT_BLOCK = int(os.environ.get("ADAPT_BLOCK", "31"))  # must be odd
 ADAPT_C = int(os.environ.get("ADAPT_C", "2"))
 
-# Edge morphology tuning
-EDGE_DILATE = int(os.environ.get("EDGE_DILATE", "1"))
-EDGE_CLOSE = int(os.environ.get("EDGE_CLOSE", "2"))
+# Edge morphology tuning (đừng quá mạnh, không thì dính thành mảng)
+EDGE_DILATE = int(os.environ.get("EDGE_DILATE", "0"))
+EDGE_CLOSE = int(os.environ.get("EDGE_CLOSE", "1"))
 
 # =========================
 # HTTP upload helper
@@ -221,8 +222,8 @@ def edges_combo(frame_bgr: np.ndarray) -> Tuple[np.ndarray, Dict[str, np.ndarray
         combo = cv2.dilate(combo, k, iterations=EDGE_DILATE)
     if EDGE_CLOSE > 0:
         combo = cv2.morphologyEx(combo, cv2.MORPH_CLOSE, k, iterations=EDGE_CLOSE)
-    stages["3d_edges_closed"] = cv2.cvtColor(combo, cv2.COLOR_GRAY2BGR)
 
+    stages["3d_edges_closed"] = cv2.cvtColor(combo, cv2.COLOR_GRAY2BGR)
     return combo, stages
 
 def find_board_quad_from_edges(edges: np.ndarray) -> Optional[np.ndarray]:
@@ -253,14 +254,6 @@ def find_board_quad_from_edges(edges: np.ndarray) -> Optional[np.ndarray]:
             approx = approx2
 
         pts = approx.reshape(4, 2).astype(np.float32)
-
-        x, y, w, h = cv2.boundingRect(approx)
-        if h <= 1 or w <= 1:
-            continue
-        ar = w / float(h)
-        if not (0.55 <= ar <= 1.9):
-            continue
-
         polyA = polygon_area(pts)
         if polyA > best_area:
             best_area = polyA
@@ -271,24 +264,52 @@ def find_board_quad_from_edges(edges: np.ndarray) -> Optional[np.ndarray]:
     return order_points(best)
 
 # =========================
-# NEW: Yellow corner marker quad
+# Yellow marker detection (SMALL markers) - Corner ROI method
 # =========================
 def hsv_yellow_mask(bgr: np.ndarray) -> np.ndarray:
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     lower = np.array([YEL_H_LO, YEL_S_LO, YEL_V_LO], dtype=np.uint8)
     upper = np.array([YEL_H_HI, 255, 255], dtype=np.uint8)
     mask = cv2.inRange(hsv, lower, upper)
-    k = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
+
+    ksz = YEL_K if YEL_K % 2 == 1 else YEL_K + 1
+    k = np.ones((ksz, ksz), np.uint8)
+
+    if YEL_OPEN_IT > 0:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=YEL_OPEN_IT)
+    if YEL_CLOSE_IT > 0:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=YEL_CLOSE_IT)
     return mask
 
-def find_quad_from_yellow_markers(frame_bgr: np.ndarray) -> Tuple[Optional[np.ndarray], Dict[str, np.ndarray]]:
-    """
-    Return (quad, stage_images). quad is 4 points (tl,tr,br,bl) in image coords.
-    Use 4 largest yellow blobs as markers.
-    """
-    st = {}
+def _largest_blob_center(mask_roi: np.ndarray, min_area: float, max_area: float) -> Optional[Tuple[float, float, float]]:
+    cnts, _ = cv2.findContours(mask_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best = None
+    bestA = 0.0
+    for c in cnts:
+        A = cv2.contourArea(c)
+        if A < min_area or A > max_area:
+            continue
+        x, y, w, h = cv2.boundingRect(c)
+        if w <= 1 or h <= 1:
+            continue
+        ar = max(w, h) / (min(w, h) + 1e-6)
+        # marker là hình chữ nhật nhỏ -> cho phép hơi dài, nhưng tránh đường kẻ dài
+        if ar > 6.0:
+            continue
+
+        M = cv2.moments(c)
+        if abs(M.get("m00", 0.0)) < 1e-6:
+            continue
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
+        if A > bestA:
+            bestA = A
+            best = (cx, cy, A)
+    return best
+
+def find_quad_from_yellow_markers_corner_roi(frame_bgr: np.ndarray) -> Tuple[Optional[np.ndarray], Dict[str, np.ndarray]]:
+    st: Dict[str, np.ndarray] = {}
+
     mask = hsv_yellow_mask(frame_bgr)
     st["2y_yellow_mask"] = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 
@@ -297,55 +318,72 @@ def find_quad_from_yellow_markers(frame_bgr: np.ndarray) -> Tuple[Optional[np.nd
     minA = MIN_MARKER_AREA_RATIO * img_area
     maxA = MAX_MARKER_AREA_RATIO * img_area
 
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cand = []
-    for c in cnts:
-        area = cv2.contourArea(c)
-        if area < minA or area > maxA:
+    # define ROIs
+    rr = float(CORNER_ROI_RATIO)
+    rw = int(W * rr)
+    rh = int(H * rr)
+    rw = max(60, rw)
+    rh = max(60, rh)
+
+    rois = {
+        "tl": (0, 0, rw, rh),
+        "tr": (W - rw, 0, W, rh),
+        "br": (W - rw, H - rh, W, H),
+        "bl": (0, H - rh, rw, H),
+    }
+
+    pts = {}
+    dbg = frame_bgr.copy()
+    cv2.putText(dbg, "yellow corner ROI search", (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+    # Draw ROI boxes
+    for k, (x0, y0, x1, y1) in rois.items():
+        cv2.rectangle(dbg, (x0, y0), (x1, y1), (0, 255, 255), 1)
+        cv2.putText(dbg, k, (x0 + 6, y0 + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+    # Search each ROI
+    for name, (x0, y0, x1, y1) in rois.items():
+        roi = mask[y0:y1, x0:x1]
+        if roi.size == 0:
             continue
 
-        rect = cv2.minAreaRect(c)
-        (cx, cy), (rw, rh), ang = rect
-        if rw <= 1 or rh <= 1:
-            continue
-        ar = max(rw, rh) / (min(rw, rh) + 1e-6)
-        # marker thường gần vuông/HCN, cho phép hơi dài
-        if ar > 3.5:
-            continue
+        # area threshold per ROI: dùng minA nhưng clamp để marker siêu nhỏ vẫn sống
+        roi_area = float((y1 - y0) * (x1 - x0))
+        minA_roi = max(20.0, 0.00025 * roi_area)  # >=20 px
+        maxA_roi = maxA  # keep global cap
 
-        cand.append((area, (cx, cy), rect, c))
+        res = _largest_blob_center(roi, minA_roi, maxA_roi)
+        if res is None:
+            continue
+        cx, cy, A = res
+        pts[name] = (cx + x0, cy + y0)
 
-    cand.sort(key=lambda x: x[0], reverse=True)
-    if len(cand) < 4:
-        dbg = frame_bgr.copy()
-        cv2.putText(dbg, f"yellow markers found: {len(cand)}/4", (10, 25),
+        cv2.circle(dbg, (int(cx + x0), int(cy + y0)), 7, (0, 255, 255), -1)
+        cv2.putText(dbg, f"A={int(A)}", (int(cx + x0) + 8, int(cy + y0) - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+
+    # need all 4 corners
+    if not all(k in pts for k in ("tl", "tr", "br", "bl")):
+        cv2.putText(dbg, f"markers found: {len(pts)}/4", (10, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         st["2y_markers"] = dbg
         return None, st
 
-    # lấy 4 marker lớn nhất
-    pts = np.array([cand[i][1] for i in range(4)], dtype=np.float32)
-    quad = order_points(pts)
-
-    dbg = frame_bgr.copy()
-    # draw centers
-    for i, (x, y) in enumerate(quad):
-        cv2.circle(dbg, (int(x), int(y)), 8, (0, 255, 255), -1)
-        cv2.putText(dbg, str(i), (int(x) + 6, int(y) - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-    cv2.polylines(dbg, [quad.astype(np.int32)], True, (0, 255, 255), 2)
-    cv2.putText(dbg, "quad from yellow markers", (10, 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-    st["2y_markers"] = dbg
-
-    # sanity check: quad area enough
-    if polygon_area(quad) < 0.08 * img_area:
-        dbg2 = dbg.copy()
-        cv2.putText(dbg2, "yellow quad too small (check markers size/HSV)", (10, 75),
+    quad = np.array([pts["tl"], pts["tr"], pts["br"], pts["bl"]], dtype=np.float32)
+    # sanity: area
+    if polygon_area(quad) < 0.06 * img_area:
+        cv2.putText(dbg, "yellow quad too small -> tune HSV/ROI", (10, 75),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
-        st["2y_markers"] = dbg2
+        st["2y_markers"] = dbg
         return None, st
 
+    cv2.polylines(dbg, [quad.astype(np.int32)], True, (0, 255, 255), 2)
+    cv2.putText(dbg, "quad=yellow(corner ROI)", (10, 75),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+    st["2y_markers"] = dbg
     return quad, st
 
 # =========================
@@ -361,85 +399,6 @@ def enhance_for_server(warp_bgr: np.ndarray) -> np.ndarray:
     out = cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
     return out
 
-def mask_white_objects(warp_bgr: np.ndarray) -> np.ndarray:
-    hsv = cv2.cvtColor(warp_bgr, cv2.COLOR_BGR2HSV)
-    lower = np.array([0, 0, 160], dtype=np.uint8)
-    upper = np.array([180, 70, 255], dtype=np.uint8)
-    mask = cv2.inRange(hsv, lower, upper)
-    k = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
-    return mask
-
-def detect_O_centers(warp_bgr: np.ndarray, rows: int, cols: int) -> List[Tuple[int, int]]:
-    mask = mask_white_objects(warp_bgr)
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    size = warp_bgr.shape[0]
-    cell = size / float(max(1, cols))
-    min_r = MIN_R_RATIO * cell
-    max_r = MAX_R_RATIO * cell
-
-    centers = []
-    for c in cnts:
-        area = cv2.contourArea(c)
-        if area < 80:
-            continue
-        (x, y), r = cv2.minEnclosingCircle(c)
-        if r < min_r or r > max_r:
-            continue
-        peri = cv2.arcLength(c, True) + 1e-6
-        circ = 4.0 * np.pi * area / (peri * peri)
-        if circ < 0.45:
-            continue
-        centers.append((int(round(x)), int(round(y))))
-    return centers
-
-def detect_X_cells_simple(warp_bgr: np.ndarray, rows: int, cols: int) -> List[Tuple[int, int]]:
-    gray = cv2.cvtColor(warp_bgr, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = auto_canny(blur, sigma=0.33)
-
-    H, W = edges.shape[:2]
-    cell_w = W / float(cols)
-    cell_h = H / float(rows)
-
-    hits = []
-    for r in range(rows):
-        for c in range(cols):
-            x0 = int(c * cell_w); x1 = int((c + 1) * cell_w)
-            y0 = int(r * cell_h); y1 = int((r + 1) * cell_h)
-
-            roi = edges[y0:y1, x0:x1]
-            if roi.size == 0:
-                continue
-
-            lines = cv2.HoughLinesP(
-                roi, 1, np.pi / 180,
-                threshold=22,
-                minLineLength=int(0.35 * min(roi.shape[:2])),
-                maxLineGap=12
-            )
-            if lines is None:
-                continue
-
-            ang1 = 0
-            ang2 = 0
-            for l in lines[:, 0]:
-                xA, yA, xB, yB = l
-                dx = xB - xA
-                dy = yB - yA
-                a = np.degrees(np.arctan2(dy, dx))
-                a = (a + 180) % 180
-                if 25 <= a <= 70:
-                    ang1 += 1
-                elif 110 <= a <= 155:
-                    ang2 += 1
-
-            if ang1 >= 1 and ang2 >= 1:
-                hits.append((r, c))
-    return hits
-
 # =========================
 # Pipeline
 # =========================
@@ -452,23 +411,21 @@ class ScanPipeline:
     def run(self, frame_bgr: np.ndarray) -> Dict[str, Any]:
         stages: Dict[str, np.ndarray] = {}
 
-        # 0) Try yellow marker quad first
-        quad_yel, st_yel = find_quad_from_yellow_markers(frame_bgr)
+        # 0) Try yellow corner ROI quad first (for tiny markers)
+        quad_yel, st_yel = find_quad_from_yellow_markers_corner_roi(frame_bgr)
         stages.update(st_yel)
 
-        # 1) Build robust edges (keep old flow)
+        # 1) Edges (keep old flow)
         edges, st = edges_combo(frame_bgr)
         stages.update(st)
 
-        # 2) choose quad
         quad = None
         quad_src = "none"
 
         if quad_yel is not None:
             quad = quad_yel
-            quad_src = "yellow"
+            quad_src = "yellow_roi"
         else:
-            # fallback to old contour-based quad
             edges_gray = cv2.cvtColor(stages["3d_edges_closed"], cv2.COLOR_BGR2GRAY)
             quad2 = find_board_quad_from_edges(edges_gray)
             if quad2 is not None:
@@ -479,7 +436,7 @@ class ScanPipeline:
             dbg = frame_bgr.copy()
             cv2.putText(dbg, "board quad NOT found", (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            cv2.putText(dbg, "tip: tune YEL_* or marker size", (10, 50),
+            cv2.putText(dbg, "tip: check 2y_yellow_mask + 2y_markers", (10, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
             stages["4_board"] = dbg
             return {"found": False, "stages": stages}
@@ -495,34 +452,6 @@ class ScanPipeline:
         warp_bgr, H, Hinv = warp_board(frame_bgr, quad, self.warp_size)
         stages["5_warp"] = warp_bgr.copy()
 
-        # local previews
-        mask = mask_white_objects(warp_bgr)
-        stages["6_mask_white"] = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-
-        o_centers = detect_O_centers(warp_bgr, self.rows, self.cols)
-        x_cells = detect_X_cells_simple(warp_bgr, self.rows, self.cols)
-
-        pieces_vis = warp_bgr.copy()
-        s = self.warp_size
-        for c in range(1, self.cols):
-            xx = int(round(c * s / self.cols))
-            cv2.line(pieces_vis, (xx, 0), (xx, s - 1), (255, 255, 0), 1)
-        for r in range(1, self.rows):
-            yy = int(round(r * s / self.rows))
-            cv2.line(pieces_vis, (0, yy), (s - 1, yy), (255, 255, 0), 1)
-
-        for (x, y) in o_centers:
-            cv2.circle(pieces_vis, (x, y), 12, (0, 255, 0), 2)
-            cv2.circle(pieces_vis, (x, y), 2, (0, 255, 0), -1)
-        for (r, c) in x_cells:
-            cx = int((c + 0.5) * s / self.cols)
-            cy = int((r + 0.5) * s / self.rows)
-            cv2.putText(pieces_vis, "X", (cx - 10, cy + 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-
-        stages["7_pieces_local"] = pieces_vis
-
-        # Prepare for server confirm
         warp_send = enhance_for_server(warp_bgr)
         stages["8_send"] = warp_send.copy()
 
@@ -908,11 +837,11 @@ tick();
 # Main
 # =========================
 def main():
-    print("[START] scan_board_4x6_pipeline (yellow markers preferred)", flush=True)
+    print("[START] scan_board_4x6_pipeline (tiny yellow corner markers)", flush=True)
     print(f"[CFG] GRID_ROWS={GRID_ROWS} GRID_COLS={GRID_COLS}", flush=True)
     print(f"[CFG] CAM={CAM_W}x{CAM_H}@{CAM_FPS} rotate180={ROTATE_180}", flush=True)
-    print(f"[CFG] YELLOW HSV H[{YEL_H_LO},{YEL_H_HI}] S>={YEL_S_LO} V>={YEL_V_LO}", flush=True)
-    print(f"[CFG] BLUE HSV   H[{BLUE_H_LO},{BLUE_H_HI}] S>={BLUE_S_LO} V>={BLUE_V_LO}", flush=True)
+    print(f"[CFG] YEL HSV H[{YEL_H_LO},{YEL_H_HI}] S>={YEL_S_LO} V>={YEL_V_LO}", flush=True)
+    print(f"[CFG] CORNER_ROI_RATIO={CORNER_ROI_RATIO} MIN_MARKER_AREA_RATIO={MIN_MARKER_AREA_RATIO}", flush=True)
     print(f"[CFG] SCAN_API_URL={SCAN_API_URL}", flush=True)
 
     board = BoardState(rows=GRID_ROWS, cols=GRID_COLS)
@@ -930,7 +859,6 @@ def main():
         while True:
             if cam.consume_scan_request():
                 cam.set_scan_status("scanning")
-
                 raw = cam.get_last_frame_raw()
                 if raw is None:
                     cam.set_scan_status("failed")
@@ -944,7 +872,7 @@ def main():
                     cam.set_pipeline_outputs(angle=None, cells=[], stages=stages)
                     cam.set_live_frame(stages.get("4_board", raw))
                     cam.set_scan_status("failed")
-                    print("[SCAN] board quad not found", flush=True)
+                    print("[SCAN] quad not found (check 2y_yellow_mask + 2y_markers)", flush=True)
                     time.sleep(0.2)
                     continue
 
