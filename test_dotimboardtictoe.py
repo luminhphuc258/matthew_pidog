@@ -641,7 +641,7 @@ tick();
 </body>
 </html>
 """
-    return html.replace("__CAM_W__", str(CAM_W)).replace("__CAM_H__", str(CAM_H))
+        return html.replace("__CAM_W__", str(CAM_W)).replace("__CAM_H__", str(CAM_H))
 
 
     def _mjpeg_gen(self):
