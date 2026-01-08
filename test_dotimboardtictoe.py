@@ -159,46 +159,34 @@ def build_grid_from_blue_lines(lines, frame_shape, cols: int = GRID_COLS, rows: 
     return {"x": v_lines, "y": h_lines, "lines": out_lines, "cells": cells, "rows": rows, "cols": cols}
 
 
-def _diag_lines_present(roi_edges, min_len):
-    lines = cv2.HoughLinesP(roi_edges, 1, np.pi / 180, threshold=20, minLineLength=min_len, maxLineGap=12)
-    if lines is None:
-        return False
-    pos = []
-    neg = []
-    for ln in lines:
-        x1, y1, x2, y2 = ln[0]
-        dx = x2 - x1
-        dy = y2 - y1
-        if dx == 0:
+def detect_x_centers_contour(frame_bgr):
+    h, w = frame_bgr.shape[:2]
+    if h < 40 or w < 40:
+        return []
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    th = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31, 5
+    )
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    lo = _parse_hsv_triplet(BLUE_LO, (85, 30, 30))
+    hi = _parse_hsv_triplet(BLUE_HI, (140, 255, 255))
+    blue_mask = cv2.inRange(hsv, lo, hi)
+    th[blue_mask > 0] = 0
+
+    cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    centers = []
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if area < 200 or area > 3000:
             continue
-        slope = dy / float(dx)
-        if DIAG_SLOPE_MIN <= slope <= DIAG_SLOPE_MAX:
-            pos.append((x1, y1, x2, y2))
-        elif -DIAG_SLOPE_MAX <= slope <= -DIAG_SLOPE_MIN:
-            neg.append((x1, y1, x2, y2))
-
-    def _cluster_midpoints(lines_set):
-        if not lines_set:
-            return []
-        mids = [((x1 + x2) / 2.0, (y1 + y2) / 2.0) for x1, y1, x2, y2 in lines_set]
-        tol = max(6, int(min_len * 0.4))
-        clusters = []
-        for mx, my in mids:
-            merged = False
-            for i, (cx, cy, cnt) in enumerate(clusters):
-                if abs(mx - cx) <= tol and abs(my - cy) <= tol:
-                    nx = (cx * cnt + mx) / (cnt + 1)
-                    ny = (cy * cnt + my) / (cnt + 1)
-                    clusters[i] = (nx, ny, cnt + 1)
-                    merged = True
-                    break
-            if not merged:
-                clusters.append((mx, my, 1))
-        return clusters
-
-    pos_c = _cluster_midpoints(pos)
-    neg_c = _cluster_midpoints(neg)
-    return bool(pos_c) and bool(neg_c)
+        x, y, bw, bh = cv2.boundingRect(c)
+        ar = bw / float(bh) if bh else 0
+        if 0.6 < ar < 1.6:
+            centers.append((x + bw // 2, y + bh // 2))
+    return centers
 
 
 def detect_board_state(frame_bgr, grid, rows: int, cols: int):
@@ -206,26 +194,20 @@ def detect_board_state(frame_bgr, grid, rows: int, cols: int):
     y_lines = grid["y"]
     board = [[0 for _ in range(cols)] for _ in range(rows)]
 
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(gray, 30, 110)
-
-    for r in range(rows):
-        for c in range(cols):
-            x0, x1 = x_lines[c], x_lines[c + 1]
-            y0, y1 = y_lines[r], y_lines[r + 1]
-            if x1 <= x0 or y1 <= y0:
-                continue
-            mx = max(2, int((x1 - x0) * 0.08))
-            my = max(2, int((y1 - y0) * 0.08))
-            xa, xb = x0 + mx, x1 - mx
-            ya, yb = y0 + my, y1 - my
-            if xb <= xa or yb <= ya:
-                continue
-            roi_edges = edges[ya:yb, xa:xb].copy()
-            min_len = int(min(xb - xa, yb - ya) * DIAG_MIN_RATIO)
-            if _diag_lines_present(roi_edges, min_len):
-                board[r][c] = 1
+    centers = detect_x_centers_contour(frame_bgr)
+    for cx, cy in centers:
+        c = -1
+        r = -1
+        for i in range(cols):
+            if x_lines[i] <= cx < x_lines[i + 1]:
+                c = i
+                break
+        for j in range(rows):
+            if y_lines[j] <= cy < y_lines[j + 1]:
+                r = j
+                break
+        if 0 <= r < rows and 0 <= c < cols:
+            board[r][c] = 1
     return board
 
 
