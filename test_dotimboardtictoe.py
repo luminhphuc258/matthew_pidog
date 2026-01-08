@@ -506,7 +506,7 @@ class CameraWeb:
             return Response(buf.tobytes(), mimetype="image/jpeg")
 
     def _html(self) -> str:
-    html = """<!doctype html>
+        html = """<!doctype html>
 <html>
 <head>
   <meta charset="utf-8"/>
