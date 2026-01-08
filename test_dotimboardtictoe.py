@@ -38,10 +38,10 @@ SCAN_API_URL = os.environ.get(
     "https://embeddedprogramming-healtheworldserver.up.railway.app/scan_chess",
 )
 
-# mở rộng quad bàn cờ thêm chút (thay “2cm” vì không có scale => ratio)
-BOARD_PAD_RATIO = float(os.environ.get("BOARD_PAD_RATIO", "0.06"))  # 0.04~0.10 tùy bạn
+# ✅ IMPORTANT: KHÔNG MỞ RỘNG QUAD NỮA (PAD=0)
+BOARD_PAD_RATIO = float(os.environ.get("BOARD_PAD_RATIO", "0.0"))
 
-# marker vàng HSV threshold (bạn có thể tinh chỉnh)
+# marker vàng HSV threshold
 Y_H_LO = int(os.environ.get("Y_H_LO", "18"))
 Y_S_LO = int(os.environ.get("Y_S_LO", "70"))
 Y_V_LO = int(os.environ.get("Y_V_LO", "70"))
@@ -49,7 +49,7 @@ Y_H_HI = int(os.environ.get("Y_H_HI", "40"))
 Y_S_HI = int(os.environ.get("Y_S_HI", "255"))
 Y_V_HI = int(os.environ.get("Y_V_HI", "255"))
 
-# lọc marker theo diện tích (px) - tùy camera
+# lọc marker theo diện tích (px)
 MARKER_AREA_MIN = int(os.environ.get("MARKER_AREA_MIN", "120"))
 MARKER_AREA_MAX = int(os.environ.get("MARKER_AREA_MAX", "20000"))
 
@@ -65,8 +65,9 @@ CANNY2 = int(os.environ.get("CANNY2", "160"))
 # morph params
 MORPH_K = int(os.environ.get("MORPH_K", "3"))
 
-# giảm giật: chỉ poll state chậm
-STATE_POLL_MS = int(os.environ.get("STATE_POLL_MS", "800"))
+# giảm giật: poll state chậm
+STATE_POLL_MS = int(os.environ.get("STATE_POLL_MS", "900"))
+
 
 # =========================
 # HTTP upload helper
@@ -79,7 +80,6 @@ def _encode_jpeg(img_bgr, quality=JPEG_QUALITY) -> bytes:
 
 
 def _post_image_to_api(image_bytes: bytes, timeout_sec: int = 25) -> Optional[Dict[str, Any]]:
-    """POST multipart image -> SCAN_API_URL, expecting JSON (optional)."""
     if not image_bytes:
         return None
 
@@ -125,7 +125,7 @@ def _post_image_to_api(image_bytes: bytes, timeout_sec: int = 25) -> Optional[Di
 # Geometry helpers
 # =========================
 def order_points_tl_tr_bl_br(pts: np.ndarray) -> np.ndarray:
-    """pts: (4,2) -> ordered: TL, TR, BL, BR"""
+    """pts: (4,2) -> TL, TR, BL, BR"""
     pts = np.array(pts, dtype=np.float32).reshape(4, 2)
     s = pts.sum(axis=1)
     diff = np.diff(pts, axis=1).reshape(-1)
@@ -138,25 +138,20 @@ def order_points_tl_tr_bl_br(pts: np.ndarray) -> np.ndarray:
 
 
 def pad_quad(quad: np.ndarray, pad_ratio: float) -> np.ndarray:
-    """
-    Mở rộng quad quanh tâm.
-    quad: (4,2) ordered or not (we'll treat as 4 points).
-    """
+    # pad_ratio mặc định = 0 => giữ nguyên
     q = np.array(quad, dtype=np.float32).reshape(4, 2)
     c = q.mean(axis=0)
     v = q - c
-    q2 = c + v * (1.0 + float(max(0.0, pad_ratio)))
+    q2 = c + v * (1.0 + float(pad_ratio))
     return q2
 
 
 def infer_4th_point_from_3(pts3: np.ndarray) -> Optional[np.ndarray]:
     """
-    Given 3 corners of a parallelogram/rectangle, infer 4th.
-    Robust: choose the pair with largest distance as diagonal (A,B),
-    third point is C, then D = A + B - C.
+    Given 3 corners, infer 4th using parallelogram:
+    choose largest distance pair as diagonal A,B, third is C => D=A+B-C
     """
     pts = np.array(pts3, dtype=np.float32).reshape(3, 2)
-    # pairwise distances
     d01 = np.linalg.norm(pts[0] - pts[1])
     d02 = np.linalg.norm(pts[0] - pts[2])
     d12 = np.linalg.norm(pts[1] - pts[2])
@@ -183,15 +178,11 @@ def clamp_points_to_image(pts: np.ndarray, w: int, h: int) -> np.ndarray:
 # Vision: marker detect
 # =========================
 def detect_yellow_markers(frame_bgr: np.ndarray) -> Tuple[List[Tuple[int, int]], np.ndarray, np.ndarray]:
-    """
-    Return list of marker centers [(x,y)], plus mask and debug image.
-    """
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     lo = np.array([Y_H_LO, Y_S_LO, Y_V_LO], dtype=np.uint8)
     hi = np.array([Y_H_HI, Y_S_HI, Y_V_HI], dtype=np.uint8)
     mask = cv2.inRange(hsv, lo, hi)
 
-    # clean noise
     k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
     mask = cv2.dilate(mask, k, iterations=1)
@@ -204,11 +195,12 @@ def detect_yellow_markers(frame_bgr: np.ndarray) -> Tuple[List[Tuple[int, int]],
         area = cv2.contourArea(c)
         if area < MARKER_AREA_MIN or area > MARKER_AREA_MAX:
             continue
+
         x, y, w, h = cv2.boundingRect(c)
         if w <= 2 or h <= 2:
             continue
+
         ar = w / float(h + 1e-6)
-        # marker là hình chữ nhật nhỏ, cho phép hơi dài
         if ar < 0.3 or ar > 3.5:
             continue
 
@@ -222,11 +214,10 @@ def detect_yellow_markers(frame_bgr: np.ndarray) -> Tuple[List[Tuple[int, int]],
         cv2.rectangle(dbg, (x, y), (x + w, y + h), (0, 0, 255), 2)
         cv2.circle(dbg, (cx, cy), 5, (0, 0, 255), -1)
 
-    # nếu nhiều hơn 4 -> lấy 4 điểm xa nhau nhất theo convex hull
+    # nếu >4: lấy 4 extreme corners từ hull
     if len(centers) > 4:
         pts = np.array(centers, dtype=np.int32)
         hull = cv2.convexHull(pts).reshape(-1, 2)
-        # nếu hull > 4, lấy 4 điểm theo extreme corners (sum/diff)
         if hull.shape[0] >= 4:
             s = hull.sum(axis=1)
             d = np.diff(hull, axis=1).reshape(-1)
@@ -252,64 +243,24 @@ def stage_gray_blur(frame_bgr: np.ndarray) -> np.ndarray:
 
 
 def stage_edges(gray_blur: np.ndarray) -> np.ndarray:
-    e = cv2.Canny(gray_blur, CANNY1, CANNY2)
-    return e
+    return cv2.Canny(gray_blur, CANNY1, CANNY2)
 
 
 def stage_edges_closed(edges: np.ndarray) -> np.ndarray:
     k = cv2.getStructuringElement(cv2.MORPH_RECT, (MORPH_K, MORPH_K))
-    # close để nối nét
     closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k, iterations=2)
-    # thêm 1 lần dilate nhẹ
     closed = cv2.dilate(closed, k, iterations=1)
     return closed
 
 
-def find_board_quad_from_edges(edges_closed: np.ndarray, min_area_ratio: float = 0.08) -> Optional[np.ndarray]:
-    """
-    Tìm 1 contour lớn nhất dạng tứ giác từ ảnh edges/closed.
-    (dùng khi marker fail)
-    """
-    h, w = edges_closed.shape[:2]
-    min_area = float(h * w) * float(min_area_ratio)
-
-    cnts, _ = cv2.findContours(edges_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    best = None
-    best_area = 0.0
-
-    for c in cnts:
-        area = cv2.contourArea(c)
-        if area < min_area:
-            continue
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) != 4:
-            continue
-        if area > best_area:
-            best_area = area
-            best = approx.reshape(4, 2)
-
-    if best is None:
-        return None
-    return np.array(best, dtype=np.float32)
-
-
 def compute_angle_from_quad(quad_ordered: np.ndarray) -> float:
-    """
-    Góc nghiêng dựa trên cạnh top (TL->TR)
-    """
     tl, tr = quad_ordered[0], quad_ordered[1]
     dx = float(tr[0] - tl[0])
     dy = float(tr[1] - tl[1])
-    ang = np.degrees(np.arctan2(dy, dx))
-    return float(ang)
+    return float(np.degrees(np.arctan2(dy, dx)))
 
 
 def warp_board(frame_bgr: np.ndarray, quad_ordered: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Warp board to WARP_W x WARP_H
-    Return: warped_bgr, H, Hinv
-    """
     src = quad_ordered.astype(np.float32)
     dst = np.array([
         [0, 0],
@@ -332,10 +283,6 @@ def draw_quad(frame_bgr: np.ndarray, quad_ordered: np.ndarray, color=(0, 255, 25
 
 
 def grid_cell_quads_in_original(Hinv: np.ndarray) -> List[List[np.ndarray]]:
-    """
-    Tạo quad cho mỗi cell trong hệ warp, rồi map ngược về ảnh gốc.
-    Return: cell_quads[row][col] = (4,2) float32 in original image space
-    """
     cell_quads = []
     for r in range(GRID_ROWS):
         row_list = []
@@ -359,9 +306,6 @@ def grid_cell_quads_in_original(Hinv: np.ndarray) -> List[List[np.ndarray]]:
 
 
 def make_cells_composite(warped_bgr: np.ndarray) -> np.ndarray:
-    """
-    Cắt tất cả ô từ warped, làm đậm viền, ghép thành 1 ảnh lớn để gửi endpoint.
-    """
     tiles = []
     for r in range(GRID_ROWS):
         row_tiles = []
@@ -372,7 +316,6 @@ def make_cells_composite(warped_bgr: np.ndarray) -> np.ndarray:
             y1 = (r + 1) * CELL_SIZE
             crop = warped_bgr[y0:y1, x0:x1].copy()
 
-            # làm đậm đường viền/nét: edges -> overlay
             g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
             g = cv2.GaussianBlur(g, (5, 5), 0)
             e = cv2.Canny(g, 60, 170)
@@ -380,17 +323,12 @@ def make_cells_composite(warped_bgr: np.ndarray) -> np.ndarray:
             e = cv2.dilate(e, k, iterations=1)
             e3 = cv2.cvtColor(e, cv2.COLOR_GRAY2BGR)
 
-            # invert edges to black lines on white-ish background: tùy bạn, ở đây giữ trắng trên đen
-            # trộn nhẹ để GPT thấy rõ nét
             combo = cv2.addWeighted(crop, 0.80, e3, 0.20, 0)
 
-            # label r,c lên tile
             cv2.putText(combo, f"({r},{c})", (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
-
             row_tiles.append(combo)
         tiles.append(np.hstack(row_tiles))
-    composite = np.vstack(tiles)
-    return composite
+    return np.vstack(tiles)
 
 
 # =========================
@@ -406,8 +344,6 @@ class BoardState:
         self._scan_status = "idle"
         self._angle = None
         self._scan_id = 0
-
-        # store last stages as jpeg bytes (only updated after scan)
         self._stages: Dict[str, bytes] = {}
 
     def set_scan(self, status: str, angle: Optional[float]):
@@ -428,7 +364,6 @@ class BoardState:
             self._scan_id += 1
 
     def set_stage(self, name: str, img_bgr_or_gray: np.ndarray):
-        # store as jpeg
         if img_bgr_or_gray is None:
             return
         if len(img_bgr_or_gray.shape) == 2:
@@ -551,7 +486,6 @@ class CameraWeb:
         cap.release()
 
     def _mjpeg_gen(self):
-        # live view; không nháy vì stages chỉ update sau scan
         while not self._stop.is_set():
             frame = self.get_last_frame()
             if frame is None:
@@ -569,7 +503,6 @@ class CameraWeb:
             time.sleep(0.05)
 
     def _html(self) -> str:
-        # tránh format() với JS braces => dùng placeholder
         html = """<!doctype html>
 <html>
 <head>
@@ -614,7 +547,7 @@ class CameraWeb:
 
         <div style="margin-top:10px;">
           <button class="btn" onclick="playScan()">Play Scan</button>
-          <div class="muted" style="margin-top:8px;">Tip: Web chỉ cập nhật ảnh stages sau khi scan xong để tránh giật.</div>
+          <div class="muted" style="margin-top:8px;">Stages chỉ update sau khi scan xong để tránh giật.</div>
         </div>
       </div>
     </div>
@@ -654,7 +587,8 @@ async function tick() {
     document.getElementById('rows').textContent = js.rows ?? '-';
     document.getElementById('cols').textContent = js.cols ?? '-';
     document.getElementById('scan_status').textContent = js.scan_status ?? '-';
-    document.getElementById('angle').textContent = (js.angle === null || js.angle === undefined) ? '-' : js.angle.toFixed(2);
+    document.getElementById('angle').textContent =
+      (js.angle === null || js.angle === undefined) ? '-' : js.angle.toFixed(2);
 
     document.getElementById('empty').textContent = js.empty ?? '-';
     document.getElementById('player').textContent = js.player ?? '-';
@@ -666,7 +600,6 @@ async function tick() {
     const scanId = js.scan_id ?? 0;
     if (scanId !== lastScanId) {
       lastScanId = scanId;
-      // chỉ reload stages khi scan_id đổi => không chớp liên tục
       setStage('s_marker_mask',  '/stage/marker_mask.jpg?sid=' + scanId);
       setStage('s_marker_dbg',   '/stage/marker_debug.jpg?sid=' + scanId);
       setStage('s_edges_closed', '/stage/edges_closed.jpg?sid=' + scanId);
@@ -700,7 +633,6 @@ tick();
 
     def start(self):
         threading.Thread(target=self._capture_loop, daemon=True).start()
-
         threading.Thread(
             target=lambda: self.app.run(
                 host="0.0.0.0",
@@ -711,10 +643,9 @@ tick();
             ),
             daemon=True,
         ).start()
-
         print(f"[WEB] http://<pi_ip>:{WEB_PORT}/", flush=True)
 
-    def wait_ready(self, timeout_sec: float = 5.0) -> bool:
+    def wait_ready(self, timeout_sec: float = 6.0) -> bool:
         self._ready.wait(timeout=max(0.1, float(timeout_sec)))
         return self._ready.is_set() and not self._failed.is_set()
 
@@ -727,11 +658,6 @@ def empty_board(rows: int, cols: int) -> List[List[int]]:
 
 
 def board_from_server_cells(rows: int, cols: int, result: Dict[str, Any]) -> Tuple[List[List[int]], str]:
-    """
-    Nếu endpoint trả cells kiểu:
-      cells: [{row, col, state}]
-    state: player_x / robot_o / empty ...
-    """
     board = empty_board(rows, cols)
     lines = []
     cells = result.get("cells", []) if isinstance(result, dict) else []
@@ -754,19 +680,16 @@ def board_from_server_cells(rows: int, cols: int, result: Dict[str, Any]) -> Tup
 
 
 def overlay_cells_quads(frame_bgr: np.ndarray, cell_quads: List[List[np.ndarray]], board: List[List[int]]) -> np.ndarray:
-    """
-    Vẽ quad từng cell theo đúng phối cảnh (project ngược từ warp).
-    """
     out = frame_bgr.copy()
     for r in range(GRID_ROWS):
         for c in range(GRID_COLS):
             q = cell_quads[r][c].astype(np.int32).reshape(-1, 1, 2)
             val = board[r][c]
             if val == 1:
-                color = (0, 255, 255)   # X
+                color = (0, 255, 255)
                 thickness = 2
             elif val == 2:
-                color = (255, 0, 255)   # O
+                color = (255, 0, 255)
                 thickness = 2
             else:
                 color = (60, 60, 90)
@@ -779,20 +702,9 @@ def overlay_cells_quads(frame_bgr: np.ndarray, cell_quads: List[List[np.ndarray]
 # Main scan pipeline
 # =========================
 def run_scan_pipeline(frame_bgr: np.ndarray, state: BoardState) -> Dict[str, Any]:
-    """
-    Pipeline:
-    - marker detect (4 or 3 -> infer 4th)
-    - fallback: find quad from edges
-    - pad quad
-    - warp
-    - edges/closed in warp (for debug)
-    - composite cells + send to endpoint
-    - overlay quad + cell quads onto original
-    """
     h, w = frame_bgr.shape[:2]
     state.clear_stages()
 
-    # 1) marker detect
     centers, marker_mask, marker_dbg = detect_yellow_markers(frame_bgr)
     state.set_stage("marker_mask", marker_mask)
     state.set_stage("marker_debug", marker_dbg)
@@ -809,50 +721,41 @@ def run_scan_pipeline(frame_bgr: np.ndarray, state: BoardState) -> Dict[str, Any
     else:
         quad = None
 
-    # 2) edges pipeline for fallback + debug
+    # edges debug only (không dùng để pad)
     gb = stage_gray_blur(frame_bgr)
     ed = stage_edges(gb)
     edc = stage_edges_closed(ed)
     state.set_stage("edges_closed", edc)
 
     if quad is None:
-        # fallback: find quad from edges
-        q2 = find_board_quad_from_edges(edc, min_area_ratio=0.06)
-        if q2 is not None:
-            quad = q2
-            quad_src = "edges"
-
-    if quad is None:
-        # fail
         fail_img = frame_bgr.copy()
-        cv2.putText(fail_img, "board quad NOT found", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 3, cv2.LINE_AA)
+        cv2.putText(fail_img, "marker quad NOT found", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 3, cv2.LINE_AA)
         state.set_stage("board_quad", fail_img)
         return {"ok": False, "reason": "quad_not_found"}
 
-    # 3) order + pad
     quad = clamp_points_to_image(quad, w, h)
     quad_ord = order_points_tl_tr_bl_br(quad)
-    quad_pad = pad_quad(quad_ord, BOARD_PAD_RATIO)
-    quad_pad = clamp_points_to_image(quad_pad, w, h)
-    quad_pad = order_points_tl_tr_bl_br(quad_pad)
 
-    angle = compute_angle_from_quad(quad_pad)
+    # ✅ NO PAD: giữ đúng vùng marker, chỉ rectify
+    if abs(BOARD_PAD_RATIO) > 1e-6:
+        quad_ord = pad_quad(quad_ord, BOARD_PAD_RATIO)
+        quad_ord = clamp_points_to_image(quad_ord, w, h)
+        quad_ord = order_points_tl_tr_bl_br(quad_ord)
 
-    # 4) warp
-    warped, H, Hinv = warp_board(frame_bgr, quad_pad)
+    angle = compute_angle_from_quad(quad_ord)
 
-    # show quad on original
-    board_quad_img = draw_quad(frame_bgr, quad_pad, color=(0,255,255), thickness=3)
-    cv2.putText(board_quad_img, f"angle={angle:.1f} src={quad_src}", (15, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0,255,255), 2, cv2.LINE_AA)
+    warped, H, Hinv = warp_board(frame_bgr, quad_ord)
+
+    board_quad_img = draw_quad(frame_bgr, quad_ord, color=(0,255,255), thickness=3)
+    cv2.putText(board_quad_img, f"angle={angle:.1f} src={quad_src} pad={BOARD_PAD_RATIO}", (15, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0,255,255), 2, cv2.LINE_AA)
+
     state.set_stage("board_quad", board_quad_img)
     state.set_stage("warp", warped)
 
-    # 5) build composite cells image (to send GPT/server)
     cells_comp = make_cells_composite(warped)
     state.set_stage("cells_composite", cells_comp)
 
-    # 6) send to endpoint
     api_result = _post_image_to_api(_encode_jpeg(cells_comp, quality=80))
     board = empty_board(GRID_ROWS, GRID_COLS)
     cells_text = "-"
@@ -860,17 +763,10 @@ def run_scan_pipeline(frame_bgr: np.ndarray, state: BoardState) -> Dict[str, Any
     if isinstance(api_result, dict) and (api_result.get("cells") is not None):
         board, cells_text = board_from_server_cells(GRID_ROWS, GRID_COLS, api_result)
     else:
-        # nếu server không trả cells, vẫn để board empty
-        if api_result is None:
-            cells_text = "[API] no response / parse fail"
-        else:
-            cells_text = "[API] returned but no 'cells' field"
+        cells_text = "[API] no 'cells' in response" if api_result is not None else "[API] no response"
 
-    # 7) overlay cell quads (project ngược)
     cell_quads = grid_cell_quads_in_original(Hinv)
     overlay_img = overlay_cells_quads(board_quad_img, cell_quads, board)
-
-    # update stage: board_quad now includes cell quads
     state.set_stage("board_quad", overlay_img)
 
     return {"ok": True, "angle": angle, "board": board, "cells_text": cells_text}
@@ -880,11 +776,11 @@ def run_scan_pipeline(frame_bgr: np.ndarray, state: BoardState) -> Dict[str, Any
 # Main loop
 # =========================
 def main():
-    print("[START] tictactoe_scan_4x6", flush=True)
+    print("[START] tictactoe_scan_4x6 (NO PAD)", flush=True)
     print(f"[CFG] SCAN_API_URL={SCAN_API_URL}", flush=True)
     print(f"[CFG] rows={GRID_ROWS} cols={GRID_COLS} warp={WARP_W}x{WARP_H} cell={CELL_SIZE}", flush=True)
     print(f"[CFG] ROTATE_180={ROTATE_180}", flush=True)
-    print(f"[CFG] BOARD_PAD_RATIO={BOARD_PAD_RATIO}", flush=True)
+    print(f"[CFG] BOARD_PAD_RATIO={BOARD_PAD_RATIO} (0.0 = giữ nguyên marker)", flush=True)
 
     state = BoardState(rows=GRID_ROWS, cols=GRID_COLS)
     cam = CameraWeb(state)
@@ -899,7 +795,6 @@ def main():
     try:
         while True:
             if cam.consume_scan_request():
-                # reset visible status immediately
                 state.set_scan("scanning", None)
                 state.set_board(empty_board(GRID_ROWS, GRID_COLS))
                 state.set_cells_text("-")
@@ -918,7 +813,6 @@ def main():
                     state.set_board(res.get("board", empty_board(GRID_ROWS, GRID_COLS)))
                     state.set_cells_text(res.get("cells_text", "-"))
 
-                # IMPORTANT: bump scan id at end so web reload stages exactly once
                 state.bump_scan_id()
 
             time.sleep(0.05)
