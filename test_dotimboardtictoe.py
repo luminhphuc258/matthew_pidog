@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 import os
 import time
@@ -66,10 +64,6 @@ MARKER_MIN_SIDE = int(os.environ.get("MARKER_MIN_SIDE", "8"))       # w/h min
 # “corner preference”
 CORNER_BAND = float(os.environ.get("CORNER_BAND", "0.22"))  # vùng góc (22% ảnh)
 TOP_NOISE_REJECT_Y = float(os.environ.get("TOP_NOISE_REJECT_Y", "0.10"))  # loại nhiễu nằm quá sát mép trên (10%)
-
-# ✅ NEW: adaptive filter để loại marker nhiễu nhỏ ở mép trên
-# giữ những marker có area >= max_area * AREA_KEEP_FRAC
-AREA_KEEP_FRAC = float(os.environ.get("AREA_KEEP_FRAC", "0.35"))  # 0.30~0.50 tuỳ thực tế
 
 # board bbox padding (giữ 0 nếu muốn đúng “vùng góc”)
 BBOX_PAD_PX = int(os.environ.get("BBOX_PAD_PX", "0"))  # bạn muốn fixed => 0
@@ -231,6 +225,7 @@ class MarkerBoardDetector:
 
             # reject noisy yellow objects too close to top edge
             if cy < TOP_NOISE_REJECT_Y * h:
+                # vẫn vẽ nhưng đánh dấu là reject
                 box = cv2.boxPoints(rect).astype(np.int32)
                 cv2.drawContours(dbg, [box], -1, (0, 0, 255), 2)
                 cv2.circle(dbg, (int(cx), int(cy)), 4, (0, 0, 255), -1)
@@ -253,8 +248,8 @@ class MarkerBoardDetector:
     def _pick_best_4_by_corners(self, candidates: List[Dict[str, Any]], w: int, h: int) -> List[np.ndarray]:
         """
         Chọn 4 marker đúng bằng scoring theo 4 góc ảnh.
+        Ý tưởng: marker góc TL gần (0,0), TR gần (w,0), BR gần (w,h), BL gần (0,h)
         + ưu tiên nằm trong vùng góc (CORNER_BAND)
-        + penalty nếu nằm ngược phía
         """
         if not candidates:
             return []
@@ -286,6 +281,7 @@ class MarkerBoardDetector:
         picked = {}
         used = set()
 
+        # greedy pick per corner
         for key in ["tl", "tr", "br", "bl"]:
             best_i = None
             best_score = 1e18
@@ -293,9 +289,10 @@ class MarkerBoardDetector:
                 if i in used:
                     continue
                 d = float(np.linalg.norm(pt - corners[key]))
+                # bonus nếu nằm trong band góc
                 if in_corner_band(pt, key):
                     d *= 0.65
-
+                # penalty nếu nằm "ngược phía"
                 if key in ("tl", "bl") and pt[0] > w * 0.75:
                     d *= 2.0
                 if key in ("tr", "br") and pt[0] < w * 0.25:
@@ -313,10 +310,12 @@ class MarkerBoardDetector:
                 picked[key] = centers[best_i]
                 used.add(best_i)
 
+        # trả ra theo thứ tự TL TR BR BL (chỉ những cái có)
         out = []
         for key in ["tl", "tr", "br", "bl"]:
             if key in picked:
                 out.append(picked[key])
+
         return out
 
     def _infer_4th(self, pts3: List[np.ndarray]) -> Optional[np.ndarray]:
@@ -327,6 +326,7 @@ class MarkerBoardDetector:
         pts = np.array(pts3, dtype=np.float32)
         cen = pts.mean(axis=0)
 
+        # classify into TL/TR/BR/BL using centroid quadrant
         slots = {}
         for p in pts:
             if p[0] < cen[0] and p[1] < cen[1]:
@@ -341,6 +341,7 @@ class MarkerBoardDetector:
         keys = {"tl", "tr", "br", "bl"}
         missing = list(keys - set(slots.keys()))
         if len(missing) != 1:
+            # fallback generic
             p0, p1, p2 = pts
             return p0 + p2 - p1
 
@@ -365,37 +366,19 @@ class MarkerBoardDetector:
         h, w = frame_bgr.shape[:2]
 
         ex = self._extract_candidates(frame_bgr)
-        cand_all = ex["candidates"]
+        cand = ex["candidates"]
 
+        # debug stage
         dbg = ex["debug"].copy()
         mask = ex["mask"]
 
-        # ==========================================================
-        # ✅ FIX CHÍNH: loại marker nhiễu nhỏ ở mép trên bằng area ratio
-        # ==========================================================
-        cand = cand_all
-        if len(cand_all) >= 4:
-            max_area = max(c["area"] for c in cand_all)
-            keep_thr = max_area * max(0.05, min(0.90, AREA_KEEP_FRAC))
-            cand_big = [c for c in cand_all if c["area"] >= keep_thr]
-
-            # vẽ info lên debug
-            cv2.putText(dbg, f"max_area={int(max_area)} keep>={int(keep_thr)} n_big={len(cand_big)}",
-                        (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
-
-            # nếu lọc mà vẫn đủ 4 -> dùng cand_big (để loại nhiễu nhỏ)
-            # nếu lọc quá mạnh (<4) -> fallback lại cand_all
-            if len(cand_big) >= 4:
-                cand = cand_big
-            else:
-                cand = cand_all
-
-        # pick best 4 by corner scoring (trên danh sách đã lọc)
+        # pick best 4 by corner scoring
         picked = self._pick_best_4_by_corners(cand, w, h)
 
-        # fallback: nếu vẫn thiếu 4 nhưng tổng cand_all >=4 thì dùng top theo area
-        if len(picked) < 4 and len(cand_all) >= 4:
-            cand2 = sorted(cand_all, key=lambda x: x["area"], reverse=True)[:8]
+        # if more than 4 candidates exist and picked size < 4,
+        # still allow fallback: take top by area then corner scoring again
+        if len(picked) < 4 and len(cand) >= 4:
+            cand2 = sorted(cand, key=lambda x: x["area"], reverse=True)[:8]
             picked = self._pick_best_4_by_corners(cand2, w, h)
 
         inferred = None
@@ -415,6 +398,7 @@ class MarkerBoardDetector:
             }
 
         centers4 = np.array(picked[:4], dtype=np.float32)
+        # reorder
         centers4 = order_points_4(centers4)
 
         # draw centers
@@ -423,12 +407,14 @@ class MarkerBoardDetector:
             cv2.putText(dbg, f"C{i}", (int(p[0]) + 6, int(p[1]) - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
+        # make upright rectangle bbox from 4 centers
         bbox = bbox_from_centers(centers4, w, h, pad_px=BBOX_PAD_PX)
         bbox = smooth_bbox(self.prev_bbox, bbox, BBOX_SMOOTH_ALPHA)
         self.prev_bbox = bbox
 
         x0, y0, x1, y1 = bbox
 
+        # draw rectangle (yellow)
         out = frame_bgr.copy()
         cv2.rectangle(out, (x0, y0), (x1, y1), (0, 255, 255), 2)
         cv2.putText(out, "board_bbox (marker-only)", (x0 + 10, max(20, y0 - 10)),
@@ -771,7 +757,6 @@ def main():
     print(f"[CFG] ROTATE_180={ROTATE_180}", flush=True)
     print(f"[CFG] HSV H[{Y_H_MIN},{Y_H_MAX}] S[{Y_S_MIN},{Y_S_MAX}] V[{Y_V_MIN},{Y_V_MAX}]", flush=True)
     print(f"[CFG] TOP_NOISE_REJECT_Y={TOP_NOISE_REJECT_Y} CORNER_BAND={CORNER_BAND}", flush=True)
-    print(f"[CFG] AREA_KEEP_FRAC={AREA_KEEP_FRAC}", flush=True)
 
     board = BoardState(rows=GRID_ROWS, cols=GRID_COLS)
     cam = CameraWeb(board)
@@ -819,9 +804,11 @@ def main():
             bbox = det["bbox"]
             stages["4_board_bbox"] = det.get("board_bbox_img")
 
+            # warp only from bbox rectangle
             warp = warp_rect(frame, bbox)
             stages["5_warp"] = warp
 
+            # ✅ send ONLY 4_board_bbox and 5_warp (no edges)
             board_bbox_img = stages["4_board_bbox"]
             bw = warp.shape[1]
             bh = int(round(board_bbox_img.shape[0] * (bw / max(1, board_bbox_img.shape[1]))))
