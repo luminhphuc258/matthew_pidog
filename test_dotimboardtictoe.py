@@ -20,6 +20,11 @@ ROTATE_180 = str(os.environ.get("CAM_ROTATE_180", "1")).lower() in ("1", "true",
 
 GRID_COLS = int(os.environ.get("GRID_COLS", "4"))
 GRID_ROWS = int(os.environ.get("GRID_ROWS", "6"))
+BLUE_LO = os.environ.get("BLUE_LO", "85,30,30")
+BLUE_HI = os.environ.get("BLUE_HI", "140,255,255")
+DIAG_MIN_RATIO = float(os.environ.get("DIAG_MIN_RATIO", "0.25"))
+DIAG_SLOPE_MIN = float(os.environ.get("DIAG_SLOPE_MIN", "0.5"))
+DIAG_SLOPE_MAX = float(os.environ.get("DIAG_SLOPE_MAX", "2.0"))
 
 
 def _cluster_positions(pos, tol):
@@ -57,15 +62,28 @@ def _evenly_spaced(min_v: int, max_v: int, count: int):
     return [int(round(min_v + step * i)) for i in range(count)]
 
 
+def _parse_hsv_triplet(val: str, fallback: Tuple[int, int, int]):
+    try:
+        parts = [int(x.strip()) for x in val.split(",")]
+        if len(parts) == 3:
+            return tuple(parts)
+    except Exception:
+        pass
+    return fallback
+
+
 def detect_blue_lines(frame_bgr):
     h, w = frame_bgr.shape[:2]
     if h < 40 or w < 40:
         return []
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    blue_mask = cv2.inRange(hsv, (90, 70, 60), (130, 255, 255))
-    edges = cv2.Canny(blue_mask, 50, 150)
-    min_len = int(min(w, h) * 0.25)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=50, minLineLength=min_len, maxLineGap=25)
+    lo = _parse_hsv_triplet(BLUE_LO, (85, 30, 30))
+    hi = _parse_hsv_triplet(BLUE_HI, (140, 255, 255))
+    blue_mask = cv2.inRange(hsv, lo, hi)
+    blue_mask = cv2.medianBlur(blue_mask, 5)
+    edges = cv2.Canny(blue_mask, 30, 120)
+    min_len = int(min(w, h) * 0.18)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=25, minLineLength=min_len, maxLineGap=35)
     if lines is None:
         return []
 
@@ -142,7 +160,7 @@ def build_grid_from_blue_lines(lines, frame_shape, cols: int = GRID_COLS, rows: 
 
 
 def _diag_lines_present(roi_edges, min_len):
-    lines = cv2.HoughLinesP(roi_edges, 1, np.pi / 180, threshold=25, minLineLength=min_len, maxLineGap=10)
+    lines = cv2.HoughLinesP(roi_edges, 1, np.pi / 180, threshold=20, minLineLength=min_len, maxLineGap=12)
     if lines is None:
         return False
     pos = []
@@ -154,11 +172,33 @@ def _diag_lines_present(roi_edges, min_len):
         if dx == 0:
             continue
         slope = dy / float(dx)
-        if 0.6 <= slope <= 1.6:
+        if DIAG_SLOPE_MIN <= slope <= DIAG_SLOPE_MAX:
             pos.append((x1, y1, x2, y2))
-        elif -1.6 <= slope <= -0.6:
+        elif -DIAG_SLOPE_MAX <= slope <= -DIAG_SLOPE_MIN:
             neg.append((x1, y1, x2, y2))
-    return bool(pos) and bool(neg)
+
+    def _cluster_midpoints(lines_set):
+        if not lines_set:
+            return []
+        mids = [((x1 + x2) / 2.0, (y1 + y2) / 2.0) for x1, y1, x2, y2 in lines_set]
+        tol = max(6, int(min_len * 0.4))
+        clusters = []
+        for mx, my in mids:
+            merged = False
+            for i, (cx, cy, cnt) in enumerate(clusters):
+                if abs(mx - cx) <= tol and abs(my - cy) <= tol:
+                    nx = (cx * cnt + mx) / (cnt + 1)
+                    ny = (cy * cnt + my) / (cnt + 1)
+                    clusters[i] = (nx, ny, cnt + 1)
+                    merged = True
+                    break
+            if not merged:
+                clusters.append((mx, my, 1))
+        return clusters
+
+    pos_c = _cluster_midpoints(pos)
+    neg_c = _cluster_midpoints(neg)
+    return bool(pos_c) and bool(neg_c)
 
 
 def detect_board_state(frame_bgr, grid, rows: int, cols: int):
@@ -166,10 +206,9 @@ def detect_board_state(frame_bgr, grid, rows: int, cols: int):
     y_lines = grid["y"]
     board = [[0 for _ in range(cols)] for _ in range(rows)]
 
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    blue_mask = cv2.inRange(hsv, (90, 70, 60), (130, 255, 255))
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 50, 150)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 30, 110)
 
     for r in range(rows):
         for c in range(cols):
@@ -177,22 +216,29 @@ def detect_board_state(frame_bgr, grid, rows: int, cols: int):
             y0, y1 = y_lines[r], y_lines[r + 1]
             if x1 <= x0 or y1 <= y0:
                 continue
-            mx = max(2, int((x1 - x0) * 0.12))
-            my = max(2, int((y1 - y0) * 0.12))
+            mx = max(2, int((x1 - x0) * 0.08))
+            my = max(2, int((y1 - y0) * 0.08))
             xa, xb = x0 + mx, x1 - mx
             ya, yb = y0 + my, y1 - my
             if xb <= xa or yb <= ya:
                 continue
             roi_edges = edges[ya:yb, xa:xb].copy()
-            roi_blue = blue_mask[ya:yb, xa:xb]
-            roi_edges[roi_blue > 0] = 0
-            min_len = int(min(xb - xa, yb - ya) * 0.45)
+            min_len = int(min(xb - xa, yb - ya) * DIAG_MIN_RATIO)
             if _diag_lines_present(roi_edges, min_len):
                 board[r][c] = 1
     return board
 
 
-def draw_board_overlay(frame_bgr, blue_lines=None, cells=None):
+def draw_board_overlay(frame_bgr, blue_lines=None, cells=None, board=None):
+    if board and cells:
+        overlay = frame_bgr.copy()
+        for cell in cells:
+            r = cell["r"]
+            c = cell["c"]
+            if 0 <= r < len(board) and 0 <= c < len(board[r]) and board[r][c] == 1:
+                x0, y0, x1, y1 = cell["x0"], cell["y0"], cell["x1"], cell["y1"]
+                cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 255, 255), -1)
+        cv2.addWeighted(overlay, 0.35, frame_bgr, 0.65, 0, frame_bgr)
     if blue_lines:
         for x1, y1, x2, y2 in blue_lines:
             cv2.line(frame_bgr, (x1, y1), (x2, y2), (80, 220, 80), 1)
@@ -430,10 +476,10 @@ tick();
             if grid:
                 board = detect_board_state(frame, grid, self.board.rows, self.board.cols)
                 self.board.set_board(board)
-                draw_board_overlay(frame, blue_lines=grid.get("lines"), cells=grid.get("cells"))
+                draw_board_overlay(frame, blue_lines=grid.get("lines"), cells=grid.get("cells"), board=board)
             else:
                 blue_lines = detect_blue_lines(frame)
-                draw_board_overlay(frame, blue_lines=blue_lines, cells=None)
+                draw_board_overlay(frame, blue_lines=blue_lines, cells=None, board=None)
 
             with self._lock:
                 self._last = frame
