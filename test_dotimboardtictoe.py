@@ -46,11 +46,22 @@ HILITE_ALPHA = float(os.environ.get("HILITE_ALPHA", "0.28"))
 MIN_R_RATIO = float(os.environ.get("MIN_R_RATIO", "0.12"))
 MAX_R_RATIO = float(os.environ.get("MAX_R_RATIO", "0.30"))
 
-# HSV blue range (tuned for blue marker tape/pen)
+# HSV blue range (grid line)
 BLUE_H_LO = int(os.environ.get("BLUE_H_LO", "85"))
 BLUE_H_HI = int(os.environ.get("BLUE_H_HI", "140"))
 BLUE_S_LO = int(os.environ.get("BLUE_S_LO", "55"))
 BLUE_V_LO = int(os.environ.get("BLUE_V_LO", "50"))
+
+# ===== NEW: HSV yellow corner marker range =====
+# (tune nếu marker vàng khác tông)
+YEL_H_LO = int(os.environ.get("YEL_H_LO", "18"))
+YEL_H_HI = int(os.environ.get("YEL_H_HI", "45"))
+YEL_S_LO = int(os.environ.get("YEL_S_LO", "70"))
+YEL_V_LO = int(os.environ.get("YEL_V_LO", "80"))
+
+# Minimum marker area ratio (so it won't pick noise)
+MIN_MARKER_AREA_RATIO = float(os.environ.get("MIN_MARKER_AREA_RATIO", "0.0015"))  # ~0.15% frame
+MAX_MARKER_AREA_RATIO = float(os.environ.get("MAX_MARKER_AREA_RATIO", "0.08"))    # ~8% frame
 
 # Adaptive threshold params
 ADAPT_BLOCK = int(os.environ.get("ADAPT_BLOCK", "31"))  # must be odd
@@ -185,33 +196,26 @@ def edges_combo(frame_bgr: np.ndarray) -> Tuple[np.ndarray, Dict[str, np.ndarray
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     stages["1_gray"] = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
-    # blur nhẹ hơn để không mất nét
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     stages["2_blur"] = cv2.cvtColor(blur, cv2.COLOR_GRAY2BGR)
 
-    # auto canny trên gray
     e_gray = auto_canny(blur, sigma=0.33)
     stages["3_edges_gray"] = cv2.cvtColor(e_gray, cv2.COLOR_GRAY2BGR)
 
-    # adaptive threshold bắt nét bút / đường tối
     th = adaptive_lines(gray)
     stages["2b_adapt_thresh"] = cv2.cvtColor(th, cv2.COLOR_GRAY2BGR)
 
-    # blue mask bắt đường xanh (grid)
     m_blue = hsv_blue_mask(frame_bgr)
     stages["2hsv_blue_mask"] = cv2.cvtColor(m_blue, cv2.COLOR_GRAY2BGR)
 
-    # edges từ blue mask (bằng canny hoặc gradient)
     m_blur = cv2.GaussianBlur(m_blue, (5, 5), 0)
     e_blue = cv2.Canny(m_blur, 40, 120)
     stages["3b_edges_blue"] = cv2.cvtColor(e_blue, cv2.COLOR_GRAY2BGR)
 
-    # OR tất cả lại
     combo = cv2.bitwise_or(e_gray, e_blue)
     combo = cv2.bitwise_or(combo, th)
     stages["3c_edges_combo"] = cv2.cvtColor(combo, cv2.COLOR_GRAY2BGR)
 
-    # nối cạnh bị đứt
     k = np.ones((3, 3), np.uint8)
     if EDGE_DILATE > 0:
         combo = cv2.dilate(combo, k, iterations=EDGE_DILATE)
@@ -222,10 +226,6 @@ def edges_combo(frame_bgr: np.ndarray) -> Tuple[np.ndarray, Dict[str, np.ndarray
     return combo, stages
 
 def find_board_quad_from_edges(edges: np.ndarray) -> Optional[np.ndarray]:
-    """
-    Tìm contour lớn nhất và approx 4 điểm.
-    Dùng edges đã được "closed" => ổn định hơn.
-    """
     cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return None
@@ -247,7 +247,6 @@ def find_board_quad_from_edges(edges: np.ndarray) -> Optional[np.ndarray]:
 
         approx = cv2.approxPolyDP(c, 0.02 * peri, True)
         if len(approx) != 4:
-            # thử nới lỏng chút
             approx2 = cv2.approxPolyDP(c, 0.03 * peri, True)
             if len(approx2) != 4:
                 continue
@@ -255,7 +254,6 @@ def find_board_quad_from_edges(edges: np.ndarray) -> Optional[np.ndarray]:
 
         pts = approx.reshape(4, 2).astype(np.float32)
 
-        # aspect ratio check
         x, y, w, h = cv2.boundingRect(approx)
         if h <= 1 or w <= 1:
             continue
@@ -271,6 +269,84 @@ def find_board_quad_from_edges(edges: np.ndarray) -> Optional[np.ndarray]:
     if best is None:
         return None
     return order_points(best)
+
+# =========================
+# NEW: Yellow corner marker quad
+# =========================
+def hsv_yellow_mask(bgr: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    lower = np.array([YEL_H_LO, YEL_S_LO, YEL_V_LO], dtype=np.uint8)
+    upper = np.array([YEL_H_HI, 255, 255], dtype=np.uint8)
+    mask = cv2.inRange(hsv, lower, upper)
+    k = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
+    return mask
+
+def find_quad_from_yellow_markers(frame_bgr: np.ndarray) -> Tuple[Optional[np.ndarray], Dict[str, np.ndarray]]:
+    """
+    Return (quad, stage_images). quad is 4 points (tl,tr,br,bl) in image coords.
+    Use 4 largest yellow blobs as markers.
+    """
+    st = {}
+    mask = hsv_yellow_mask(frame_bgr)
+    st["2y_yellow_mask"] = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+
+    H, W = mask.shape[:2]
+    img_area = float(H * W)
+    minA = MIN_MARKER_AREA_RATIO * img_area
+    maxA = MAX_MARKER_AREA_RATIO * img_area
+
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cand = []
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if area < minA or area > maxA:
+            continue
+
+        rect = cv2.minAreaRect(c)
+        (cx, cy), (rw, rh), ang = rect
+        if rw <= 1 or rh <= 1:
+            continue
+        ar = max(rw, rh) / (min(rw, rh) + 1e-6)
+        # marker thường gần vuông/HCN, cho phép hơi dài
+        if ar > 3.5:
+            continue
+
+        cand.append((area, (cx, cy), rect, c))
+
+    cand.sort(key=lambda x: x[0], reverse=True)
+    if len(cand) < 4:
+        dbg = frame_bgr.copy()
+        cv2.putText(dbg, f"yellow markers found: {len(cand)}/4", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        st["2y_markers"] = dbg
+        return None, st
+
+    # lấy 4 marker lớn nhất
+    pts = np.array([cand[i][1] for i in range(4)], dtype=np.float32)
+    quad = order_points(pts)
+
+    dbg = frame_bgr.copy()
+    # draw centers
+    for i, (x, y) in enumerate(quad):
+        cv2.circle(dbg, (int(x), int(y)), 8, (0, 255, 255), -1)
+        cv2.putText(dbg, str(i), (int(x) + 6, int(y) - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    cv2.polylines(dbg, [quad.astype(np.int32)], True, (0, 255, 255), 2)
+    cv2.putText(dbg, "quad from yellow markers", (10, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    st["2y_markers"] = dbg
+
+    # sanity check: quad area enough
+    if polygon_area(quad) < 0.08 * img_area:
+        dbg2 = dbg.copy()
+        cv2.putText(dbg2, "yellow quad too small (check markers size/HSV)", (10, 75),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
+        st["2y_markers"] = dbg2
+        return None, st
+
+    return quad, st
 
 # =========================
 # Vision helpers (warp stages)
@@ -376,17 +452,35 @@ class ScanPipeline:
     def run(self, frame_bgr: np.ndarray) -> Dict[str, Any]:
         stages: Dict[str, np.ndarray] = {}
 
-        # Build robust edges
+        # 0) Try yellow marker quad first
+        quad_yel, st_yel = find_quad_from_yellow_markers(frame_bgr)
+        stages.update(st_yel)
+
+        # 1) Build robust edges (keep old flow)
         edges, st = edges_combo(frame_bgr)
         stages.update(st)
 
-        # find quad
-        quad = find_board_quad_from_edges(cv2.cvtColor(stages["3d_edges_closed"], cv2.COLOR_BGR2GRAY))
+        # 2) choose quad
+        quad = None
+        quad_src = "none"
+
+        if quad_yel is not None:
+            quad = quad_yel
+            quad_src = "yellow"
+        else:
+            # fallback to old contour-based quad
+            edges_gray = cv2.cvtColor(stages["3d_edges_closed"], cv2.COLOR_BGR2GRAY)
+            quad2 = find_board_quad_from_edges(edges_gray)
+            if quad2 is not None:
+                quad = quad2
+                quad_src = "edges"
+
         if quad is None:
-            # show debug board stage
             dbg = frame_bgr.copy()
             cv2.putText(dbg, "board quad NOT found", (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.putText(dbg, "tip: tune YEL_* or marker size", (10, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
             stages["4_board"] = dbg
             return {"found": False, "stages": stages}
 
@@ -394,7 +488,7 @@ class ScanPipeline:
 
         board_vis = frame_bgr.copy()
         cv2.polylines(board_vis, [quad.astype(np.int32)], True, (0, 255, 255), 2)
-        cv2.putText(board_vis, f"angle={angle:.1f}", (10, 25),
+        cv2.putText(board_vis, f"angle={angle:.1f} src={quad_src}", (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         stages["4_board"] = board_vis
 
@@ -814,12 +908,11 @@ tick();
 # Main
 # =========================
 def main():
-    print("[START] scan_board_4x6_pipeline (robust edges)", flush=True)
+    print("[START] scan_board_4x6_pipeline (yellow markers preferred)", flush=True)
     print(f"[CFG] GRID_ROWS={GRID_ROWS} GRID_COLS={GRID_COLS}", flush=True)
     print(f"[CFG] CAM={CAM_W}x{CAM_H}@{CAM_FPS} rotate180={ROTATE_180}", flush=True)
-    print(f"[CFG] HSV blue H[{BLUE_H_LO},{BLUE_H_HI}] S>={BLUE_S_LO} V>={BLUE_V_LO}", flush=True)
-    print(f"[CFG] ADAPT block={ADAPT_BLOCK} C={ADAPT_C}", flush=True)
-    print(f"[CFG] EDGE dilate={EDGE_DILATE} close={EDGE_CLOSE}", flush=True)
+    print(f"[CFG] YELLOW HSV H[{YEL_H_LO},{YEL_H_HI}] S>={YEL_S_LO} V>={YEL_V_LO}", flush=True)
+    print(f"[CFG] BLUE HSV   H[{BLUE_H_LO},{BLUE_H_HI}] S>={BLUE_S_LO} V>={BLUE_V_LO}", flush=True)
     print(f"[CFG] SCAN_API_URL={SCAN_API_URL}", flush=True)
 
     board = BoardState(rows=GRID_ROWS, cols=GRID_COLS)
