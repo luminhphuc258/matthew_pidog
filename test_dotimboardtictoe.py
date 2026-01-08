@@ -11,6 +11,7 @@ import urllib.error
 from typing import List, Optional, Tuple, Dict, Any
 
 import cv2
+import numpy as np
 from flask import Flask, Response, jsonify
 
 # =========================
@@ -18,12 +19,13 @@ from flask import Flask, Response, jsonify
 # =========================
 WEB_PORT = 8000
 CAM_DEV = os.environ.get("CAM_DEV", "0")
-CAM_W = int(os.environ.get("CAM_W", "320"))
-CAM_H = int(os.environ.get("CAM_H", "240"))
+CAM_W = int(os.environ.get("CAM_W", "640"))
+CAM_H = int(os.environ.get("CAM_H", "480"))
 CAM_FPS = int(os.environ.get("CAM_FPS", "15"))
 JPEG_QUALITY = int(os.environ.get("CAM_JPEG_QUALITY", "70"))
-ROTATE_180 = str(os.environ.get("CAM_ROTATE_180", "1")).lower() in ("1", "true", "yes", "on")
+ROTATE_180 = str(os.environ.get("CAM_ROTATE_180", "0")).lower() in ("1", "true", "yes", "on")
 
+# ✅ Board size: 4x6
 GRID_COLS = int(os.environ.get("GRID_COLS", "4"))
 GRID_ROWS = int(os.environ.get("GRID_ROWS", "6"))
 
@@ -32,24 +34,16 @@ SCAN_API_URL = os.environ.get(
     "https://embeddedprogramming-healtheworldserver.up.railway.app/scan_chess",
 )
 
-# ✅ NEW: endpoint đã fix row/col rồi => client KHÔNG offset nữa
-# Nếu bạn muốn, vẫn có thể set = 0/0; code này không dùng.
-CELL_ROW_OFFSET = int(os.environ.get("CELL_ROW_OFFSET", "0"))
-CELL_COL_OFFSET = int(os.environ.get("CELL_COL_OFFSET", "0"))
+# Warp output size (top-down). Keep square for easier mapping.
+WARP_SIZE = int(os.environ.get("WARP_SIZE", "520"))
 
-# Nếu overlay bị lệch pixel do camera crop/rotate, chỉnh 2 biến này:
-DRAW_X_OFF_X = int(os.environ.get("DRAW_X_OFF_X", "0"))
-DRAW_X_OFF_Y = int(os.environ.get("DRAW_X_OFF_Y", "0"))
+# Highlight alpha
+HILITE_ALPHA = float(os.environ.get("HILITE_ALPHA", "0.28"))
 
-# inset để highlight không che đường kẻ
-HILITE_INSET_RATIO = float(os.environ.get("HILITE_INSET_RATIO", "0.12"))
-
-# Nếu muốn co grid_bbox một chút (tránh bbox ăn nhầm viền):
-GRID_INSET_TOP = float(os.environ.get("GRID_INSET_TOP", "0.00"))      # ratio 0..0.2
-GRID_INSET_BOTTOM = float(os.environ.get("GRID_INSET_BOTTOM", "0.00"))# ratio 0..0.2
-GRID_INSET_LEFT = float(os.environ.get("GRID_INSET_LEFT", "0.00"))    # ratio 0..0.2
-GRID_INSET_RIGHT = float(os.environ.get("GRID_INSET_RIGHT", "0.00"))  # ratio 0..0.2
-
+# Circle radius filter relative to cell size
+# (tune a bit depending camera distance)
+MIN_R_RATIO = float(os.environ.get("MIN_R_RATIO", "0.12"))
+MAX_R_RATIO = float(os.environ.get("MAX_R_RATIO", "0.30"))
 
 # =========================
 # HTTP upload helper
@@ -59,7 +53,6 @@ def _encode_frame_jpeg(frame_bgr) -> bytes:
     if not ok:
         return b""
     return buf.tobytes()
-
 
 def _post_image_to_api(image_bytes: bytes) -> Optional[Dict[str, Any]]:
     if not image_bytes:
@@ -102,189 +95,335 @@ def _post_image_to_api(image_bytes: bytes) -> Optional[Dict[str, Any]]:
         print(f"[SCAN] parse failed: {exc}", flush=True)
         return None
 
-
 # =========================
 # Geometry helpers
 # =========================
-def _bbox_to_pixels(bbox, w: int, h: int) -> Optional[Tuple[int, int, int, int]]:
+def order_points(pts: np.ndarray) -> np.ndarray:
     """
-    Accept bbox normalized [0..1] or pixel coords.
-    Return (x0,y0,x1,y1) in pixels.
+    pts: (4,2) float32 -> order tl, tr, br, bl
     """
-    if not bbox or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+    pts = np.asarray(pts, dtype=np.float32)
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1).reshape(-1)
+
+    tl = pts[np.argmin(s)]
+    br = pts[np.argmax(s)]
+    tr = pts[np.argmin(diff)]
+    bl = pts[np.argmax(diff)]
+    return np.array([tl, tr, br, bl], dtype=np.float32)
+
+def polygon_area(pts: np.ndarray) -> float:
+    pts = pts.reshape(-1, 2)
+    x = pts[:, 0]; y = pts[:, 1]
+    return float(0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+def find_board_quad(edges: np.ndarray) -> Optional[np.ndarray]:
+    """
+    edges: binary canny image
+    return quad points (4,2) float32 in image coords
+    """
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
         return None
-    try:
-        x0, y0, x1, y1 = [float(x) for x in bbox]
-    except Exception:
-        return None
 
-    # normalized [0..1]
-    if max(abs(x0), abs(y0), abs(x1), abs(y1)) <= 1.5:
-        x0 = int(round(x0 * w))
-        x1 = int(round(x1 * w))
-        y0 = int(round(y0 * h))
-        y1 = int(round(y1 * h))
-    else:
-        x0 = int(round(x0))
-        x1 = int(round(x1))
-        y0 = int(round(y0))
-        y1 = int(round(y1))
+    H, W = edges.shape[:2]
+    img_area = float(H * W)
 
-    x0 = max(0, min(w - 1, x0))
-    x1 = max(0, min(w - 1, x1))
-    y0 = max(0, min(h - 1, y0))
-    y1 = max(0, min(h - 1, y1))
-    if x1 <= x0 or y1 <= y0:
-        return None
-    return x0, y0, x1, y1
+    best = None
+    best_area = 0.0
 
-
-def _apply_grid_inset_px(grid_bbox_px: Tuple[int, int, int, int], rows: int, cols: int) -> Tuple[int, int, int, int]:
-    """
-    Optional: shrink bbox a bit by ratios.
-    """
-    x0, y0, x1, y1 = grid_bbox_px
-    W = max(1, x1 - x0)
-    H = max(1, y1 - y0)
-
-    dxL = int(round(W * max(0.0, GRID_INSET_LEFT)))
-    dxR = int(round(W * max(0.0, GRID_INSET_RIGHT)))
-    dyT = int(round(H * max(0.0, GRID_INSET_TOP)))
-    dyB = int(round(H * max(0.0, GRID_INSET_BOTTOM)))
-
-    x0 = x0 + dxL
-    x1 = x1 - dxR
-    y0 = y0 + dyT
-    y1 = y1 - dyB
-
-    if x1 <= x0 + 2:
-        x0, x1 = grid_bbox_px[0], grid_bbox_px[2]
-    if y1 <= y0 + 2:
-        y0, y1 = grid_bbox_px[1], grid_bbox_px[3]
-    return (x0, y0, x1, y1)
-
-
-def _cells_from_result(result, frame_shape, rows: int, cols: int):
-    """
-    Parse cells từ API.
-    ✅ Endpoint mới đã trả row/col chuẩn => KHÔNG offset.
-    """
-    h, w = frame_shape[:2]
-    cells = []
-
-    for cell in result.get("cells", []):
-        bbox_px = _bbox_to_pixels(cell.get("bbox"), w, h)
-        if not bbox_px:
+    for c in cnts:
+        peri = cv2.arcLength(c, True)
+        if peri < 250:
+            continue
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) != 4:
             continue
 
-        # ✅ row/col từ server (đã recompute) => dùng thẳng
-        r0 = int(cell.get("row", 0))
-        c0 = int(cell.get("col", 0))
+        pts = approx.reshape(4, 2).astype(np.float32)
+        area = polygon_area(pts)
+        if area < 0.02 * img_area:
+            continue
 
-        # clamp cho chắc
-        r0 = max(0, min(rows - 1, r0))
-        c0 = max(0, min(cols - 1, c0))
+        # aspect ratio roughly square-ish because we warp to square,
+        # but board itself in camera might be not square; still ok.
+        x, y, w, h = cv2.boundingRect(approx)
+        if h <= 1 or w <= 1:
+            continue
+        ar = w / float(h)
+        if not (0.65 <= ar <= 1.6):
+            continue
 
-        x0, y0, x1, y1 = bbox_px
-        cells.append({
-            "r": r0,
-            "c": c0,
-            "x0": x0, "y0": y0, "x1": x1, "y1": y1,
-            "state": str(cell.get("state", "empty")),
-        })
+        if area > best_area:
+            best_area = area
+            best = pts
 
-    return cells
+    if best is None:
+        return None
+    return order_points(best)
 
+def compute_angle_deg(quad: np.ndarray) -> float:
+    """
+    quad order tl,tr,br,bl
+    angle of top edge
+    """
+    tl, tr = quad[0], quad[1]
+    dx = float(tr[0] - tl[0])
+    dy = float(tr[1] - tl[1])
+    return float(np.degrees(np.arctan2(dy, dx)))
 
-def _board_from_cells(rows: int, cols: int, cells):
-    board = [[0 for _ in range(cols)] for _ in range(rows)]
-    for cell in cells:
-        r = cell.get("r", -1)
-        c = cell.get("c", -1)
-        state = cell.get("state", "empty")
-        if 0 <= r < rows and 0 <= c < cols:
-            if state == "player_x":
-                board[r][c] = 1
-            elif state == "robot_line":
-                board[r][c] = 2
-    return board
+def warp_board(frame_bgr: np.ndarray, quad: np.ndarray, size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    return warped_bgr, H (img->warp), Hinv (warp->img)
+    """
+    dst = np.array([[0, 0], [size - 1, 0], [size - 1, size - 1], [0, size - 1]], dtype=np.float32)
+    H = cv2.getPerspectiveTransform(quad.astype(np.float32), dst)
+    Hinv = cv2.getPerspectiveTransform(dst, quad.astype(np.float32))
+    warped = cv2.warpPerspective(frame_bgr, H, (size, size))
+    return warped, H, Hinv
 
+def map_points(H: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    pts = np.asarray(pts, dtype=np.float32).reshape(-1, 1, 2)
+    out = cv2.perspectiveTransform(pts, H)
+    return out.reshape(-1, 2)
 
 # =========================
-# Drawing helpers
+# Vision helpers (stages)
 # =========================
-def draw_grid_bbox(frame_bgr, grid_bbox_px, rows, cols):
-    if not grid_bbox_px or rows <= 0 or cols <= 0:
-        return
+def enhance_for_server(warp_bgr: np.ndarray) -> np.ndarray:
+    blur = cv2.GaussianBlur(warp_bgr, (5, 5), 0)
+    lab = cv2.cvtColor(blur, cv2.COLOR_BGR2LAB)
+    L, A, B = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    L2 = clahe.apply(L)
+    lab2 = cv2.merge([L2, A, B])
+    out = cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
+    return out
 
-    x0, y0, x1, y1 = grid_bbox_px
-    x0 += DRAW_X_OFF_X; x1 += DRAW_X_OFF_X
-    y0 += DRAW_X_OFF_Y; y1 += DRAW_X_OFF_Y
+def mask_white_objects(warp_bgr: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(warp_bgr, cv2.COLOR_BGR2HSV)
+    lower = np.array([0, 0, 160], dtype=np.uint8)
+    upper = np.array([180, 70, 255], dtype=np.uint8)
+    mask = cv2.inRange(hsv, lower, upper)
 
-    W = max(1, x1 - x0)
-    H = max(1, y1 - y0)
+    k = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
+    return mask
+
+def detect_O_centers(warp_bgr: np.ndarray, rows: int, cols: int) -> List[Tuple[int, int]]:
+    """
+    GitHub-like: mask + contours + minEnclosingCircle + radius filter
+    """
+    mask = mask_white_objects(warp_bgr)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    size = warp_bgr.shape[0]
+    cell = size / float(max(1, cols))
+    min_r = MIN_R_RATIO * cell
+    max_r = MAX_R_RATIO * cell
+
+    centers = []
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if area < 60:
+            continue
+        (x, y), r = cv2.minEnclosingCircle(c)
+        if r < min_r or r > max_r:
+            continue
+
+        peri = cv2.arcLength(c, True) + 1e-6
+        circ = 4.0 * np.pi * area / (peri * peri)
+        if circ < 0.42:
+            continue
+
+        centers.append((int(round(x)), int(round(y))))
+    return centers
+
+def detect_X_cells_simple(warp_bgr: np.ndarray, rows: int, cols: int) -> List[Tuple[int, int]]:
+    """
+    Per-cell X check: HoughLinesP, need both diagonal groups.
+    """
+    gray = cv2.cvtColor(warp_bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 60, 140)
+
+    H, W = edges.shape[:2]
     cell_w = W / float(cols)
     cell_h = H / float(rows)
 
-    cv2.rectangle(frame_bgr, (x0, y0), (x1, y1), (0, 255, 255), 1)
-    for c in range(1, cols):
-        xx = int(round(x0 + c * cell_w))
-        cv2.line(frame_bgr, (xx, y0), (xx, y1), (0, 255, 255), 1)
-    for r in range(1, rows):
-        yy = int(round(y0 + r * cell_h))
-        cv2.line(frame_bgr, (x0, yy), (x1, yy), (0, 255, 255), 1)
-
-
-def draw_x_overlay_by_grid(frame_bgr, grid_bbox_px, rows, cols, board):
-    if not grid_bbox_px or rows <= 0 or cols <= 0:
-        return
-
-    x0, y0, x1, y1 = grid_bbox_px
-    x0 += DRAW_X_OFF_X; x1 += DRAW_X_OFF_X
-    y0 += DRAW_X_OFF_Y; y1 += DRAW_X_OFF_Y
-
-    W = max(1, x1 - x0)
-    H = max(1, y1 - y0)
-    cell_w = W / float(cols)
-    cell_h = H / float(rows)
-
-    overlay = frame_bgr.copy()
-    drew = 0
-
+    hits = []
     for r in range(rows):
         for c in range(cols):
-            if board[r][c] != 1:
+            x0 = int(c * cell_w); x1 = int((c + 1) * cell_w)
+            y0 = int(r * cell_h); y1 = int((r + 1) * cell_h)
+
+            roi = edges[y0:y1, x0:x1]
+            if roi.size == 0:
                 continue
 
-            cx0 = int(round(x0 + c * cell_w))
-            cy0 = int(round(y0 + r * cell_h))
-            cx1 = int(round(x0 + (c + 1) * cell_w))
-            cy1 = int(round(y0 + (r + 1) * cell_h))
-
-            inset_x = int(round((cx1 - cx0) * HILITE_INSET_RATIO))
-            inset_y = int(round((cy1 - cy0) * HILITE_INSET_RATIO))
-            cx0 += inset_x; cx1 -= inset_x
-            cy0 += inset_y; cy1 -= inset_y
-
-            cx0 = max(0, min(frame_bgr.shape[1] - 1, cx0))
-            cx1 = max(0, min(frame_bgr.shape[1] - 1, cx1))
-            cy0 = max(0, min(frame_bgr.shape[0] - 1, cy0))
-            cy1 = max(0, min(frame_bgr.shape[0] - 1, cy1))
-            if cx1 <= cx0 or cy1 <= cy0:
+            lines = cv2.HoughLinesP(
+                roi,
+                rho=1,
+                theta=np.pi / 180,
+                threshold=25,
+                minLineLength=int(0.35 * min(roi.shape[:2])),
+                maxLineGap=10,
+            )
+            if lines is None:
                 continue
 
-            cv2.rectangle(overlay, (cx0, cy0), (cx1, cy1), (0, 255, 255), -1)
-            drew += 1
+            ang1 = 0
+            ang2 = 0
+            for l in lines[:, 0]:
+                xA, yA, xB, yB = l
+                dx = xB - xA
+                dy = yB - yA
+                a = np.degrees(np.arctan2(dy, dx))
+                a = (a + 180) % 180
+                if 25 <= a <= 65:
+                    ang1 += 1
+                elif 115 <= a <= 155:
+                    ang2 += 1
 
-    if drew > 0:
-        cv2.addWeighted(overlay, 0.28, frame_bgr, 0.72, 0, frame_bgr)
+            if ang1 >= 1 and ang2 >= 1:
+                hits.append((r, c))
 
+    return hits
+
+# =========================
+# Pipeline
+# =========================
+class ScanPipeline:
+    def __init__(self, rows: int, cols: int, warp_size: int):
+        self.rows = int(rows)
+        self.cols = int(cols)
+        self.warp_size = int(warp_size)
+
+    def run(self, frame_bgr: np.ndarray) -> Dict[str, Any]:
+        stages: Dict[str, np.ndarray] = {}
+
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        stages["1_gray"] = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+        blur = cv2.GaussianBlur(gray, (7, 7), 0)
+        stages["2_blur"] = cv2.cvtColor(blur, cv2.COLOR_GRAY2BGR)
+
+        edges = cv2.Canny(blur, 70, 160)
+        k = np.ones((3, 3), np.uint8)
+        edges2 = cv2.dilate(edges, k, iterations=1)
+        edges2 = cv2.erode(edges2, k, iterations=1)
+        stages["3_edges"] = cv2.cvtColor(edges2, cv2.COLOR_GRAY2BGR)
+
+        quad = find_board_quad(edges2)
+        if quad is None:
+            stages["4_board"] = frame_bgr.copy()
+            return {"found": False, "stages": stages}
+
+        angle = compute_angle_deg(quad)
+
+        board_vis = frame_bgr.copy()
+        cv2.polylines(board_vis, [quad.astype(np.int32)], True, (0, 255, 255), 2)
+        cv2.putText(board_vis, f"angle={angle:.1f}", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        stages["4_board"] = board_vis
+
+        warp_bgr, H, Hinv = warp_board(frame_bgr, quad, self.warp_size)
+        stages["5_warp"] = warp_bgr.copy()
+
+        mask = mask_white_objects(warp_bgr)
+        stages["6_mask"] = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+
+        o_centers = detect_O_centers(warp_bgr, self.rows, self.cols)
+        x_cells = detect_X_cells_simple(warp_bgr, self.rows, self.cols)
+
+        pieces_vis = warp_bgr.copy()
+        s = self.warp_size
+
+        # draw grid lines in warp (debug)
+        for c in range(1, self.cols):
+            xx = int(round(c * s / self.cols))
+            cv2.line(pieces_vis, (xx, 0), (xx, s - 1), (255, 255, 0), 1)
+        for r in range(1, self.rows):
+            yy = int(round(r * s / self.rows))
+            cv2.line(pieces_vis, (0, yy), (s - 1, yy), (255, 255, 0), 1)
+
+        for (x, y) in o_centers:
+            cv2.circle(pieces_vis, (x, y), 12, (0, 255, 0), 2)
+            cv2.circle(pieces_vis, (x, y), 2, (0, 255, 0), -1)
+
+        for (r, c) in x_cells:
+            cx = int((c + 0.5) * s / self.cols)
+            cy = int((r + 0.5) * s / self.rows)
+            cv2.putText(pieces_vis, "X", (cx - 10, cy + 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+
+        stages["7_pieces_local"] = pieces_vis
+
+        warp_send = enhance_for_server(warp_bgr)
+        stages["8_send"] = warp_send.copy()
+
+        return {
+            "found": True,
+            "quad": quad,
+            "angle": angle,
+            "warp": warp_bgr,
+            "warp_send": warp_send,
+            "Hinv": Hinv,
+            "stages": stages
+        }
+
+# =========================
+# Draw overlay on real camera using perspective mapping
+# =========================
+def draw_grid_perspective(frame_bgr: np.ndarray, Hinv: np.ndarray, rows: int, cols: int, size: int):
+    overlay = frame_bgr.copy()
+
+    for c in range(cols + 1):
+        x = c * (size - 1) / float(cols)
+        pts_w = np.array([[x, 0], [x, size - 1]], dtype=np.float32)
+        pts_i = map_points(Hinv, pts_w).astype(np.int32)
+        cv2.line(overlay, tuple(pts_i[0]), tuple(pts_i[1]), (0, 255, 255), 2)
+
+    for r in range(rows + 1):
+        y = r * (size - 1) / float(rows)
+        pts_w = np.array([[0, y], [size - 1, y]], dtype=np.float32)
+        pts_i = map_points(Hinv, pts_w).astype(np.int32)
+        cv2.line(overlay, tuple(pts_i[0]), tuple(pts_i[1]), (0, 255, 255), 2)
+
+    cv2.addWeighted(overlay, 0.55, frame_bgr, 0.45, 0, frame_bgr)
+
+def fill_cell_perspective(frame_bgr: np.ndarray, Hinv: np.ndarray, r: int, c: int, rows: int, cols: int, size: int):
+    x0 = c * (size - 1) / float(cols)
+    x1 = (c + 1) * (size - 1) / float(cols)
+    y0 = r * (size - 1) / float(rows)
+    y1 = (r + 1) * (size - 1) / float(rows)
+
+    poly_w = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
+    poly_i = map_points(Hinv, poly_w).astype(np.int32)
+
+    overlay = frame_bgr.copy()
+    cv2.fillPoly(overlay, [poly_i], (0, 255, 255))
+    cv2.addWeighted(overlay, HILITE_ALPHA, frame_bgr, 1.0 - HILITE_ALPHA, 0, frame_bgr)
+
+def board_from_server_cells(rows: int, cols: int, cells: List[Dict[str, Any]]) -> List[List[int]]:
+    board = [[0 for _ in range(cols)] for _ in range(rows)]
+    for cell in cells:
+        r = int(cell.get("row", cell.get("r", 0)))
+        c = int(cell.get("col", cell.get("c", 0)))
+        st = str(cell.get("state", "empty"))
+        if 0 <= r < rows and 0 <= c < cols:
+            if st in ("player_x", "x", "X"):
+                board[r][c] = 1
+            elif st in ("robot_line", "o", "O", "player_o"):
+                board[r][c] = 2
+    return board
 
 # =========================
 # State store
 # =========================
 class BoardState:
-    def __init__(self, rows: int = GRID_ROWS, cols: int = GRID_COLS):
+    def __init__(self, rows: int, cols: int):
         self._lock = threading.Lock()
         self.rows = int(rows)
         self.cols = int(cols)
@@ -305,7 +444,6 @@ class BoardState:
             robot = sum(1 for r in self._board for v in r if v == 2)
         return {"empty": empty, "player": player, "robot": robot}
 
-
 # =========================
 # Web + Camera
 # =========================
@@ -313,20 +451,20 @@ class CameraWeb:
     def __init__(self, board: BoardState):
         self.board = board
         self.app = Flask("scan_board")
+
         self._lock = threading.Lock()
-        self._last = None
-
-        self._cells = []
-        self._grid_bbox_px = None
-        self._grid_rows = GRID_ROWS
-        self._grid_cols = GRID_COLS
-
+        self._last = None                 # live frame (with final overlay)
+        self._raw = None                  # raw camera frame
         self._scan_status = "idle"
         self._stop = threading.Event()
         self._thread = None
         self._ready = threading.Event()
         self._failed = threading.Event()
         self._play_requested = threading.Event()
+
+        self._angle = None
+        self._cells = []
+        self._stages: Dict[str, np.ndarray] = {}
 
         @self.app.get("/")
         def index():
@@ -336,16 +474,12 @@ class CameraWeb:
         def state():
             st = self.board.stats()
             with self._lock:
-                st["cells"] = self._cells
                 st["scan_status"] = self._scan_status
-                st["grid_bbox_px"] = self._grid_bbox_px
-                st["rows"] = self._grid_rows
-                st["cols"] = self._grid_cols
-                st["draw_off"] = {"x": DRAW_X_OFF_X, "y": DRAW_X_OFF_Y}
-                st["grid_inset"] = {
-                    "top": GRID_INSET_TOP, "bottom": GRID_INSET_BOTTOM,
-                    "left": GRID_INSET_LEFT, "right": GRID_INSET_RIGHT
-                }
+                st["angle"] = self._angle
+                st["cells"] = self._cells
+                st["stages"] = list(self._stages.keys())
+                st["rows"] = GRID_ROWS
+                st["cols"] = GRID_COLS
             st["board"] = self.board.snapshot()
             return jsonify(st)
 
@@ -358,13 +492,25 @@ class CameraWeb:
         def mjpeg():
             return Response(self._mjpeg_gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
+        @self.app.get("/stage/<name>.jpg")
+        def stage(name: str):
+            with self._lock:
+                img = self._stages.get(name)
+            if img is None:
+                blank = np.zeros((1, 1, 3), dtype=np.uint8)
+                buf = cv2.imencode(".jpg", blank)[1].tobytes()
+                return Response(buf, mimetype="image/jpeg")
+            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+            if not ok:
+                return Response(b"", mimetype="image/jpeg")
+            return Response(buf.tobytes(), mimetype="image/jpeg")
+
     def _html(self) -> str:
-        # dùng format để tránh lỗi f-string/JS template
         html = """<!doctype html>
 <html>
 <head>
   <meta charset="utf-8"/>
-  <title>Scan Board</title>
+  <title>Scan Board 4x6</title>
   <style>
     body {{ font-family: Arial, sans-serif; background:#0b0f14; color:#e7eef7; margin:0; }}
     .wrap {{ display:flex; gap:16px; padding:16px; align-items:flex-start; }}
@@ -373,67 +519,115 @@ class CameraWeb:
     .k {{ color:#93c5fd; }}
     .row {{ display:flex; gap:8px; align-items:center; margin-top:10px; }}
     .btn {{ background:#1f2937; border:1px solid #334155; color:#e7eef7; padding:6px 10px; border-radius:8px; cursor:pointer; }}
-    .video {{ border:1px solid #223; border-radius:8px; width:{cam_w}px; height:{cam_h}px; }}
-    .cells {{ font-size:11px; color:#cbd5f5; white-space:pre; max-height:360px; overflow:auto; }}
+    .video {{ border:1px solid #223; border-radius:8px; width:{cam_w}px; height:{cam_h}px; object-fit:cover; }}
+    .cells {{ font-size:11px; color:#cbd5f5; white-space:pre; max-height:220px; overflow:auto; }}
+
+    .stages {{
+      width: 360px;
+      background:#111827; border:1px solid #223; border-radius:12px; padding:12px;
+    }}
+    .stageTitle {{ color:#93c5fd; margin:0 0 10px 0; font-weight:600; }}
+    .grid {{
+      display:grid;
+      grid-template-columns: 1fr;
+      gap:10px;
+      max-height: calc(100vh - 80px);
+      overflow:auto;
+    }}
+    .thumb {{
+      border:1px solid #223;
+      border-radius:10px;
+      padding:8px;
+      background:#0f1624;
+    }}
+    .thumb h4 {{ margin:0 0 6px 0; font-size:12px; color:#cbd5f5; }}
+    .thumb img {{ width:100%; height:auto; border-radius:8px; display:block; }}
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="card">
-      <div class="kv"><span class="k">Empty cells:</span> <span id="empty">-</span></div>
-      <div class="kv"><span class="k">Player X:</span> <span id="player">-</span></div>
-      <div class="kv"><span class="k">Robot:</span> <span id="robot">-</span></div>
-      <div class="kv"><span class="k">Detected cells:</span> <span id="cells_count">-</span></div>
-      <div class="kv"><span class="k">Grid:</span> <span id="gridrc">-</span></div>
-      <div class="kv"><span class="k">Draw offset:</span> <span id="drawoff">-</span></div>
-      <div class="kv"><span class="k">Grid inset:</span> <span id="inset">-</span></div>
+    <div>
+      <img class="video" id="cam" src="/mjpeg" />
+    </div>
 
-      <div id="cells" class="cells">-</div>
+    <div class="card">
+      <div class="kv"><span class="k">Board:</span> <span id="gridrc">-</span></div>
+      <div class="kv"><span class="k">Scan status:</span> <span id="scan_status">idle</span></div>
+      <div class="kv"><span class="k">Angle:</span> <span id="angle">-</span></div>
+
+      <div class="kv"><span class="k">Empty:</span> <span id="empty">-</span></div>
+      <div class="kv"><span class="k">Player X:</span> <span id="player">-</span></div>
+      <div class="kv"><span class="k">Robot O:</span> <span id="robot">-</span></div>
 
       <div class="kv"><span class="k">Board state:</span></div>
       <div id="board" class="cells">-</div>
 
-      <div class="kv"><span class="k">Scan status:</span> <span id="scan_status">idle</span></div>
+      <div class="kv"><span class="k">Cells (server):</span></div>
+      <div id="cells" class="cells">-</div>
+
       <div class="row">
-        <button class="btn" onclick="playScan()">Play</button>
+        <button class="btn" onclick="playScan()">Play Scan</button>
       </div>
     </div>
 
-    <img class="video" id="cam" src="/mjpeg" />
+    <div class="stages">
+      <div class="stageTitle">Processing Stages</div>
+      <div id="stageGrid" class="grid"></div>
+    </div>
   </div>
 
 <script>
-async function tick() {{
-  try {{
-    const r = await fetch('/state.json', {{cache:'no-store'}});
-    const js = await r.json();
-    document.getElementById('empty').textContent = js.empty ?? '-';
-    document.getElementById('player').textContent = js.player ?? '-';
-    document.getElementById('robot').textContent = js.robot ?? '-';
-
-    const cells = js.cells || [];
-    document.getElementById('cells_count').textContent = cells.length || 0;
-    document.getElementById('cells').textContent = formatCells(cells);
-
-    document.getElementById('board').textContent = formatBoard(js.board);
-    document.getElementById('scan_status').textContent = js.scan_status ?? '-';
-
-    document.getElementById('gridrc').textContent = `rows=${{js.rows}}, cols=${{js.cols}}`;
-    const d = js.draw_off || {{x:0,y:0}};
-    document.getElementById('drawoff').textContent = `x=${{d.x}}, y=${{d.y}}`;
-    const ins = js.grid_inset || {{}};
-    document.getElementById('inset').textContent = `t=${{ins.top||0}} b=${{ins.bottom||0}} l=${{ins.left||0}} r=${{ins.right||0}}`;
-  }} catch(e) {{}}
-}}
-
-function formatCells(cells) {{
-  if (!cells || !cells.length) return '-';
-  return cells.map(c => `(${{c.r}},${{c.c}}) ${{c.state}} [${{c.x0}},${{c.y0}}]-[${{c.x1}},${{c.y1}}]`).join('\\n');
-}}
+let stageNames = [];
 
 function formatBoard(board) {{
   if (!board || !board.length) return '-';
   return board.map(row => row.join(' ')).join('\\n');
+}}
+
+function formatCells(cells) {{
+  if (!cells || !cells.length) return '-';
+  return cells.map(c => `(${c.row ?? c.r},${c.col ?? c.c}) ${c.state}`).join('\\n');
+}}
+
+function renderStages(names) {{
+  const grid = document.getElementById('stageGrid');
+  grid.innerHTML = '';
+  names.forEach(n => {{
+    const d = document.createElement('div');
+    d.className = 'thumb';
+    d.innerHTML = `<h4>${n}</h4><img src="/stage/${n}.jpg?ts=${Date.now()}" />`;
+    grid.appendChild(d);
+  }});
+}}
+
+async function tick() {{
+  try {{
+    const r = await fetch('/state.json', {{cache:'no-store'}});
+    const js = await r.json();
+
+    document.getElementById('gridrc').textContent = `rows=${js.rows}, cols=${js.cols}`;
+    document.getElementById('scan_status').textContent = js.scan_status ?? '-';
+    document.getElementById('angle').textContent = (js.angle ?? '-') + '';
+
+    document.getElementById('empty').textContent = js.empty ?? '-';
+    document.getElementById('player').textContent = js.player ?? '-';
+    document.getElementById('robot').textContent = js.robot ?? '-';
+
+    document.getElementById('board').textContent = formatBoard(js.board);
+    document.getElementById('cells').textContent = formatCells(js.cells || []);
+
+    const names = js.stages || [];
+    if (JSON.stringify(names) !== JSON.stringify(stageNames)) {{
+      stageNames = names;
+      renderStages(stageNames);
+    }} else {{
+      const imgs = document.querySelectorAll('#stageGrid img');
+      imgs.forEach(img => {{
+        const base = img.src.split('?')[0];
+        img.src = base + '?ts=' + Date.now();
+      }});
+    }}
+  }} catch(e) {{}}
 }}
 
 async function playScan() {{
@@ -441,7 +635,7 @@ async function playScan() {{
   tick();
 }}
 
-setInterval(tick, 500);
+setInterval(tick, 450);
 tick();
 </script>
 </body>
@@ -468,23 +662,23 @@ tick();
                    b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
             time.sleep(0.03)
 
-    def get_last_frame(self):
+    def get_last_frame_raw(self):
         with self._lock:
-            return None if self._last is None else self._last.copy()
+            return None if self._raw is None else self._raw.copy()
 
-    def set_cells(self, cells):
+    def set_live_frame(self, frame_bgr):
         with self._lock:
-            self._cells = cells
-
-    def set_grid(self, grid_bbox_px, rows, cols):
-        with self._lock:
-            self._grid_bbox_px = grid_bbox_px
-            self._grid_rows = int(rows)
-            self._grid_cols = int(cols)
+            self._last = frame_bgr
 
     def set_scan_status(self, status: str):
         with self._lock:
             self._scan_status = str(status)
+
+    def set_pipeline_outputs(self, angle: Optional[float], cells: List[Dict[str, Any]], stages: Dict[str, np.ndarray]):
+        with self._lock:
+            self._angle = angle
+            self._cells = cells
+            self._stages = dict(sorted(stages.items(), key=lambda kv: kv[0]))
 
     def consume_scan_request(self) -> bool:
         if self._play_requested.is_set():
@@ -515,21 +709,11 @@ tick();
             if ROTATE_180:
                 frame = cv2.rotate(frame, cv2.ROTATE_180)
 
-            # draw overlay based on current board + grid_bbox
             with self._lock:
-                grid_bbox_px = self._grid_bbox_px
-                rows = self._grid_rows
-                cols = self._grid_cols
+                self._raw = frame.copy()
 
-            board_snapshot = self.board.snapshot()
-
-            if grid_bbox_px:
-                draw_grid_bbox(frame, grid_bbox_px, rows, cols)
-                draw_x_overlay_by_grid(frame, grid_bbox_px, rows, cols, board_snapshot)
-
-            with self._lock:
-                self._last = frame
-
+            # default stream raw
+            self.set_live_frame(frame)
             self._ready.set()
             time.sleep(0.01)
 
@@ -556,17 +740,15 @@ tick();
         self._ready.wait(timeout=max(0.1, float(timeout_sec)))
         return self._ready.is_set() and not self._failed.is_set()
 
-
 # =========================
-# Main loop
+# Main
 # =========================
 def main():
-    print("[START] test_dotimboardticttoe", flush=True)
+    print("[START] scan_board_4x6_pipeline", flush=True)
     print(f"[CFG] SCAN_API_URL={SCAN_API_URL}", flush=True)
     print(f"[CFG] GRID_ROWS={GRID_ROWS} GRID_COLS={GRID_COLS}", flush=True)
-    print(f"[CFG] OFFSET row={CELL_ROW_OFFSET} col={CELL_COL_OFFSET} (NOTE: endpoint fixed, client does NOT apply offset)", flush=True)
-    print(f"[CFG] DRAW_OFF x={DRAW_X_OFF_X} y={DRAW_X_OFF_Y}", flush=True)
-    print(f"[CFG] GRID_INSET t={GRID_INSET_TOP} b={GRID_INSET_BOTTOM} l={GRID_INSET_LEFT} r={GRID_INSET_RIGHT}", flush=True)
+    print(f"[CFG] CAM={CAM_W}x{CAM_H}@{CAM_FPS} rotate180={ROTATE_180}", flush=True)
+    print(f"[CFG] WARP_SIZE={WARP_SIZE}", flush=True)
 
     board = BoardState(rows=GRID_ROWS, cols=GRID_COLS)
     cam = CameraWeb(board)
@@ -576,51 +758,82 @@ def main():
         print("[CAM] not ready, stop", flush=True)
         return
 
-    print("[WEB] waiting for Play button to scan", flush=True)
+    pipeline = ScanPipeline(rows=GRID_ROWS, cols=GRID_COLS, warp_size=WARP_SIZE)
+    print("[WEB] press Play Scan to run pipeline", flush=True)
 
     try:
         while True:
             if cam.consume_scan_request():
                 cam.set_scan_status("scanning")
 
-                frame = cam.get_last_frame()
-                if frame is None:
+                raw = cam.get_last_frame_raw()
+                if raw is None:
                     cam.set_scan_status("failed")
                     time.sleep(0.2)
                     continue
 
-                img_bytes = _encode_frame_jpeg(frame)
+                out = pipeline.run(raw)
+                stages = out.get("stages", {})
+
+                if not out.get("found"):
+                    cam.set_pipeline_outputs(angle=None, cells=[], stages=stages)
+                    cam.set_live_frame(raw)
+                    cam.set_scan_status("failed")
+                    print("[SCAN] board not found", flush=True)
+                    time.sleep(0.2)
+                    continue
+
+                quad = out["quad"]
+                angle = out["angle"]
+                Hinv = out["Hinv"]
+                warp_send = out["warp_send"]
+
+                # show stages right away
+                cam.set_pipeline_outputs(angle=angle, cells=[], stages=stages)
+
+                # send processed warp to server
+                img_bytes = _encode_frame_jpeg(warp_send)
                 result = _post_image_to_api(img_bytes)
 
                 if not result or not result.get("found"):
                     cam.set_scan_status("failed")
-                    print("[SCAN] no board found", flush=True)
+                    print("[SCAN] server confirm failed", flush=True)
+                    live = raw.copy()
+                    cv2.polylines(live, [quad.astype(np.int32)], True, (0, 255, 255), 2)
+                    cam.set_live_frame(live)
                     time.sleep(0.2)
                     continue
 
                 rows = int(result.get("rows", GRID_ROWS) or GRID_ROWS)
                 cols = int(result.get("cols", GRID_COLS) or GRID_COLS)
+                cells = result.get("cells", []) if isinstance(result.get("cells", []), list) else []
 
-                # board cells from API (row/col already fixed)
-                cells = _cells_from_result(result, frame.shape, rows, cols)
-                board_mat = _board_from_cells(rows, cols, cells)
+                board_mat = board_from_server_cells(rows, cols, cells)
                 board.set_board(board_mat)
-                cam.set_cells(cells)
 
-                # grid bbox (normalized -> pixels)
-                grid_bbox_px = _bbox_to_pixels(result.get("grid_bbox"), frame.shape[1], frame.shape[0])
-                if grid_bbox_px:
-                    grid_bbox_px = _apply_grid_inset_px(grid_bbox_px, rows, cols)
-                cam.set_grid(grid_bbox_px, rows, cols)
+                # final overlay on real frame using perspective
+                live = raw.copy()
+                draw_grid_perspective(live, Hinv, rows, cols, WARP_SIZE)
 
+                for r in range(rows):
+                    for c in range(cols):
+                        if board_mat[r][c] != 0:
+                            fill_cell_perspective(live, Hinv, r, c, rows, cols, WARP_SIZE)
+
+                cv2.polylines(live, [quad.astype(np.int32)], True, (0, 255, 255), 2)
+                cv2.putText(live, f"angle={angle:.1f}", (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+                cam.set_live_frame(live)
+                cam.set_pipeline_outputs(angle=angle, cells=cells, stages=stages)
                 cam.set_scan_status("ready")
-                print("[SCAN] board updated", {"rows": rows, "cols": cols, "cells": len(cells), "grid_bbox_px": grid_bbox_px}, flush=True)
 
-            time.sleep(0.2)
+                print("[SCAN] done", {"rows": rows, "cols": cols, "cells": len(cells), "angle": angle}, flush=True)
+
+            time.sleep(0.08)
 
     except KeyboardInterrupt:
         print("\n[EXIT] Ctrl+C", flush=True)
-
 
 if __name__ == "__main__":
     main()
