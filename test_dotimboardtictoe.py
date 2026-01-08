@@ -8,11 +8,14 @@ import json
 import uuid
 import urllib.request
 import urllib.error
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 
 import cv2
 from flask import Flask, Response, jsonify
 
+# =========================
+# CONFIG
+# =========================
 WEB_PORT = 8000
 CAM_DEV = os.environ.get("CAM_DEV", "0")
 CAM_W = int(os.environ.get("CAM_W", "320"))
@@ -29,18 +32,28 @@ SCAN_API_URL = os.environ.get(
     "https://embeddedprogramming-healtheworldserver.up.railway.app/scan_chess",
 )
 
-# ✅ Fix lệch chỉ số row/col từ API (bạn đang bị lệch row +1)
-CELL_ROW_OFFSET = int(os.environ.get("CELL_ROW_OFFSET", "1"))
+# ✅ NEW: endpoint đã fix row/col rồi => client KHÔNG offset nữa
+# Nếu bạn muốn, vẫn có thể set = 0/0; code này không dùng.
+CELL_ROW_OFFSET = int(os.environ.get("CELL_ROW_OFFSET", "0"))
 CELL_COL_OFFSET = int(os.environ.get("CELL_COL_OFFSET", "0"))
 
-# Nếu overlay bị lệch pixel cố định, chỉnh 2 biến này:
+# Nếu overlay bị lệch pixel do camera crop/rotate, chỉnh 2 biến này:
 DRAW_X_OFF_X = int(os.environ.get("DRAW_X_OFF_X", "0"))
 DRAW_X_OFF_Y = int(os.environ.get("DRAW_X_OFF_Y", "0"))
 
 # inset để highlight không che đường kẻ
 HILITE_INSET_RATIO = float(os.environ.get("HILITE_INSET_RATIO", "0.12"))
 
+# Nếu muốn co grid_bbox một chút (tránh bbox ăn nhầm viền):
+GRID_INSET_TOP = float(os.environ.get("GRID_INSET_TOP", "0.00"))      # ratio 0..0.2
+GRID_INSET_BOTTOM = float(os.environ.get("GRID_INSET_BOTTOM", "0.00"))# ratio 0..0.2
+GRID_INSET_LEFT = float(os.environ.get("GRID_INSET_LEFT", "0.00"))    # ratio 0..0.2
+GRID_INSET_RIGHT = float(os.environ.get("GRID_INSET_RIGHT", "0.00"))  # ratio 0..0.2
 
+
+# =========================
+# HTTP upload helper
+# =========================
 def _encode_frame_jpeg(frame_bgr) -> bytes:
     ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
     if not ok:
@@ -48,7 +61,7 @@ def _encode_frame_jpeg(frame_bgr) -> bytes:
     return buf.tobytes()
 
 
-def _post_image_to_api(image_bytes: bytes):
+def _post_image_to_api(image_bytes: bytes) -> Optional[Dict[str, Any]]:
     if not image_bytes:
         return None
 
@@ -72,7 +85,7 @@ def _post_image_to_api(image_bytes: bytes):
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=25) as resp:
             data = resp.read().decode("utf-8", errors="ignore")
             return json.loads(data)
     except urllib.error.HTTPError as exc:
@@ -80,7 +93,7 @@ def _post_image_to_api(image_bytes: bytes):
             detail = exc.read().decode("utf-8", errors="ignore")
         except Exception:
             detail = ""
-        print(f"[SCAN] HTTPError {exc.code}: {detail[:250]}", flush=True)
+        print(f"[SCAN] HTTPError {exc.code}: {detail[:350]}", flush=True)
         return None
     except urllib.error.URLError as exc:
         print(f"[SCAN] URLError: {exc}", flush=True)
@@ -90,12 +103,18 @@ def _post_image_to_api(image_bytes: bytes):
         return None
 
 
+# =========================
+# Geometry helpers
+# =========================
 def _bbox_to_pixels(bbox, w: int, h: int) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Accept bbox normalized [0..1] or pixel coords.
+    Return (x0,y0,x1,y1) in pixels.
+    """
     if not bbox or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
         return None
-    x0, y0, x1, y1 = bbox
     try:
-        x0 = float(x0); y0 = float(y0); x1 = float(x1); y1 = float(y1)
+        x0, y0, x1, y1 = [float(x) for x in bbox]
     except Exception:
         return None
 
@@ -120,32 +139,60 @@ def _bbox_to_pixels(bbox, w: int, h: int) -> Optional[Tuple[int, int, int, int]]
     return x0, y0, x1, y1
 
 
+def _apply_grid_inset_px(grid_bbox_px: Tuple[int, int, int, int], rows: int, cols: int) -> Tuple[int, int, int, int]:
+    """
+    Optional: shrink bbox a bit by ratios.
+    """
+    x0, y0, x1, y1 = grid_bbox_px
+    W = max(1, x1 - x0)
+    H = max(1, y1 - y0)
+
+    dxL = int(round(W * max(0.0, GRID_INSET_LEFT)))
+    dxR = int(round(W * max(0.0, GRID_INSET_RIGHT)))
+    dyT = int(round(H * max(0.0, GRID_INSET_TOP)))
+    dyB = int(round(H * max(0.0, GRID_INSET_BOTTOM)))
+
+    x0 = x0 + dxL
+    x1 = x1 - dxR
+    y0 = y0 + dyT
+    y1 = y1 - dyB
+
+    if x1 <= x0 + 2:
+        x0, x1 = grid_bbox_px[0], grid_bbox_px[2]
+    if y1 <= y0 + 2:
+        y0, y1 = grid_bbox_px[1], grid_bbox_px[3]
+    return (x0, y0, x1, y1)
+
+
 def _cells_from_result(result, frame_shape, rows: int, cols: int):
     """
-    Parse cells từ API, apply offset row/col để sửa lệch.
+    Parse cells từ API.
+    ✅ Endpoint mới đã trả row/col chuẩn => KHÔNG offset.
     """
     h, w = frame_shape[:2]
     cells = []
+
     for cell in result.get("cells", []):
-        bbox = _bbox_to_pixels(cell.get("bbox"), w, h)
-        if not bbox:
+        bbox_px = _bbox_to_pixels(cell.get("bbox"), w, h)
+        if not bbox_px:
             continue
 
-        # ✅ apply offset
-        r0 = int(cell.get("row", 0)) + CELL_ROW_OFFSET
-        c0 = int(cell.get("col", 0)) + CELL_COL_OFFSET
+        # ✅ row/col từ server (đã recompute) => dùng thẳng
+        r0 = int(cell.get("row", 0))
+        c0 = int(cell.get("col", 0))
 
-        # clamp vào [0..rows-1], [0..cols-1]
+        # clamp cho chắc
         r0 = max(0, min(rows - 1, r0))
         c0 = max(0, min(cols - 1, c0))
 
-        x0, y0, x1, y1 = bbox
+        x0, y0, x1, y1 = bbox_px
         cells.append({
             "r": r0,
             "c": c0,
             "x0": x0, "y0": y0, "x1": x1, "y1": y1,
             "state": str(cell.get("state", "empty")),
         })
+
     return cells
 
 
@@ -163,10 +210,14 @@ def _board_from_cells(rows: int, cols: int, cells):
     return board
 
 
-def draw_grid_bbox(frame_bgr, grid_bbox, rows, cols):
-    if not grid_bbox or rows <= 0 or cols <= 0:
+# =========================
+# Drawing helpers
+# =========================
+def draw_grid_bbox(frame_bgr, grid_bbox_px, rows, cols):
+    if not grid_bbox_px or rows <= 0 or cols <= 0:
         return
-    x0, y0, x1, y1 = grid_bbox
+
+    x0, y0, x1, y1 = grid_bbox_px
     x0 += DRAW_X_OFF_X; x1 += DRAW_X_OFF_X
     y0 += DRAW_X_OFF_Y; y1 += DRAW_X_OFF_Y
 
@@ -184,11 +235,11 @@ def draw_grid_bbox(frame_bgr, grid_bbox, rows, cols):
         cv2.line(frame_bgr, (x0, yy), (x1, yy), (0, 255, 255), 1)
 
 
-def draw_x_overlay_by_grid(frame_bgr, grid_bbox, rows, cols, board):
-    if not grid_bbox or rows <= 0 or cols <= 0:
+def draw_x_overlay_by_grid(frame_bgr, grid_bbox_px, rows, cols, board):
+    if not grid_bbox_px or rows <= 0 or cols <= 0:
         return
 
-    x0, y0, x1, y1 = grid_bbox
+    x0, y0, x1, y1 = grid_bbox_px
     x0 += DRAW_X_OFF_X; x1 += DRAW_X_OFF_X
     y0 += DRAW_X_OFF_Y; y1 += DRAW_X_OFF_Y
 
@@ -229,6 +280,9 @@ def draw_x_overlay_by_grid(frame_bgr, grid_bbox, rows, cols, board):
         cv2.addWeighted(overlay, 0.28, frame_bgr, 0.72, 0, frame_bgr)
 
 
+# =========================
+# State store
+# =========================
 class BoardState:
     def __init__(self, rows: int = GRID_ROWS, cols: int = GRID_COLS):
         self._lock = threading.Lock()
@@ -252,6 +306,9 @@ class BoardState:
         return {"empty": empty, "player": player, "robot": robot}
 
 
+# =========================
+# Web + Camera
+# =========================
 class CameraWeb:
     def __init__(self, board: BoardState):
         self.board = board
@@ -260,7 +317,7 @@ class CameraWeb:
         self._last = None
 
         self._cells = []
-        self._grid_bbox = None
+        self._grid_bbox_px = None
         self._grid_rows = GRID_ROWS
         self._grid_cols = GRID_COLS
 
@@ -281,11 +338,14 @@ class CameraWeb:
             with self._lock:
                 st["cells"] = self._cells
                 st["scan_status"] = self._scan_status
-                st["grid_bbox"] = self._grid_bbox
+                st["grid_bbox_px"] = self._grid_bbox_px
                 st["rows"] = self._grid_rows
                 st["cols"] = self._grid_cols
-                st["row_offset"] = CELL_ROW_OFFSET
-                st["col_offset"] = CELL_COL_OFFSET
+                st["draw_off"] = {"x": DRAW_X_OFF_X, "y": DRAW_X_OFF_Y}
+                st["grid_inset"] = {
+                    "top": GRID_INSET_TOP, "bottom": GRID_INSET_BOTTOM,
+                    "left": GRID_INSET_LEFT, "right": GRID_INSET_RIGHT
+                }
             st["board"] = self.board.snapshot()
             return jsonify(st)
 
@@ -299,6 +359,7 @@ class CameraWeb:
             return Response(self._mjpeg_gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
     def _html(self) -> str:
+        # dùng format để tránh lỗi f-string/JS template
         html = """<!doctype html>
 <html>
 <head>
@@ -307,12 +368,12 @@ class CameraWeb:
   <style>
     body {{ font-family: Arial, sans-serif; background:#0b0f14; color:#e7eef7; margin:0; }}
     .wrap {{ display:flex; gap:16px; padding:16px; align-items:flex-start; }}
-    .card {{ background:#111827; border:1px solid #223; border-radius:12px; padding:12px; min-width:320px; }}
+    .card {{ background:#111827; border:1px solid #223; border-radius:12px; padding:12px; min-width:340px; }}
     .kv {{ margin:8px 0; }}
     .k {{ color:#93c5fd; }}
     .row {{ display:flex; gap:8px; align-items:center; margin-top:10px; }}
     .btn {{ background:#1f2937; border:1px solid #334155; color:#e7eef7; padding:6px 10px; border-radius:8px; cursor:pointer; }}
-    .video {{ border:1px solid #223; border-radius:8px; width:{CAM_W}px; height:{CAM_H}px; }}
+    .video {{ border:1px solid #223; border-radius:8px; width:{cam_w}px; height:{cam_h}px; }}
     .cells {{ font-size:11px; color:#cbd5f5; white-space:pre; max-height:360px; overflow:auto; }}
   </style>
 </head>
@@ -323,7 +384,9 @@ class CameraWeb:
       <div class="kv"><span class="k">Player X:</span> <span id="player">-</span></div>
       <div class="kv"><span class="k">Robot:</span> <span id="robot">-</span></div>
       <div class="kv"><span class="k">Detected cells:</span> <span id="cells_count">-</span></div>
-      <div class="kv"><span class="k">Row/Col offset:</span> <span id="offset">-</span></div>
+      <div class="kv"><span class="k">Grid:</span> <span id="gridrc">-</span></div>
+      <div class="kv"><span class="k">Draw offset:</span> <span id="drawoff">-</span></div>
+      <div class="kv"><span class="k">Grid inset:</span> <span id="inset">-</span></div>
 
       <div id="cells" class="cells">-</div>
 
@@ -347,12 +410,19 @@ async function tick() {{
     document.getElementById('empty').textContent = js.empty ?? '-';
     document.getElementById('player').textContent = js.player ?? '-';
     document.getElementById('robot').textContent = js.robot ?? '-';
+
     const cells = js.cells || [];
-    document.getElementById('cells_count').textContent = (cells && cells.length) ? cells.length : 0;
+    document.getElementById('cells_count').textContent = cells.length || 0;
     document.getElementById('cells').textContent = formatCells(cells);
+
     document.getElementById('board').textContent = formatBoard(js.board);
     document.getElementById('scan_status').textContent = js.scan_status ?? '-';
-    document.getElementById('offset').textContent = `row=${{js.row_offset}}, col=${{js.col_offset}}`;
+
+    document.getElementById('gridrc').textContent = `rows=${{js.rows}}, cols=${{js.cols}}`;
+    const d = js.draw_off || {{x:0,y:0}};
+    document.getElementById('drawoff').textContent = `x=${{d.x}}, y=${{d.y}}`;
+    const ins = js.grid_inset || {{}};
+    document.getElementById('inset').textContent = `t=${{ins.top||0}} b=${{ins.bottom||0}} l=${{ins.left||0}} r=${{ins.right||0}}`;
   }} catch(e) {{}}
 }}
 
@@ -377,7 +447,7 @@ tick();
 </body>
 </html>
 """
-        return html.format(CAM_W=CAM_W, CAM_H=CAM_H)
+        return html.format(cam_w=CAM_W, cam_h=CAM_H)
 
     def _mjpeg_gen(self):
         while not self._stop.is_set():
@@ -406,9 +476,9 @@ tick();
         with self._lock:
             self._cells = cells
 
-    def set_grid_bbox(self, bbox, rows, cols):
+    def set_grid(self, grid_bbox_px, rows, cols):
         with self._lock:
-            self._grid_bbox = bbox
+            self._grid_bbox_px = grid_bbox_px
             self._grid_rows = int(rows)
             self._grid_cols = int(cols)
 
@@ -445,16 +515,17 @@ tick();
             if ROTATE_180:
                 frame = cv2.rotate(frame, cv2.ROTATE_180)
 
+            # draw overlay based on current board + grid_bbox
             with self._lock:
-                grid_bbox = self._grid_bbox
+                grid_bbox_px = self._grid_bbox_px
                 rows = self._grid_rows
                 cols = self._grid_cols
 
             board_snapshot = self.board.snapshot()
 
-            if grid_bbox:
-                draw_grid_bbox(frame, grid_bbox, rows, cols)
-                draw_x_overlay_by_grid(frame, grid_bbox, rows, cols, board_snapshot)
+            if grid_bbox_px:
+                draw_grid_bbox(frame, grid_bbox_px, rows, cols)
+                draw_x_overlay_by_grid(frame, grid_bbox_px, rows, cols, board_snapshot)
 
             with self._lock:
                 self._last = frame
@@ -478,6 +549,7 @@ tick();
             ),
             daemon=True,
         ).start()
+
         print(f"[WEB] http://<pi_ip>:{WEB_PORT}/", flush=True)
 
     def wait_ready(self, timeout_sec: float = 5.0) -> bool:
@@ -485,9 +557,16 @@ tick();
         return self._ready.is_set() and not self._failed.is_set()
 
 
+# =========================
+# Main loop
+# =========================
 def main():
     print("[START] test_dotimboardticttoe", flush=True)
-    print(f"[CFG] CELL_ROW_OFFSET={CELL_ROW_OFFSET} CELL_COL_OFFSET={CELL_COL_OFFSET}", flush=True)
+    print(f"[CFG] SCAN_API_URL={SCAN_API_URL}", flush=True)
+    print(f"[CFG] GRID_ROWS={GRID_ROWS} GRID_COLS={GRID_COLS}", flush=True)
+    print(f"[CFG] OFFSET row={CELL_ROW_OFFSET} col={CELL_COL_OFFSET} (NOTE: endpoint fixed, client does NOT apply offset)", flush=True)
+    print(f"[CFG] DRAW_OFF x={DRAW_X_OFF_X} y={DRAW_X_OFF_Y}", flush=True)
+    print(f"[CFG] GRID_INSET t={GRID_INSET_TOP} b={GRID_INSET_BOTTOM} l={GRID_INSET_LEFT} r={GRID_INSET_RIGHT}", flush=True)
 
     board = BoardState(rows=GRID_ROWS, cols=GRID_COLS)
     cam = CameraWeb(board)
@@ -522,16 +601,20 @@ def main():
                 rows = int(result.get("rows", GRID_ROWS) or GRID_ROWS)
                 cols = int(result.get("cols", GRID_COLS) or GRID_COLS)
 
+                # board cells from API (row/col already fixed)
                 cells = _cells_from_result(result, frame.shape, rows, cols)
                 board_mat = _board_from_cells(rows, cols, cells)
                 board.set_board(board_mat)
                 cam.set_cells(cells)
 
-                grid_bbox = _bbox_to_pixels(result.get("grid_bbox"), frame.shape[1], frame.shape[0])
-                cam.set_grid_bbox(grid_bbox, rows, cols)
+                # grid bbox (normalized -> pixels)
+                grid_bbox_px = _bbox_to_pixels(result.get("grid_bbox"), frame.shape[1], frame.shape[0])
+                if grid_bbox_px:
+                    grid_bbox_px = _apply_grid_inset_px(grid_bbox_px, rows, cols)
+                cam.set_grid(grid_bbox_px, rows, cols)
 
                 cam.set_scan_status("ready")
-                print("[SCAN] board updated", {"rows": rows, "cols": cols, "offset_row": CELL_ROW_OFFSET}, flush=True)
+                print("[SCAN] board updated", {"rows": rows, "cols": cols, "cells": len(cells), "grid_bbox_px": grid_bbox_px}, flush=True)
 
             time.sleep(0.2)
 
