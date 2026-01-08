@@ -8,7 +8,7 @@ import json
 import uuid
 import urllib.request
 import urllib.error
-from typing import List
+from typing import List, Optional, Dict, Any
 
 import cv2
 import numpy as np
@@ -30,6 +30,8 @@ SCAN_API_URL = os.environ.get(
     "https://embeddedprogramming-healtheworldserver.up.railway.app/scan_chess",
 )
 
+HTTP_TIMEOUT = float(os.environ.get("SCAN_TIMEOUT", "15"))
+
 
 def _encode_frame_jpeg(frame_bgr) -> bytes:
     ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
@@ -38,15 +40,22 @@ def _encode_frame_jpeg(frame_bgr) -> bytes:
     return buf.tobytes()
 
 
-def _post_image_to_api(image_bytes: bytes):
+def _post_image_to_api(image_bytes: bytes) -> Optional[Dict[str, Any]]:
+    """
+    POST multipart/form-data:
+      field name = "image"
+    """
     if not image_bytes:
         return None
+
     boundary = uuid.uuid4().hex
+
     header = (
         f"--{boundary}\r\n"
-        f"Content-Disposition: form-data; name=\"image\"; filename=\"frame.jpg\"\r\n"
+        f'Content-Disposition: form-data; name="image"; filename="frame.jpg"\r\n'
         f"Content-Type: image/jpeg\r\n\r\n"
     ).encode("utf-8")
+
     footer = f"\r\n--{boundary}--\r\n".encode("utf-8")
     body = header + image_bytes + footer
 
@@ -56,19 +65,37 @@ def _post_image_to_api(image_bytes: bytes):
         headers={
             "Content-Type": f"multipart/form-data; boundary={boundary}",
             "Content-Length": str(len(body)),
+            "Accept": "application/json",
+            "User-Agent": "MatthewPi/scan_board",
         },
         method="POST",
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = resp.read().decode("utf-8", errors="ignore")
-            return json.loads(data)
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            status = getattr(resp, "status", 200)
+            raw = resp.read().decode("utf-8", errors="ignore")
+            if status < 200 or status >= 300:
+                print(f"[SCAN] HTTP {status} body_head={raw[:200]!r}")
+                return None
+            try:
+                return json.loads(raw)
+            except Exception as exc:
+                print(f"[SCAN] JSON parse failed: {exc} body_head={raw[:200]!r}")
+                return None
+
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read().decode("utf-8", errors="ignore")
+        except Exception:
+            raw = ""
+        print(f"[SCAN] HTTPError {exc.code}: {raw[:200]!r}")
+        return None
     except urllib.error.URLError as exc:
-        print(f"[SCAN] request failed: {exc}")
+        print(f"[SCAN] URLError: {exc}")
         return None
     except Exception as exc:
-        print(f"[SCAN] parse failed: {exc}")
+        print(f"[SCAN] request failed: {exc}")
         return None
 
 
@@ -76,20 +103,24 @@ def _bbox_to_pixels(bbox, w: int, h: int):
     if not bbox or len(bbox) != 4:
         return None
     x0, y0, x1, y1 = bbox
-    if max(abs(x0), abs(y0), abs(x1), abs(y1)) <= 1.5:
-        x0 = int(round(x0 * w))
-        x1 = int(round(x1 * w))
-        y0 = int(round(y0 * h))
-        y1 = int(round(y1 * h))
+
+    # normalized?
+    if max(abs(float(x0)), abs(float(y0)), abs(float(x1)), abs(float(y1))) <= 1.5:
+        x0 = int(round(float(x0) * w))
+        x1 = int(round(float(x1) * w))
+        y0 = int(round(float(y0) * h))
+        y1 = int(round(float(y1) * h))
     else:
-        x0 = int(round(x0))
-        x1 = int(round(x1))
-        y0 = int(round(y0))
-        y1 = int(round(y1))
+        x0 = int(round(float(x0)))
+        x1 = int(round(float(x1)))
+        y0 = int(round(float(y0)))
+        y1 = int(round(float(y1)))
+
     x0 = max(0, min(w - 1, x0))
     x1 = max(0, min(w - 1, x1))
     y0 = max(0, min(h - 1, y0))
     y1 = max(0, min(h - 1, y1))
+
     if x1 <= x0 or y1 <= y0:
         return None
     return x0, y0, x1, y1
@@ -98,19 +129,23 @@ def _bbox_to_pixels(bbox, w: int, h: int):
 def _cells_from_result(result, frame_shape):
     h, w = frame_shape[:2]
     cells = []
-    for cell in result.get("cells", []):
+    for cell in result.get("cells", []) or []:
         bbox = _bbox_to_pixels(cell.get("bbox"), w, h)
         if not bbox:
             continue
         x0, y0, x1, y1 = bbox
+        state = str(cell.get("state", "empty")).strip().lower()
+        # normalize state
+        if state in ("x", "player", "playerx"):
+            state = "player_x"
+        if state in ("robot", "robotline", "line"):
+            state = "robot_line"
+
         cells.append({
             "r": int(cell.get("row", 0)),
             "c": int(cell.get("col", 0)),
-            "x0": x0,
-            "y0": y0,
-            "x1": x1,
-            "y1": y1,
-            "state": str(cell.get("state", "empty")),
+            "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+            "state": state,
         })
     return cells
 
@@ -120,28 +155,33 @@ def _board_from_cells(rows: int, cols: int, cells):
     for cell in cells:
         r = cell.get("r", -1)
         c = cell.get("c", -1)
-        state = cell.get("state", "empty")
+        st = cell.get("state", "empty")
         if 0 <= r < rows and 0 <= c < cols:
-            if state == "player_x":
+            if st == "player_x":
                 board[r][c] = 1
-            elif state == "robot":
+            elif st == "robot_line":
                 board[r][c] = 2
     return board
 
 
-def draw_board_overlay(frame_bgr, cells=None):
+def draw_x_overlay_only(frame_bgr, cells=None):
+    """
+    ✅ chỉ vẽ quân X đã nhận dạng (player_x)
+    """
     if not cells:
         return
     overlay = frame_bgr.copy()
+    drew = 0
     for cell in cells:
+        if cell.get("state") != "player_x":
+            continue
         x0, y0, x1, y1 = cell["x0"], cell["y0"], cell["x1"], cell["y1"]
-        state = cell.get("state", "empty")
-        if state == "player_x":
-            color = (0, 0, 255)
-        else:
-            color = (255, 120, 0)
-        cv2.rectangle(overlay, (x0, y0), (x1, y1), color, -1)
-    cv2.addWeighted(overlay, 0.35, frame_bgr, 0.65, 0, frame_bgr)
+        # chỉ highlight ô có X
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 255, 255), -1)
+        drew += 1
+
+    if drew > 0:
+        cv2.addWeighted(overlay, 0.30, frame_bgr, 0.70, 0, frame_bgr)
 
 
 class BoardState:
@@ -225,8 +265,8 @@ class CameraWeb:
   <div class="wrap">
     <div class="card">
       <div class="kv"><span class="k">Empty cells:</span> <span id="empty">-</span></div>
-      <div class="kv"><span class="k">Player moves:</span> <span id="player">-</span></div>
-      <div class="kv"><span class="k">Robot moves:</span> <span id="robot">-</span></div>
+      <div class="kv"><span class="k">Player X:</span> <span id="player">-</span></div>
+      <div class="kv"><span class="k">Robot:</span> <span id="robot">-</span></div>
       <div class="kv"><span class="k">Detected cells:</span> <span id="cells_count">-</span></div>
       <div id="cells" class="cells">-</div>
       <div class="kv"><span class="k">Board state:</span></div>
@@ -255,11 +295,11 @@ async function tick() {{
 }}
 function formatCells(cells) {{
   if (!cells || !cells.length) return '-';
-  return cells.map(c => `(${{c.r}},${{c.c}}) ${{c.state}} [${{c.x0}},${{c.y0}}]-[${{c.x1}},${{c.y1}}]`).join('\n');
+  return cells.map(c => `(${{c.r}},${{c.c}}) ${{c.state}} [${{c.x0}},${{c.y0}}]-[${{c.x1}},${{c.y1}}]`).join('\\n');
 }}
 function formatBoard(board) {{
   if (!board || !board.length) return '-';
-  return board.map(row => row.join(' ')).join('\n');
+  return board.map(row => row.join(' ')).join('\\n');
 }}
 async function playScan() {{
   try {{ await fetch('/play'); }} catch(e) {{}}
@@ -278,20 +318,17 @@ tick();
             if frame is None:
                 time.sleep(0.05)
                 continue
+
             ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
             if not ok:
                 time.sleep(0.03)
                 continue
+
             jpg = buf.tobytes()
-            yield (b"--frame
-
-Content-Type: image/jpeg
-
-
-
-" + jpg + b"
-
-")
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+            )
             time.sleep(0.03)
 
     def get_last_frame(self):
@@ -320,6 +357,7 @@ Content-Type: image/jpeg
             self._failed.set()
             self._ready.set()
             return
+
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_W)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
         cap.set(cv2.CAP_PROP_FPS, CAM_FPS)
@@ -329,16 +367,20 @@ Content-Type: image/jpeg
             if not ok or frame is None:
                 time.sleep(0.05)
                 continue
+
             if ROTATE_180:
                 frame = cv2.rotate(frame, cv2.ROTATE_180)
 
             with self._lock:
                 cells = list(self._cells)
+
+            # ✅ chỉ vẽ X
             if cells:
-                draw_board_overlay(frame, cells=cells)
+                draw_x_overlay_only(frame, cells=cells)
 
             with self._lock:
                 self._last = frame
+
             self._ready.set()
             time.sleep(0.01)
 
@@ -347,10 +389,18 @@ Content-Type: image/jpeg
     def start(self):
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
+
         threading.Thread(
-            target=lambda: self.app.run(host="0.0.0.0", port=WEB_PORT, debug=False, use_reloader=False, threaded=True),
+            target=lambda: self.app.run(
+                host="0.0.0.0",
+                port=WEB_PORT,
+                debug=False,
+                use_reloader=False,
+                threaded=True,
+            ),
             daemon=True,
         ).start()
+
         print(f"[WEB] http://<pi_ip>:{WEB_PORT}/", flush=True)
 
     def wait_ready(self, timeout_sec: float = 5.0) -> bool:
@@ -363,38 +413,47 @@ def main():
     board = BoardState()
     cam = CameraWeb(board)
     cam.start()
+
     if not cam.wait_ready(timeout_sec=5.0):
         print("[CAM] not ready, stop", flush=True)
         return
 
-    print("[WEB] waiting for Play button to scan")
+    print("[WEB] waiting for Play button to scan", flush=True)
+
     try:
         while True:
             if cam.consume_scan_request():
                 cam.set_scan_status("scanning")
+
                 frame = cam.get_last_frame()
                 if frame is None:
                     cam.set_scan_status("failed")
                     time.sleep(0.2)
                     continue
+
                 img_bytes = _encode_frame_jpeg(frame)
                 result = _post_image_to_api(img_bytes)
+
                 if not result or not result.get("found"):
                     cam.set_scan_status("failed")
-                    print("[SCAN] no board found")
+                    print("[SCAN] no board found", flush=True)
                     time.sleep(0.2)
                     continue
-                rows = int(result.get("rows", GRID_ROWS))
-                cols = int(result.get("cols", GRID_COLS))
+
+                rows = int(result.get("rows", GRID_ROWS) or GRID_ROWS)
+                cols = int(result.get("cols", GRID_COLS) or GRID_COLS)
+
                 cells = _cells_from_result(result, frame.shape)
                 board.set_board(_board_from_cells(rows, cols, cells))
                 cam.set_cells(cells)
+
                 cam.set_scan_status("ready")
-                print("[SCAN] board updated")
+                print(f"[SCAN] board updated: player_x={sum(1 for c in cells if c.get('state')=='player_x')}", flush=True)
+
             time.sleep(0.2)
+
     except KeyboardInterrupt:
-        print("
-[EXIT] Ctrl+C", flush=True)
+        print("\n[EXIT] Ctrl+C", flush=True)
 
 
 if __name__ == "__main__":
