@@ -43,17 +43,11 @@ def _post_image_to_api(image_bytes: bytes):
         return None
     boundary = uuid.uuid4().hex
     header = (
-        f"--{boundary}
-"
-        f"Content-Disposition: form-data; name="image"; filename="frame.jpg"
-"
-        f"Content-Type: image/jpeg
-
-"
+        f"--{boundary}\r\n"
+        f"Content-Disposition: form-data; name=\"image\"; filename=\"frame.jpg\"\r\n"
+        f"Content-Type: image/jpeg\r\n\r\n"
     ).encode("utf-8")
-    footer = f"
---{boundary}--
-".encode("utf-8")
+    footer = f"\r\n--{boundary}--\r\n".encode("utf-8")
     body = header + image_bytes + footer
 
     req = urllib.request.Request(
@@ -289,10 +283,14 @@ tick();
                 time.sleep(0.03)
                 continue
             jpg = buf.tobytes()
-            yield (b"--frame
-Content-Type: image/jpeg
-
-" + jpg + b"
+            yield (b"--frame
+
+Content-Type: image/jpeg
+
+
+
+" + jpg + b"
+
 ")
             time.sleep(0.03)
 
