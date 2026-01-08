@@ -27,29 +27,24 @@ CAM_H = int(os.environ.get("CAM_H", "480"))
 CAM_FPS = int(os.environ.get("CAM_FPS", "12"))
 JPEG_QUALITY = int(os.environ.get("CAM_JPEG_QUALITY", "70"))
 
-# ✅ rotate 180 if needed
 ROTATE_180 = str(os.environ.get("CAM_ROTATE_180", "1")).lower() in ("1", "true", "yes", "on")
 
-# Board is 6x4 (rows=6, cols=4)
 GRID_ROWS = int(os.environ.get("GRID_ROWS", "6"))
 GRID_COLS = int(os.environ.get("GRID_COLS", "4"))
 
-# warp size
 CELL_PX = int(os.environ.get("CELL_PX", "90"))
 WARP_W = GRID_COLS * CELL_PX
 WARP_H = GRID_ROWS * CELL_PX
 
-# endpoint
 SCAN_API_URL = os.environ.get(
     "SCAN_API_URL",
     "https://embeddedprogramming-healtheworldserver.up.railway.app/scan_chess",
 )
 
-# Web refresh
 STATE_POLL_MS = int(os.environ.get("STATE_POLL_MS", "500"))
 MJPEG_SLEEP = float(os.environ.get("MJPEG_SLEEP", "0.06"))
 
-# ---------- Yellow marker HSV ----------
+# Yellow HSV
 Y_H_MIN = int(os.environ.get("Y_H_MIN", "18"))
 Y_H_MAX = int(os.environ.get("Y_H_MAX", "40"))
 Y_S_MIN = int(os.environ.get("Y_S_MIN", "70"))
@@ -57,24 +52,19 @@ Y_S_MAX = int(os.environ.get("Y_S_MAX", "255"))
 Y_V_MIN = int(os.environ.get("Y_V_MIN", "70"))
 Y_V_MAX = int(os.environ.get("Y_V_MAX", "255"))
 
-# marker size filter
-MARKER_MIN_AREA = int(os.environ.get("MARKER_MIN_AREA", "140"))     # tăng nhẹ để bớt nhiễu nhỏ
+MARKER_MIN_AREA = int(os.environ.get("MARKER_MIN_AREA", "120"))
 MARKER_MAX_AREA = int(os.environ.get("MARKER_MAX_AREA", "40000"))
-MARKER_MAX_AR = float(os.environ.get("MARKER_MAX_AR", "6.0"))       # aspect ratio max
-MARKER_MIN_SIDE = int(os.environ.get("MARKER_MIN_SIDE", "8"))       # w/h min
+MARKER_MAX_AR = float(os.environ.get("MARKER_MAX_AR", "6.0"))
+MARKER_MIN_SIDE = int(os.environ.get("MARKER_MIN_SIDE", "8"))
 
-# “corner preference”
-CORNER_BAND = float(os.environ.get("CORNER_BAND", "0.22"))  # vùng góc (22% ảnh)
-TOP_NOISE_REJECT_Y = float(os.environ.get("TOP_NOISE_REJECT_Y", "0.10"))  # loại nhiễu nằm quá sát mép trên (10%)
+# Reject noisy yellow too close to top edge
+TOP_NOISE_REJECT_Y = float(os.environ.get("TOP_NOISE_REJECT_Y", "0.10"))
+CORNER_BAND = float(os.environ.get("CORNER_BAND", "0.22"))
 
-# board bbox padding (giữ 0 nếu muốn đúng “vùng góc”)
-BBOX_PAD_PX = int(os.environ.get("BBOX_PAD_PX", "0"))  # bạn muốn fixed => 0
-
-# if only 3 markers, infer the 4th using rectangle rule
 ALLOW_INFER_4TH = str(os.environ.get("ALLOW_INFER_4TH", "1")).lower() in ("1", "true", "yes", "on")
 
-# smooth bbox to reduce jitter
-BBOX_SMOOTH_ALPHA = float(os.environ.get("BBOX_SMOOTH_ALPHA", "0.25"))
+# smoothing (quad points) to reduce jitter
+SMOOTH_ALPHA = float(os.environ.get("SMOOTH_ALPHA", "0.30"))  # 0..1
 
 
 # =========================
@@ -148,46 +138,25 @@ def order_points_4(pts: np.ndarray) -> np.ndarray:
     return np.array([tl, tr, br, bl], dtype=np.float32)
 
 
-def bbox_from_centers(centers: np.ndarray, w: int, h: int, pad_px: int = 0) -> Tuple[int, int, int, int]:
-    xs = centers[:, 0]
-    ys = centers[:, 1]
-    x0 = int(np.floor(xs.min())) - pad_px
-    x1 = int(np.ceil(xs.max())) + pad_px
-    y0 = int(np.floor(ys.min())) - pad_px
-    y1 = int(np.ceil(ys.max())) + pad_px
-    x0 = clamp(x0, 0, w - 2)
-    y0 = clamp(y0, 0, h - 2)
-    x1 = clamp(x1, x0 + 2, w - 1)
-    y1 = clamp(y1, y0 + 2, h - 1)
-    return x0, y0, x1, y1
-
-
-def warp_rect(frame_bgr, rect_bbox: Tuple[int, int, int, int]) -> np.ndarray:
-    x0, y0, x1, y1 = rect_bbox
-    src = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
+def warp_from_quad(frame_bgr, quad4: np.ndarray) -> np.ndarray:
+    quad4 = order_points_4(quad4)
     dst = np.array([[0, 0], [WARP_W - 1, 0], [WARP_W - 1, WARP_H - 1], [0, WARP_H - 1]], dtype=np.float32)
-    M = cv2.getPerspectiveTransform(src, dst)
+    M = cv2.getPerspectiveTransform(quad4.astype(np.float32), dst)
     return cv2.warpPerspective(frame_bgr, M, (WARP_W, WARP_H))
 
 
-def smooth_bbox(prev: Optional[Tuple[int, int, int, int]], cur: Tuple[int, int, int, int], alpha: float) -> Tuple[int, int, int, int]:
+def smooth_pts(prev: Optional[np.ndarray], cur: np.ndarray, alpha: float) -> np.ndarray:
     if prev is None:
-        return cur
-    px0, py0, px1, py1 = prev
-    cx0, cy0, cx1, cy1 = cur
-    x0 = int(round((1 - alpha) * px0 + alpha * cx0))
-    y0 = int(round((1 - alpha) * py0 + alpha * cy0))
-    x1 = int(round((1 - alpha) * px1 + alpha * cx1))
-    y1 = int(round((1 - alpha) * py1 + alpha * cy1))
-    return (x0, y0, x1, y1)
+        return cur.astype(np.float32)
+    return ((1 - alpha) * prev + alpha * cur).astype(np.float32)
 
 
 # =========================
-# Marker-only Detector
+# Marker-only Detector (inner-corner quad)
 # =========================
 class MarkerBoardDetector:
     def __init__(self):
-        self.prev_bbox: Optional[Tuple[int, int, int, int]] = None
+        self.prev_quad: Optional[np.ndarray] = None
 
     def _mask_yellow(self, frame_bgr) -> np.ndarray:
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
@@ -203,7 +172,6 @@ class MarkerBoardDetector:
     def _extract_candidates(self, frame_bgr) -> Dict[str, Any]:
         h, w = frame_bgr.shape[:2]
         mask = self._mask_yellow(frame_bgr)
-
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         cand = []
@@ -223,11 +191,8 @@ class MarkerBoardDetector:
             if ar > MARKER_MAX_AR:
                 continue
 
-            center = np.array([cx, cy], dtype=np.float32)
-
-            # reject noisy yellow objects too close to top edge
+            # reject top noise
             if cy < TOP_NOISE_REJECT_Y * h:
-                # vẫn vẽ nhưng đánh dấu là reject
                 box = cv2.boxPoints(rect).astype(np.int32)
                 cv2.drawContours(dbg, [box], -1, (0, 0, 255), 2)
                 cv2.circle(dbg, (int(cx), int(cy)), 4, (0, 0, 255), -1)
@@ -235,28 +200,21 @@ class MarkerBoardDetector:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
                 continue
 
-            box = cv2.boxPoints(rect).astype(np.int32)
-            cv2.drawContours(dbg, [box], -1, (0, 0, 255), 2)
+            box = cv2.boxPoints(rect).astype(np.float32)  # 4 corners
+            cv2.drawContours(dbg, [box.astype(np.int32)], -1, (0, 0, 255), 2)
             cv2.circle(dbg, (int(cx), int(cy)), 4, (0, 0, 255), -1)
 
             cand.append({
-                "center": center,
+                "center": np.array([cx, cy], dtype=np.float32),
+                "box": box,
                 "area": area,
-                "ar": float(ar),
             })
 
         return {"mask": mask, "candidates": cand, "debug": dbg}
 
-    def _pick_best_4_by_corners(self, candidates: List[Dict[str, Any]], w: int, h: int) -> List[np.ndarray]:
-        """
-        Chọn 4 marker đúng bằng scoring theo 4 góc ảnh.
-        Ý tưởng: marker góc TL gần (0,0), TR gần (w,0), BR gần (w,h), BL gần (0,h)
-        + ưu tiên nằm trong vùng góc (CORNER_BAND)
-        """
+    def _pick_best_4_by_corners(self, candidates: List[Dict[str, Any]], w: int, h: int) -> List[Dict[str, Any]]:
         if not candidates:
             return []
-
-        centers = [c["center"] for c in candidates]
 
         corners = {
             "tl": np.array([0.0, 0.0], dtype=np.float32),
@@ -268,67 +226,45 @@ class MarkerBoardDetector:
         band_x = CORNER_BAND * w
         band_y = CORNER_BAND * h
 
-        def in_corner_band(pt, key: str) -> bool:
+        def in_band(pt, key):
             x, y = float(pt[0]), float(pt[1])
-            if key == "tl":
-                return x <= band_x and y <= band_y
-            if key == "tr":
-                return x >= (w - band_x) and y <= band_y
-            if key == "br":
-                return x >= (w - band_x) and y >= (h - band_y)
-            if key == "bl":
-                return x <= band_x and y >= (h - band_y)
+            if key == "tl": return x <= band_x and y <= band_y
+            if key == "tr": return x >= (w - band_x) and y <= band_y
+            if key == "br": return x >= (w - band_x) and y >= (h - band_y)
+            if key == "bl": return x <= band_x and y >= (h - band_y)
             return False
 
         picked = {}
         used = set()
-
-        # greedy pick per corner
         for key in ["tl", "tr", "br", "bl"]:
             best_i = None
             best_score = 1e18
-            for i, pt in enumerate(centers):
+            for i, c in enumerate(candidates):
                 if i in used:
                     continue
+                pt = c["center"]
                 d = float(np.linalg.norm(pt - corners[key]))
-                # bonus nếu nằm trong band góc
-                if in_corner_band(pt, key):
+                if in_band(pt, key):
                     d *= 0.65
-                # penalty nếu nằm "ngược phía"
-                if key in ("tl", "bl") and pt[0] > w * 0.75:
-                    d *= 2.0
-                if key in ("tr", "br") and pt[0] < w * 0.25:
-                    d *= 2.0
-                if key in ("tl", "tr") and pt[1] > h * 0.75:
-                    d *= 2.0
-                if key in ("bl", "br") and pt[1] < h * 0.25:
-                    d *= 2.0
-
                 if d < best_score:
                     best_score = d
                     best_i = i
-
             if best_i is not None:
-                picked[key] = centers[best_i]
+                picked[key] = candidates[best_i]
                 used.add(best_i)
 
-        # trả ra theo thứ tự TL TR BR BL (chỉ những cái có)
         out = []
         for key in ["tl", "tr", "br", "bl"]:
             if key in picked:
                 out.append(picked[key])
-
         return out
 
-    def _infer_4th(self, pts3: List[np.ndarray]) -> Optional[np.ndarray]:
-        """infer 4th point from 3 corners: p_missing = pA + pC - pB (parallelogram)"""
-        if len(pts3) != 3:
+    def _infer_4th_center(self, centers3: List[np.ndarray]) -> Optional[np.ndarray]:
+        if len(centers3) != 3:
             return None
-
-        pts = np.array(pts3, dtype=np.float32)
+        pts = np.array(centers3, dtype=np.float32)
         cen = pts.mean(axis=0)
 
-        # classify into TL/TR/BR/BL using centroid quadrant
         slots = {}
         for p in pts:
             if p[0] < cen[0] and p[1] < cen[1]:
@@ -343,16 +279,11 @@ class MarkerBoardDetector:
         keys = {"tl", "tr", "br", "bl"}
         missing = list(keys - set(slots.keys()))
         if len(missing) != 1:
-            # fallback generic
             p0, p1, p2 = pts
             return p0 + p2 - p1
 
         m = missing[0]
-        tl = slots.get("tl")
-        tr = slots.get("tr")
-        br = slots.get("br")
-        bl = slots.get("bl")
-
+        tl = slots.get("tl"); tr = slots.get("tr"); br = slots.get("br"); bl = slots.get("bl")
         if m == "tl" and tr is not None and br is not None and bl is not None:
             return tr + bl - br
         if m == "tr" and tl is not None and br is not None and bl is not None:
@@ -361,74 +292,96 @@ class MarkerBoardDetector:
             return tr + bl - tl
         if m == "bl" and tl is not None and tr is not None and br is not None:
             return tl + br - tr
-
         return None
 
-    def detect_board_bbox(self, frame_bgr) -> Dict[str, Any]:
+    def detect_board_quad(self, frame_bgr) -> Dict[str, Any]:
         h, w = frame_bgr.shape[:2]
-
         ex = self._extract_candidates(frame_bgr)
+        mask = ex["mask"]
+        dbg = ex["debug"].copy()
         cand = ex["candidates"]
 
-        # debug stage
-        dbg = ex["debug"].copy()
-        mask = ex["mask"]
-
-        # pick best 4 by corner scoring
+        # pick 4 markers
         picked = self._pick_best_4_by_corners(cand, w, h)
-
-        # if more than 4 candidates exist and picked size < 4,
-        # still allow fallback: take top by area then corner scoring again
         if len(picked) < 4 and len(cand) >= 4:
             cand2 = sorted(cand, key=lambda x: x["area"], reverse=True)[:8]
             picked = self._pick_best_4_by_corners(cand2, w, h)
 
-        inferred = None
+        # if 3 markers only -> infer 4th center (still better than nothing)
+        inferred_center = None
         if len(picked) == 3 and ALLOW_INFER_4TH:
-            inferred = self._infer_4th(picked)
-            if inferred is not None:
-                picked = picked + [inferred]
-
-        if len(picked) < 4:
+            inferred_center = self._infer_4th_center([c["center"] for c in picked])
+            # we cannot infer box corners reliably, so we will fail (need 4 real markers)
+            # return early with debug info
             return {
                 "found": False,
-                "bbox": None,
                 "mask": mask,
                 "debug": dbg,
-                "picked_centers": picked,
-                "inferred": inferred
+                "reason": "only_3_markers_found",
+                "picked_centers": [c["center"] for c in picked],
+                "inferred_center": inferred_center
             }
 
-        centers4 = np.array(picked[:4], dtype=np.float32)
-        # reorder
-        centers4 = order_points_4(centers4)
+        if len(picked) < 4:
+            return {"found": False, "mask": mask, "debug": dbg, "reason": "not_enough_markers"}
 
-        # draw centers
-        for i, p in enumerate(centers4):
-            cv2.circle(dbg, (int(p[0]), int(p[1])), 6, (255, 0, 255), -1)
-            cv2.putText(dbg, f"C{i}", (int(p[0]) + 6, int(p[1]) - 6),
+        # ----- stage: connect 4 centers polygon -----
+        centers4 = np.array([c["center"] for c in picked], dtype=np.float32)
+        centers4_ord = order_points_4(centers4)
+
+        stage_centers_poly = frame_bgr.copy()
+        for i, p in enumerate(centers4_ord):
+            cv2.circle(stage_centers_poly, (int(p[0]), int(p[1])), 6, (0, 0, 255), -1)
+            cv2.putText(stage_centers_poly, f"{i}", (int(p[0]) + 6, int(p[1]) - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        cv2.polylines(stage_centers_poly, [centers4_ord.astype(np.int32)], True, (0, 255, 255), 2)
+        cv2.putText(stage_centers_poly, "4_center_poly", (12, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+        # ----- compute inner corner of each marker -----
+        # inner corner = corner of marker box closest to global center (mean of marker centers)
+        global_c = centers4.mean(axis=0)
+
+        inner_pts = []
+        stage_inner = frame_bgr.copy()
+
+        for idx, c in enumerate(picked):
+            box = c["box"]  # 4 corners
+            # choose corner closest to global center
+            dists = np.linalg.norm(box - global_c.reshape(1, 2), axis=1)
+            k = int(np.argmin(dists))
+            inner = box[k]
+            inner_pts.append(inner)
+
+            cv2.drawContours(stage_inner, [box.astype(np.int32)], -1, (0, 0, 255), 2)
+            cv2.circle(stage_inner, (int(inner[0]), int(inner[1])), 8, (255, 0, 255), -1)
+            cv2.putText(stage_inner, f"in{idx}", (int(inner[0]) + 6, int(inner[1]) - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
-        # make upright rectangle bbox from 4 centers
-        bbox = bbox_from_centers(centers4, w, h, pad_px=BBOX_PAD_PX)
-        bbox = smooth_bbox(self.prev_bbox, bbox, BBOX_SMOOTH_ALPHA)
-        self.prev_bbox = bbox
+        inner4 = order_points_4(np.array(inner_pts, dtype=np.float32))
 
-        x0, y0, x1, y1 = bbox
+        # smooth quad to reduce jitter
+        inner4 = smooth_pts(self.prev_quad, inner4, SMOOTH_ALPHA)
+        self.prev_quad = inner4
 
-        # draw rectangle (yellow)
-        out = frame_bgr.copy()
-        cv2.rectangle(out, (x0, y0), (x1, y1), (0, 255, 255), 2)
-        cv2.putText(out, "board_bbox (marker-only)", (x0 + 10, max(20, y0 - 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        # ----- stage: board quad from inner corners -----
+        stage_board_quad = frame_bgr.copy()
+        cv2.polylines(stage_board_quad, [inner4.astype(np.int32)], True, (0, 255, 255), 3)
+        for i, p in enumerate(inner4):
+            cv2.circle(stage_board_quad, (int(p[0]), int(p[1])), 6, (255, 0, 255), -1)
+            cv2.putText(stage_board_quad, f"Q{i}", (int(p[0]) + 6, int(p[1]) - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+        cv2.putText(stage_board_quad, "board_quad (inner corners)", (12, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
         return {
             "found": True,
-            "bbox": bbox,
             "mask": mask,
             "debug": dbg,
-            "board_bbox_img": out,
-            "centers4": centers4,
+            "stage_centers_poly": stage_centers_poly,
+            "stage_inner_debug": stage_inner,
+            "stage_board_quad": stage_board_quad,
+            "quad": inner4,
         }
 
 
@@ -483,7 +436,7 @@ def board_from_server_cells(rows: int, cols: int, cells: List[Dict[str, Any]]) -
 class CameraWeb:
     def __init__(self, board: BoardState):
         self.board = board
-        self.app = Flask("scan_board_marker_only")
+        self.app = Flask("scan_board_marker_inner_quad")
         self._lock = threading.Lock()
 
         self._last_frame = None
@@ -534,7 +487,7 @@ class CameraWeb:
 <html>
 <head>
   <meta charset="utf-8"/>
-  <title>Scan Board 6x4 (marker-only)</title>
+  <title>Scan Board 6x4 (marker inner-quad)</title>
   <style>
     body {{ font-family: Arial, sans-serif; background:#0b0f14; color:#e7eef7; margin:0; }}
     .wrap {{ display:grid; grid-template-columns: 1fr 420px; gap:14px; padding:14px; }}
@@ -570,7 +523,7 @@ class CameraWeb:
 
         <div class="kv">
           <button class="btn" onclick="playScan()">Play Scan</button>
-          <div class="muted" style="margin-top:8px;">Stages chỉ update sau khi scan xong để đỡ giật.</div>
+          <div class="muted" style="margin-top:8px;">Stages chỉ update sau scan xong để đỡ giật.</div>
         </div>
       </div>
 
@@ -579,7 +532,7 @@ class CameraWeb:
 
     <div class="stages">
       <div class="title">Processing Stages</div>
-      <div class="muted">marker-only: không dùng edges.</div>
+      <div class="muted">marker-only: dùng “inner corner” của marker để warp (giảm lệch row).</div>
       <div id="stage_list"></div>
     </div>
   </div>
@@ -692,7 +645,7 @@ tick();
                 img_bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
             else:
                 img_bgr = img
-            jpgs[name] = _encode_jpeg(img_bgr, quality=80)
+            jpgs[name] = _encode_jpeg(img_bgr, quality=85)
         with self._lock:
             self._stages_jpg = jpgs
 
@@ -754,11 +707,9 @@ tick();
 # MAIN
 # =========================
 def main():
-    print("[START] marker_only_board_bbox_send_bbox_and_warp", flush=True)
+    print("[START] marker_inner_quad + show_center_poly + show_final_sent", flush=True)
     print(f"[CFG] GRID_ROWS={GRID_ROWS} GRID_COLS={GRID_COLS}", flush=True)
     print(f"[CFG] ROTATE_180={ROTATE_180}", flush=True)
-    print(f"[CFG] HSV H[{Y_H_MIN},{Y_H_MAX}] S[{Y_S_MIN},{Y_S_MAX}] V[{Y_V_MIN},{Y_V_MAX}]", flush=True)
-    print(f"[CFG] TOP_NOISE_REJECT_Y={TOP_NOISE_REJECT_Y} CORNER_BAND={CORNER_BAND}", flush=True)
 
     board = BoardState(rows=GRID_ROWS, cols=GRID_COLS)
     cam = CameraWeb(board)
@@ -788,37 +739,40 @@ def main():
 
             stages: Dict[str, np.ndarray] = {}
 
-            det = detector.detect_board_bbox(frame)
+            det = detector.detect_board_quad(frame)
             stages["3m_marker_mask"] = det.get("mask")
             stages["3m_marker_debug"] = det.get("debug")
 
-            if not det["found"] or det.get("bbox") is None:
+            if not det.get("found"):
                 fail = frame.copy()
-                cv2.putText(fail, "board_bbox NOT found (markers)", (12, 32),
+                cv2.putText(fail, f"board_quad NOT found ({det.get('reason','fail')})", (12, 32),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                stages["4_board_bbox"] = fail
+                stages["4_center_poly"] = fail
+                stages["4b_inner_corner_debug"] = fail
+                stages["4c_board_quad"] = fail
                 cam.set_stage_images(stages)
                 cam.set_cells_server([])
                 cam.set_scan_status("failed")
                 time.sleep(0.2)
                 continue
 
-            bbox = det["bbox"]
-            stages["4_board_bbox"] = det.get("board_bbox_img")
+            stages["4_center_poly"] = det.get("stage_centers_poly")
+            stages["4b_inner_corner_debug"] = det.get("stage_inner_debug")
+            stages["4c_board_quad"] = det.get("stage_board_quad")
 
-            # warp only from bbox rectangle
-            warp = warp_rect(frame, bbox)
+            quad = det["quad"]
+            warp = warp_from_quad(frame, quad)
             stages["5_warp"] = warp
 
-            # ✅ send ONLY 4_board_bbox and 5_warp (no edges)
-            board_bbox_img = stages["4_board_bbox"]
+            # ✅ Final image sent to server (show on dashboard)
+            board_quad_img = stages["4c_board_quad"]
             bw = warp.shape[1]
-            bh = int(round(board_bbox_img.shape[0] * (bw / max(1, board_bbox_img.shape[1]))))
-            board_small = cv2.resize(board_bbox_img, (bw, bh))
+            bh = int(round(board_quad_img.shape[0] * (bw / max(1, board_quad_img.shape[1]))))
+            board_small = cv2.resize(board_quad_img, (bw, bh))
             send_img = np.vstack([board_small, warp])
-            stages["6_sent_image"] = send_img
+            stages["6_final_sent_to_server"] = send_img
 
-            result = _post_image_to_api(_encode_jpeg(send_img, quality=80))
+            result = _post_image_to_api(_encode_jpeg(send_img, quality=85))
 
             if not result or not result.get("found"):
                 cam.set_stage_images(stages)
@@ -836,7 +790,7 @@ def main():
             cam.set_stage_images(stages)
             cam.set_scan_status("ready")
 
-            print("[SCAN] ok", {"cells": len(cells), "bbox": bbox}, flush=True)
+            print("[SCAN] ok", {"cells": len(cells)}, flush=True)
             time.sleep(0.15)
 
     except KeyboardInterrupt:
