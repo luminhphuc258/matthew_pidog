@@ -8,7 +8,7 @@ import json
 import uuid
 import urllib.request
 import urllib.error
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -30,7 +30,12 @@ SCAN_API_URL = os.environ.get(
     "https://embeddedprogramming-healtheworldserver.up.railway.app/scan_chess",
 )
 
-HTTP_TIMEOUT = float(os.environ.get("SCAN_TIMEOUT", "15"))
+# Fine-tune overlay if your camera has constant offset (optional)
+DRAW_X_OFF_X = int(os.environ.get("DRAW_X_OFF_X", "0"))
+DRAW_X_OFF_Y = int(os.environ.get("DRAW_X_OFF_Y", "0"))
+
+# Optional: shrink highlight inside each cell so it looks nicer
+HILITE_INSET_RATIO = float(os.environ.get("HILITE_INSET_RATIO", "0.12"))  # 12% inset
 
 
 def _encode_frame_jpeg(frame_bgr) -> bytes:
@@ -40,22 +45,20 @@ def _encode_frame_jpeg(frame_bgr) -> bytes:
     return buf.tobytes()
 
 
-def _post_image_to_api(image_bytes: bytes) -> Optional[Dict[str, Any]]:
+def _post_image_to_api(image_bytes: bytes):
     """
     POST multipart/form-data:
-      field name = "image"
+      field name: image
     """
     if not image_bytes:
         return None
 
     boundary = uuid.uuid4().hex
-
     header = (
         f"--{boundary}\r\n"
         f'Content-Disposition: form-data; name="image"; filename="frame.jpg"\r\n'
         f"Content-Type: image/jpeg\r\n\r\n"
     ).encode("utf-8")
-
     footer = f"\r\n--{boundary}--\r\n".encode("utf-8")
     body = header + image_bytes + footer
 
@@ -65,123 +68,182 @@ def _post_image_to_api(image_bytes: bytes) -> Optional[Dict[str, Any]]:
         headers={
             "Content-Type": f"multipart/form-data; boundary={boundary}",
             "Content-Length": str(len(body)),
-            "Accept": "application/json",
-            "User-Agent": "MatthewPi/scan_board",
         },
         method="POST",
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            status = getattr(resp, "status", 200)
-            raw = resp.read().decode("utf-8", errors="ignore")
-            if status < 200 or status >= 300:
-                print(f"[SCAN] HTTP {status} body_head={raw[:200]!r}")
-                return None
-            try:
-                return json.loads(raw)
-            except Exception as exc:
-                print(f"[SCAN] JSON parse failed: {exc} body_head={raw[:200]!r}")
-                return None
-
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = resp.read().decode("utf-8", errors="ignore")
+            return json.loads(data)
     except urllib.error.HTTPError as exc:
         try:
-            raw = exc.read().decode("utf-8", errors="ignore")
+            detail = exc.read().decode("utf-8", errors="ignore")
         except Exception:
-            raw = ""
-        print(f"[SCAN] HTTPError {exc.code}: {raw[:200]!r}")
+            detail = ""
+        print(f"[SCAN] HTTPError {exc.code}: {detail[:250]}", flush=True)
         return None
     except urllib.error.URLError as exc:
-        print(f"[SCAN] URLError: {exc}")
+        print(f"[SCAN] URLError: {exc}", flush=True)
         return None
     except Exception as exc:
-        print(f"[SCAN] request failed: {exc}")
+        print(f"[SCAN] parse failed: {exc}", flush=True)
         return None
 
 
-def _bbox_to_pixels(bbox, w: int, h: int):
-    if not bbox or len(bbox) != 4:
+def _bbox_to_pixels(bbox, w: int, h: int) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Accept bbox in either normalized [0..1] or pixel units.
+    """
+    if not bbox or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
         return None
     x0, y0, x1, y1 = bbox
 
+    try:
+        x0 = float(x0); y0 = float(y0); x1 = float(x1); y1 = float(y1)
+    except Exception:
+        return None
+
     # normalized?
-    if max(abs(float(x0)), abs(float(y0)), abs(float(x1)), abs(float(y1))) <= 1.5:
-        x0 = int(round(float(x0) * w))
-        x1 = int(round(float(x1) * w))
-        y0 = int(round(float(y0) * h))
-        y1 = int(round(float(y1) * h))
+    if max(abs(x0), abs(y0), abs(x1), abs(y1)) <= 1.5:
+        x0 = int(round(x0 * w))
+        x1 = int(round(x1 * w))
+        y0 = int(round(y0 * h))
+        y1 = int(round(y1 * h))
     else:
-        x0 = int(round(float(x0)))
-        x1 = int(round(float(x1)))
-        y0 = int(round(float(y0)))
-        y1 = int(round(float(y1)))
+        x0 = int(round(x0))
+        x1 = int(round(x1))
+        y0 = int(round(y0))
+        y1 = int(round(y1))
 
     x0 = max(0, min(w - 1, x0))
     x1 = max(0, min(w - 1, x1))
     y0 = max(0, min(h - 1, y0))
     y1 = max(0, min(h - 1, y1))
-
     if x1 <= x0 or y1 <= y0:
         return None
     return x0, y0, x1, y1
 
 
 def _cells_from_result(result, frame_shape):
+    """
+    Convert API cells -> pixel bbox list
+    """
     h, w = frame_shape[:2]
     cells = []
-    for cell in result.get("cells", []) or []:
+    for cell in result.get("cells", []):
         bbox = _bbox_to_pixels(cell.get("bbox"), w, h)
         if not bbox:
             continue
         x0, y0, x1, y1 = bbox
-        state = str(cell.get("state", "empty")).strip().lower()
-        # normalize state
-        if state in ("x", "player", "playerx"):
-            state = "player_x"
-        if state in ("robot", "robotline", "line"):
-            state = "robot_line"
-
         cells.append({
             "r": int(cell.get("row", 0)),
             "c": int(cell.get("col", 0)),
-            "x0": x0, "y0": y0, "x1": x1, "y1": y1,
-            "state": state,
+            "x0": x0,
+            "y0": y0,
+            "x1": x1,
+            "y1": y1,
+            "state": str(cell.get("state", "empty")),
         })
     return cells
 
 
 def _board_from_cells(rows: int, cols: int, cells):
+    """
+    0 empty
+    1 player_x
+    2 robot_line (if ever used)
+    """
     board = [[0 for _ in range(cols)] for _ in range(rows)]
     for cell in cells:
         r = cell.get("r", -1)
         c = cell.get("c", -1)
-        st = cell.get("state", "empty")
+        state = cell.get("state", "empty")
         if 0 <= r < rows and 0 <= c < cols:
-            if st == "player_x":
+            if state == "player_x":
                 board[r][c] = 1
-            elif st == "robot_line":
+            elif state == "robot_line":
                 board[r][c] = 2
     return board
 
 
-def draw_x_overlay_only(frame_bgr, cells=None):
+def draw_grid_bbox(frame_bgr, grid_bbox, rows, cols):
     """
-    ✅ chỉ vẽ quân X đã nhận dạng (player_x)
+    Draw light grid lines based on grid_bbox (debug).
     """
-    if not cells:
+    if not grid_bbox or rows <= 0 or cols <= 0:
         return
+    x0, y0, x1, y1 = grid_bbox
+    x0 += DRAW_X_OFF_X; x1 += DRAW_X_OFF_X
+    y0 += DRAW_X_OFF_Y; y1 += DRAW_X_OFF_Y
+
+    W = max(1, x1 - x0)
+    H = max(1, y1 - y0)
+    cell_w = W / float(cols)
+    cell_h = H / float(rows)
+
+    # outer box
+    cv2.rectangle(frame_bgr, (x0, y0), (x1, y1), (0, 255, 255), 1)
+    # verticals
+    for c in range(1, cols):
+        xx = int(round(x0 + c * cell_w))
+        cv2.line(frame_bgr, (xx, y0), (xx, y1), (0, 255, 255), 1)
+    # horizontals
+    for r in range(1, rows):
+        yy = int(round(y0 + r * cell_h))
+        cv2.line(frame_bgr, (x0, yy), (x1, yy), (0, 255, 255), 1)
+
+
+def draw_x_overlay_by_grid(frame_bgr, grid_bbox, rows, cols, board):
+    """
+    Vẽ highlight CHỈ những ô có X (board[r][c] == 1) dựa trên grid_bbox chia đều.
+    Cách này ổn định hơn nhiều so với vẽ theo bbox từng cell.
+    """
+    if not grid_bbox or rows <= 0 or cols <= 0:
+        return
+
+    x0, y0, x1, y1 = grid_bbox
+    x0 += DRAW_X_OFF_X; x1 += DRAW_X_OFF_X
+    y0 += DRAW_X_OFF_Y; y1 += DRAW_X_OFF_Y
+
+    W = max(1, x1 - x0)
+    H = max(1, y1 - y0)
+    cell_w = W / float(cols)
+    cell_h = H / float(rows)
+
     overlay = frame_bgr.copy()
     drew = 0
-    for cell in cells:
-        if cell.get("state") != "player_x":
-            continue
-        x0, y0, x1, y1 = cell["x0"], cell["y0"], cell["x1"], cell["y1"]
-        # chỉ highlight ô có X
-        cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 255, 255), -1)
-        drew += 1
+
+    for r in range(rows):
+        for c in range(cols):
+            if board[r][c] != 1:
+                continue
+
+            cx0 = int(round(x0 + c * cell_w))
+            cy0 = int(round(y0 + r * cell_h))
+            cx1 = int(round(x0 + (c + 1) * cell_w))
+            cy1 = int(round(y0 + (r + 1) * cell_h))
+
+            # inset so the highlight doesn't cover blue lines
+            inset_x = int(round((cx1 - cx0) * HILITE_INSET_RATIO))
+            inset_y = int(round((cy1 - cy0) * HILITE_INSET_RATIO))
+            cx0 += inset_x; cx1 -= inset_x
+            cy0 += inset_y; cy1 -= inset_y
+
+            cx0 = max(0, min(frame_bgr.shape[1]-1, cx0))
+            cx1 = max(0, min(frame_bgr.shape[1]-1, cx1))
+            cy0 = max(0, min(frame_bgr.shape[0]-1, cy0))
+            cy1 = max(0, min(frame_bgr.shape[0]-1, cy1))
+
+            if cx1 <= cx0 or cy1 <= cy0:
+                continue
+
+            # Yellow highlight for detected X
+            cv2.rectangle(overlay, (cx0, cy0), (cx1, cy1), (0, 255, 255), -1)
+            drew += 1
 
     if drew > 0:
-        cv2.addWeighted(overlay, 0.30, frame_bgr, 0.70, 0, frame_bgr)
+        cv2.addWeighted(overlay, 0.28, frame_bgr, 0.72, 0, frame_bgr)
 
 
 class BoardState:
@@ -213,7 +275,15 @@ class CameraWeb:
         self.app = Flask("scan_board")
         self._lock = threading.Lock()
         self._last = None
+
+        # raw cells returned from API (for debug list)
         self._cells = []
+
+        # bbox of whole grid (pixel): (x0,y0,x1,y1)
+        self._grid_bbox = None
+        self._grid_rows = GRID_ROWS
+        self._grid_cols = GRID_COLS
+
         self._scan_status = "idle"
         self._stop = threading.Event()
         self._thread = None
@@ -231,6 +301,9 @@ class CameraWeb:
             with self._lock:
                 st["cells"] = self._cells
                 st["scan_status"] = self._scan_status
+                st["grid_bbox"] = self._grid_bbox
+                st["rows"] = self._grid_rows
+                st["cols"] = self._grid_cols
             st["board"] = self.board.snapshot()
             return jsonify(st)
 
@@ -252,13 +325,13 @@ class CameraWeb:
   <style>
     body {{ font-family: Arial, sans-serif; background:#0b0f14; color:#e7eef7; margin:0; }}
     .wrap {{ display:flex; gap:16px; padding:16px; align-items:flex-start; }}
-    .card {{ background:#111827; border:1px solid #223; border-radius:12px; padding:12px; min-width:260px; }}
+    .card {{ background:#111827; border:1px solid #223; border-radius:12px; padding:12px; min-width:300px; }}
     .kv {{ margin:8px 0; }}
     .k {{ color:#93c5fd; }}
     .row {{ display:flex; gap:8px; align-items:center; margin-top:10px; }}
     .btn {{ background:#1f2937; border:1px solid #334155; color:#e7eef7; padding:6px 10px; border-radius:8px; cursor:pointer; }}
     .video {{ border:1px solid #223; border-radius:8px; width:{CAM_W}px; height:{CAM_H}px; }}
-    .cells {{ font-size:11px; color:#cbd5f5; white-space:pre; max-height:260px; overflow:auto; }}
+    .cells {{ font-size:11px; color:#cbd5f5; white-space:pre; max-height:340px; overflow:auto; }}
   </style>
 </head>
 <body>
@@ -269,15 +342,24 @@ class CameraWeb:
       <div class="kv"><span class="k">Robot:</span> <span id="robot">-</span></div>
       <div class="kv"><span class="k">Detected cells:</span> <span id="cells_count">-</span></div>
       <div id="cells" class="cells">-</div>
+
       <div class="kv"><span class="k">Board state:</span></div>
       <div id="board" class="cells">-</div>
+
       <div class="kv"><span class="k">Scan status:</span> <span id="scan_status">idle</span></div>
       <div class="row">
         <button class="btn" onclick="playScan()">Play</button>
       </div>
+
+      <div class="kv" style="margin-top:12px;">
+        <span class="k">Tip:</span> nếu overlay hơi lệch cố định, set env:
+        <div class="cells">DRAW_X_OFF_X=..., DRAW_X_OFF_Y=...</div>
+      </div>
     </div>
+
     <img class="video" id="cam" src="/mjpeg" />
   </div>
+
 <script>
 async function tick() {{
   try {{
@@ -293,18 +375,22 @@ async function tick() {{
     document.getElementById('scan_status').textContent = js.scan_status ?? '-';
   }} catch(e) {{}}
 }}
+
 function formatCells(cells) {{
   if (!cells || !cells.length) return '-';
-  return cells.map(c => `(${{c.r}},${{c.c}}) ${{c.state}} [${{c.x0}},${{c.y0}}]-[${{c.x1}},${{c.y1}}]`).join('\\n');
+  return cells.map(c => `(${c.r},${c.c}) ${c.state} [${c.x0},${c.y0}]-[${c.x1},${c.y1}]`).join('\\n');
 }}
+
 function formatBoard(board) {{
   if (!board || !board.length) return '-';
   return board.map(row => row.join(' ')).join('\\n');
 }}
+
 async function playScan() {{
   try {{ await fetch('/play'); }} catch(e) {{}}
   tick();
 }}
+
 setInterval(tick, 500);
 tick();
 </script>
@@ -315,6 +401,7 @@ tick();
         while not self._stop.is_set():
             with self._lock:
                 frame = None if self._last is None else self._last.copy()
+
             if frame is None:
                 time.sleep(0.05)
                 continue
@@ -325,10 +412,8 @@ tick();
                 continue
 
             jpg = buf.tobytes()
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
-            )
+            yield (b"--frame\r\n"
+                   b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
             time.sleep(0.03)
 
     def get_last_frame(self):
@@ -338,6 +423,12 @@ tick();
     def set_cells(self, cells):
         with self._lock:
             self._cells = cells
+
+    def set_grid_bbox(self, bbox, rows, cols):
+        with self._lock:
+            self._grid_bbox = bbox
+            self._grid_rows = int(rows)
+            self._grid_cols = int(cols)
 
     def set_scan_status(self, status: str):
         with self._lock:
@@ -352,8 +443,9 @@ tick();
     def _capture_loop(self):
         dev = int(CAM_DEV) if str(CAM_DEV).isdigit() else CAM_DEV
         cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
+
         if not cap.isOpened():
-            print(f"[CAM] cannot open camera: {dev}")
+            print(f"[CAM] cannot open camera: {dev}", flush=True)
             self._failed.set()
             self._ready.set()
             return
@@ -371,12 +463,21 @@ tick();
             if ROTATE_180:
                 frame = cv2.rotate(frame, cv2.ROTATE_180)
 
+            # Draw overlay using grid_bbox + board snapshot (stable)
             with self._lock:
-                cells = list(self._cells)
+                grid_bbox = self._grid_bbox
+                rows = self._grid_rows
+                cols = self._grid_cols
 
-            # ✅ chỉ vẽ X
-            if cells:
-                draw_x_overlay_only(frame, cells=cells)
+            board_snapshot = self.board.snapshot()
+
+            # (optional) draw grid lines for debug
+            if grid_bbox:
+                draw_grid_bbox(frame, grid_bbox, rows, cols)
+
+            # highlight ONLY X cells
+            if grid_bbox:
+                draw_x_overlay_by_grid(frame, grid_bbox, rows, cols, board_snapshot)
 
             with self._lock:
                 self._last = frame
@@ -400,7 +501,6 @@ tick();
             ),
             daemon=True,
         ).start()
-
         print(f"[WEB] http://<pi_ip>:{WEB_PORT}/", flush=True)
 
     def wait_ready(self, timeout_sec: float = 5.0) -> bool:
@@ -409,8 +509,9 @@ tick();
 
 
 def main():
-    print("[START] test_dotimboardtictoe", flush=True)
-    board = BoardState()
+    print("[START] test_dotimboardticttoe", flush=True)
+
+    board = BoardState(rows=GRID_ROWS, cols=GRID_COLS)
     cam = CameraWeb(board)
     cam.start()
 
@@ -443,12 +544,22 @@ def main():
                 rows = int(result.get("rows", GRID_ROWS) or GRID_ROWS)
                 cols = int(result.get("cols", GRID_COLS) or GRID_COLS)
 
+                # keep cells list for debug panel
                 cells = _cells_from_result(result, frame.shape)
-                board.set_board(_board_from_cells(rows, cols, cells))
+
+                # build board matrix (X only)
+                board_mat = _board_from_cells(rows, cols, cells)
+                board.set_board(board_mat)
                 cam.set_cells(cells)
 
+                # IMPORTANT: use grid_bbox for stable overlay
+                grid_bbox = _bbox_to_pixels(result.get("grid_bbox"), frame.shape[1], frame.shape[0])
+                cam.set_grid_bbox(grid_bbox, rows, cols)
+
                 cam.set_scan_status("ready")
-                print(f"[SCAN] board updated: player_x={sum(1 for c in cells if c.get('state')=='player_x')}", flush=True)
+                print("[SCAN] board updated",
+                      {"rows": rows, "cols": cols, "player_x": result.get("player_count", "?")},
+                      flush=True)
 
             time.sleep(0.2)
 
