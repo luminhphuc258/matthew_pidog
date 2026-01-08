@@ -8,13 +8,12 @@ import json
 import uuid
 import urllib.request
 import urllib.error
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any
 
 import cv2
 import numpy as np
 from flask import Flask, Response, jsonify, send_file
 from io import BytesIO
-from collections import deque
 
 
 # =========================
@@ -28,24 +27,29 @@ CAM_H = int(os.environ.get("CAM_H", "480"))
 CAM_FPS = int(os.environ.get("CAM_FPS", "12"))
 JPEG_QUALITY = int(os.environ.get("CAM_JPEG_QUALITY", "70"))
 
+# ✅ rotate 180 if needed
 ROTATE_180 = str(os.environ.get("CAM_ROTATE_180", "1")).lower() in ("1", "true", "yes", "on")
 
+# Board is 6x4 (rows=6, cols=4)
 GRID_ROWS = int(os.environ.get("GRID_ROWS", "6"))
 GRID_COLS = int(os.environ.get("GRID_COLS", "4"))
 
+# warp size
 CELL_PX = int(os.environ.get("CELL_PX", "90"))
 WARP_W = GRID_COLS * CELL_PX
 WARP_H = GRID_ROWS * CELL_PX
 
+# endpoint
 SCAN_API_URL = os.environ.get(
     "SCAN_API_URL",
     "https://embeddedprogramming-healtheworldserver.up.railway.app/scan_chess",
 )
 
-STATE_POLL_MS = int(os.environ.get("STATE_POLL_MS", "400"))
+# Web refresh
+STATE_POLL_MS = int(os.environ.get("STATE_POLL_MS", "500"))
 MJPEG_SLEEP = float(os.environ.get("MJPEG_SLEEP", "0.06"))
 
-# Yellow HSV range (tùy bạn chỉnh)
+# ---------- Yellow marker HSV ----------
 Y_H_MIN = int(os.environ.get("Y_H_MIN", "18"))
 Y_H_MAX = int(os.environ.get("Y_H_MAX", "40"))
 Y_S_MIN = int(os.environ.get("Y_S_MIN", "70"))
@@ -53,33 +57,28 @@ Y_S_MAX = int(os.environ.get("Y_S_MAX", "255"))
 Y_V_MIN = int(os.environ.get("Y_V_MIN", "70"))
 Y_V_MAX = int(os.environ.get("Y_V_MAX", "255"))
 
-MARKER_MIN_AREA = int(os.environ.get("MARKER_MIN_AREA", "120"))
+# marker size filter
+MARKER_MIN_AREA = int(os.environ.get("MARKER_MIN_AREA", "140"))     # tăng nhẹ để bớt nhiễu nhỏ
 MARKER_MAX_AREA = int(os.environ.get("MARKER_MAX_AREA", "40000"))
-MARKER_MAX_AR = float(os.environ.get("MARKER_MAX_AR", "6.0"))
-MARKER_MIN_SIDE = int(os.environ.get("MARKER_MIN_SIDE", "8"))
+MARKER_MAX_AR = float(os.environ.get("MARKER_MAX_AR", "6.0"))       # aspect ratio max
+MARKER_MIN_SIDE = int(os.environ.get("MARKER_MIN_SIDE", "8"))       # w/h min
 
-TOP_NOISE_REJECT_Y = float(os.environ.get("TOP_NOISE_REJECT_Y", "0.08"))
-CORNER_BAND = float(os.environ.get("CORNER_BAND", "0.25"))
+# “corner preference”
+CORNER_BAND = float(os.environ.get("CORNER_BAND", "0.22"))  # vùng góc (22% ảnh)
+TOP_NOISE_REJECT_Y = float(os.environ.get("TOP_NOISE_REJECT_Y", "0.10"))  # loại nhiễu nằm quá sát mép trên (10%)
 
-SMOOTH_ALPHA = float(os.environ.get("SMOOTH_ALPHA", "0.30"))  # 0..1
+# ✅ NEW: adaptive filter để loại marker nhiễu nhỏ ở mép trên
+# giữ những marker có area >= max_area * AREA_KEEP_FRAC
+AREA_KEEP_FRAC = float(os.environ.get("AREA_KEEP_FRAC", "0.35"))  # 0.30~0.50 tuỳ thực tế
 
+# board bbox padding (giữ 0 nếu muốn đúng “vùng góc”)
+BBOX_PAD_PX = int(os.environ.get("BBOX_PAD_PX", "0"))  # bạn muốn fixed => 0
 
-# =========================
-# LOG BUFFER (shown on web)
-# =========================
-LOG_MAX = 250
-_logq = deque(maxlen=LOG_MAX)
-_log_lock = threading.Lock()
+# if only 3 markers, infer the 4th using rectangle rule
+ALLOW_INFER_4TH = str(os.environ.get("ALLOW_INFER_4TH", "1")).lower() in ("1", "true", "yes", "on")
 
-def log(msg: str):
-    s = f"[{time.strftime('%H:%M:%S')}] {msg}"
-    with _log_lock:
-        _logq.append(s)
-    print(s, flush=True)
-
-def get_logs() -> str:
-    with _log_lock:
-        return "\n".join(_logq)
+# smooth bbox to reduce jitter
+BBOX_SMOOTH_ALPHA = float(os.environ.get("BBOX_SMOOTH_ALPHA", "0.25"))
 
 
 # =========================
@@ -90,6 +89,7 @@ def _encode_jpeg(img_bgr, quality=JPEG_QUALITY) -> bytes:
     if not ok:
         return b""
     return buf.tobytes()
+
 
 def _post_image_to_api(image_bytes: bytes) -> Optional[Dict[str, Any]]:
     if not image_bytes:
@@ -123,19 +123,23 @@ def _post_image_to_api(image_bytes: bytes) -> Optional[Dict[str, Any]]:
             detail = exc.read().decode("utf-8", errors="ignore")
         except Exception:
             detail = ""
-        log(f"[SCAN] HTTPError {exc.code}: {detail[:280]}")
+        print(f"[SCAN] HTTPError {exc.code}: {detail[:350]}", flush=True)
         return None
     except urllib.error.URLError as exc:
-        log(f"[SCAN] URLError: {exc}")
+        print(f"[SCAN] URLError: {exc}", flush=True)
         return None
     except Exception as exc:
-        log(f"[SCAN] parse failed: {exc}")
+        print(f"[SCAN] parse failed: {exc}", flush=True)
         return None
 
 
 # =========================
 # Geometry helpers
 # =========================
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
 def order_points_4(pts: np.ndarray) -> np.ndarray:
     """Return TL, TR, BR, BL"""
     pts = np.asarray(pts, dtype=np.float32).reshape(4, 2)
@@ -147,24 +151,47 @@ def order_points_4(pts: np.ndarray) -> np.ndarray:
     bl = pts[np.argmax(diff)]
     return np.array([tl, tr, br, bl], dtype=np.float32)
 
-def smooth_pts(prev: Optional[np.ndarray], cur: np.ndarray, alpha: float) -> np.ndarray:
-    if prev is None:
-        return cur.astype(np.float32)
-    return ((1 - alpha) * prev + alpha * cur).astype(np.float32)
 
-def warp_from_quad(frame_bgr, quad4: np.ndarray) -> np.ndarray:
-    quad4 = order_points_4(quad4)
+def bbox_from_centers(centers: np.ndarray, w: int, h: int, pad_px: int = 0) -> Tuple[int, int, int, int]:
+    xs = centers[:, 0]
+    ys = centers[:, 1]
+    x0 = int(np.floor(xs.min())) - pad_px
+    x1 = int(np.ceil(xs.max())) + pad_px
+    y0 = int(np.floor(ys.min())) - pad_px
+    y1 = int(np.ceil(ys.max())) + pad_px
+    x0 = clamp(x0, 0, w - 2)
+    y0 = clamp(y0, 0, h - 2)
+    x1 = clamp(x1, x0 + 2, w - 1)
+    y1 = clamp(y1, y0 + 2, h - 1)
+    return x0, y0, x1, y1
+
+
+def warp_rect(frame_bgr, rect_bbox: Tuple[int, int, int, int]) -> np.ndarray:
+    x0, y0, x1, y1 = rect_bbox
+    src = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
     dst = np.array([[0, 0], [WARP_W - 1, 0], [WARP_W - 1, WARP_H - 1], [0, WARP_H - 1]], dtype=np.float32)
-    M = cv2.getPerspectiveTransform(quad4.astype(np.float32), dst)
+    M = cv2.getPerspectiveTransform(src, dst)
     return cv2.warpPerspective(frame_bgr, M, (WARP_W, WARP_H))
 
 
+def smooth_bbox(prev: Optional[Tuple[int, int, int, int]], cur: Tuple[int, int, int, int], alpha: float) -> Tuple[int, int, int, int]:
+    if prev is None:
+        return cur
+    px0, py0, px1, py1 = prev
+    cx0, cy0, cx1, cy1 = cur
+    x0 = int(round((1 - alpha) * px0 + alpha * cx0))
+    y0 = int(round((1 - alpha) * py0 + alpha * cy0))
+    x1 = int(round((1 - alpha) * px1 + alpha * cx1))
+    y1 = int(round((1 - alpha) * py1 + alpha * cy1))
+    return (x0, y0, x1, y1)
+
+
 # =========================
-# Marker-only Detector (inner-corner quad)
+# Marker-only Detector
 # =========================
 class MarkerBoardDetector:
     def __init__(self):
-        self.prev_quad: Optional[np.ndarray] = None
+        self.prev_bbox: Optional[Tuple[int, int, int, int]] = None
 
     def _mask_yellow(self, frame_bgr) -> np.ndarray:
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
@@ -180,6 +207,7 @@ class MarkerBoardDetector:
     def _extract_candidates(self, frame_bgr) -> Dict[str, Any]:
         h, w = frame_bgr.shape[:2]
         mask = self._mask_yellow(frame_bgr)
+
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         cand = []
@@ -191,7 +219,7 @@ class MarkerBoardDetector:
                 continue
 
             rect = cv2.minAreaRect(c)
-            (cx, cy), (rw, rh), _ = rect
+            (cx, cy), (rw, rh), ang = rect
             if rw < MARKER_MIN_SIDE or rh < MARKER_MIN_SIDE:
                 continue
 
@@ -199,32 +227,39 @@ class MarkerBoardDetector:
             if ar > MARKER_MAX_AR:
                 continue
 
+            center = np.array([cx, cy], dtype=np.float32)
+
+            # reject noisy yellow objects too close to top edge
             if cy < TOP_NOISE_REJECT_Y * h:
-                # vẽ marker bị reject
                 box = cv2.boxPoints(rect).astype(np.int32)
                 cv2.drawContours(dbg, [box], -1, (0, 0, 255), 2)
-                cv2.putText(dbg, "REJ_TOP", (int(cx)+5, int(cy)+5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+                cv2.circle(dbg, (int(cx), int(cy)), 4, (0, 0, 255), -1)
+                cv2.putText(dbg, "REJ_TOP", (int(cx) + 6, int(cy) + 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
                 continue
 
-            box = cv2.boxPoints(rect).astype(np.float32)
-            cv2.drawContours(dbg, [box.astype(np.int32)], -1, (0, 255, 0), 2)
+            box = cv2.boxPoints(rect).astype(np.int32)
+            cv2.drawContours(dbg, [box], -1, (0, 0, 255), 2)
             cv2.circle(dbg, (int(cx), int(cy)), 4, (0, 0, 255), -1)
 
             cand.append({
-                "center": np.array([cx, cy], dtype=np.float32),
-                "box": box,
+                "center": center,
                 "area": area,
+                "ar": float(ar),
             })
-
-        cv2.putText(dbg, f"candidates={len(cand)}", (12, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
 
         return {"mask": mask, "candidates": cand, "debug": dbg}
 
-    def _pick_best_4_by_corners(self, candidates: List[Dict[str, Any]], w: int, h: int) -> List[Dict[str, Any]]:
+    def _pick_best_4_by_corners(self, candidates: List[Dict[str, Any]], w: int, h: int) -> List[np.ndarray]:
+        """
+        Chọn 4 marker đúng bằng scoring theo 4 góc ảnh.
+        + ưu tiên nằm trong vùng góc (CORNER_BAND)
+        + penalty nếu nằm ngược phía
+        """
         if not candidates:
             return []
+
+        centers = [c["center"] for c in candidates]
 
         corners = {
             "tl": np.array([0.0, 0.0], dtype=np.float32),
@@ -236,31 +271,46 @@ class MarkerBoardDetector:
         band_x = CORNER_BAND * w
         band_y = CORNER_BAND * h
 
-        def in_band(pt, key):
+        def in_corner_band(pt, key: str) -> bool:
             x, y = float(pt[0]), float(pt[1])
-            if key == "tl": return x <= band_x and y <= band_y
-            if key == "tr": return x >= (w - band_x) and y <= band_y
-            if key == "br": return x >= (w - band_x) and y >= (h - band_y)
-            if key == "bl": return x <= band_x and y >= (h - band_y)
+            if key == "tl":
+                return x <= band_x and y <= band_y
+            if key == "tr":
+                return x >= (w - band_x) and y <= band_y
+            if key == "br":
+                return x >= (w - band_x) and y >= (h - band_y)
+            if key == "bl":
+                return x <= band_x and y >= (h - band_y)
             return False
 
         picked = {}
         used = set()
+
         for key in ["tl", "tr", "br", "bl"]:
             best_i = None
             best_score = 1e18
-            for i, c in enumerate(candidates):
+            for i, pt in enumerate(centers):
                 if i in used:
                     continue
-                pt = c["center"]
                 d = float(np.linalg.norm(pt - corners[key]))
-                if in_band(pt, key):
-                    d *= 0.55
+                if in_corner_band(pt, key):
+                    d *= 0.65
+
+                if key in ("tl", "bl") and pt[0] > w * 0.75:
+                    d *= 2.0
+                if key in ("tr", "br") and pt[0] < w * 0.25:
+                    d *= 2.0
+                if key in ("tl", "tr") and pt[1] > h * 0.75:
+                    d *= 2.0
+                if key in ("bl", "br") and pt[1] < h * 0.25:
+                    d *= 2.0
+
                 if d < best_score:
                     best_score = d
                     best_i = i
+
             if best_i is not None:
-                picked[key] = candidates[best_i]
+                picked[key] = centers[best_i]
                 used.add(best_i)
 
         out = []
@@ -269,75 +319,133 @@ class MarkerBoardDetector:
                 out.append(picked[key])
         return out
 
-    def detect_board_quad(self, frame_bgr) -> Dict[str, Any]:
+    def _infer_4th(self, pts3: List[np.ndarray]) -> Optional[np.ndarray]:
+        """infer 4th point from 3 corners: p_missing = pA + pC - pB (parallelogram)"""
+        if len(pts3) != 3:
+            return None
+
+        pts = np.array(pts3, dtype=np.float32)
+        cen = pts.mean(axis=0)
+
+        slots = {}
+        for p in pts:
+            if p[0] < cen[0] and p[1] < cen[1]:
+                slots["tl"] = p
+            elif p[0] >= cen[0] and p[1] < cen[1]:
+                slots["tr"] = p
+            elif p[0] >= cen[0] and p[1] >= cen[1]:
+                slots["br"] = p
+            else:
+                slots["bl"] = p
+
+        keys = {"tl", "tr", "br", "bl"}
+        missing = list(keys - set(slots.keys()))
+        if len(missing) != 1:
+            p0, p1, p2 = pts
+            return p0 + p2 - p1
+
+        m = missing[0]
+        tl = slots.get("tl")
+        tr = slots.get("tr")
+        br = slots.get("br")
+        bl = slots.get("bl")
+
+        if m == "tl" and tr is not None and br is not None and bl is not None:
+            return tr + bl - br
+        if m == "tr" and tl is not None and br is not None and bl is not None:
+            return tl + br - bl
+        if m == "br" and tl is not None and tr is not None and bl is not None:
+            return tr + bl - tl
+        if m == "bl" and tl is not None and tr is not None and br is not None:
+            return tl + br - tr
+
+        return None
+
+    def detect_board_bbox(self, frame_bgr) -> Dict[str, Any]:
         h, w = frame_bgr.shape[:2]
+
         ex = self._extract_candidates(frame_bgr)
-        mask = ex["mask"]
+        cand_all = ex["candidates"]
+
         dbg = ex["debug"].copy()
-        cand = ex["candidates"]
+        mask = ex["mask"]
 
+        # ==========================================================
+        # ✅ FIX CHÍNH: loại marker nhiễu nhỏ ở mép trên bằng area ratio
+        # ==========================================================
+        cand = cand_all
+        if len(cand_all) >= 4:
+            max_area = max(c["area"] for c in cand_all)
+            keep_thr = max_area * max(0.05, min(0.90, AREA_KEEP_FRAC))
+            cand_big = [c for c in cand_all if c["area"] >= keep_thr]
+
+            # vẽ info lên debug
+            cv2.putText(dbg, f"max_area={int(max_area)} keep>={int(keep_thr)} n_big={len(cand_big)}",
+                        (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+
+            # nếu lọc mà vẫn đủ 4 -> dùng cand_big (để loại nhiễu nhỏ)
+            # nếu lọc quá mạnh (<4) -> fallback lại cand_all
+            if len(cand_big) >= 4:
+                cand = cand_big
+            else:
+                cand = cand_all
+
+        # pick best 4 by corner scoring (trên danh sách đã lọc)
         picked = self._pick_best_4_by_corners(cand, w, h)
+
+        # fallback: nếu vẫn thiếu 4 nhưng tổng cand_all >=4 thì dùng top theo area
+        if len(picked) < 4 and len(cand_all) >= 4:
+            cand2 = sorted(cand_all, key=lambda x: x["area"], reverse=True)[:8]
+            picked = self._pick_best_4_by_corners(cand2, w, h)
+
+        inferred = None
+        if len(picked) == 3 and ALLOW_INFER_4TH:
+            inferred = self._infer_4th(picked)
+            if inferred is not None:
+                picked = picked + [inferred]
+
         if len(picked) < 4:
-            cv2.putText(dbg, "NOT ENOUGH markers in 4 corners", (12, 58),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
-            return {"found": False, "mask": mask, "debug": dbg, "reason": "not_enough_markers"}
+            return {
+                "found": False,
+                "bbox": None,
+                "mask": mask,
+                "debug": dbg,
+                "picked_centers": picked,
+                "inferred": inferred
+            }
 
-        centers4 = order_points_4(np.array([c["center"] for c in picked], dtype=np.float32))
+        centers4 = np.array(picked[:4], dtype=np.float32)
+        centers4 = order_points_4(centers4)
 
-        # Stage: connect centers
-        stage_centers = frame_bgr.copy()
-        cv2.polylines(stage_centers, [centers4.astype(np.int32)], True, (0, 255, 255), 3)
+        # draw centers
         for i, p in enumerate(centers4):
-            cv2.circle(stage_centers, (int(p[0]), int(p[1])), 6, (0,0,255), -1)
-            cv2.putText(stage_centers, f"C{i}", (int(p[0])+6, int(p[1])-6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
-        cv2.putText(stage_centers, "4_center_poly", (12, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
+            cv2.circle(dbg, (int(p[0]), int(p[1])), 6, (255, 0, 255), -1)
+            cv2.putText(dbg, f"C{i}", (int(p[0]) + 6, int(p[1]) - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
-        # Inner corner: choose marker box corner nearest global center
-        global_c = centers4.mean(axis=0)
-        inner_pts = []
-        stage_inner = frame_bgr.copy()
+        bbox = bbox_from_centers(centers4, w, h, pad_px=BBOX_PAD_PX)
+        bbox = smooth_bbox(self.prev_bbox, bbox, BBOX_SMOOTH_ALPHA)
+        self.prev_bbox = bbox
 
-        for idx, c in enumerate(picked):
-            box = c["box"]
-            dists = np.linalg.norm(box - global_c.reshape(1,2), axis=1)
-            k = int(np.argmin(dists))
-            inner = box[k]
-            inner_pts.append(inner)
+        x0, y0, x1, y1 = bbox
 
-            cv2.drawContours(stage_inner, [box.astype(np.int32)], -1, (0,255,0), 2)
-            cv2.circle(stage_inner, (int(inner[0]), int(inner[1])), 8, (255,0,255), -1)
-            cv2.putText(stage_inner, f"I{idx}", (int(inner[0])+6, int(inner[1])-6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,0,255), 2)
-
-        quad = order_points_4(np.array(inner_pts, dtype=np.float32))
-        quad = smooth_pts(self.prev_quad, quad, SMOOTH_ALPHA)
-        self.prev_quad = quad
-
-        stage_quad = frame_bgr.copy()
-        cv2.polylines(stage_quad, [quad.astype(np.int32)], True, (0,255,255), 3)
-        for i, p in enumerate(quad):
-            cv2.circle(stage_quad, (int(p[0]), int(p[1])), 6, (255,0,255), -1)
-            cv2.putText(stage_quad, f"Q{i}", (int(p[0])+6, int(p[1])-6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,0,255), 2)
-        cv2.putText(stage_quad, "board_quad (inner corners)", (12, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
+        out = frame_bgr.copy()
+        cv2.rectangle(out, (x0, y0), (x1, y1), (0, 255, 255), 2)
+        cv2.putText(out, "board_bbox (marker-only)", (x0 + 10, max(20, y0 - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
         return {
             "found": True,
+            "bbox": bbox,
             "mask": mask,
             "debug": dbg,
-            "stage_centers_poly": stage_centers,
-            "stage_inner_debug": stage_inner,
-            "stage_board_quad": stage_quad,
-            "quad": quad,
-            "cand_count": len(cand),
+            "board_bbox_img": out,
+            "centers4": centers4,
         }
 
 
 # =========================
-# Board state
+# Board State store
 # =========================
 class BoardState:
     def __init__(self, rows: int, cols: int):
@@ -364,6 +472,7 @@ class BoardState:
             ts = self.last_scan_ts
         return {"empty": empty, "player_x": player_x, "robot_o": robot_o, "last_scan_ts": ts}
 
+
 def board_from_server_cells(rows: int, cols: int, cells: List[Dict[str, Any]]) -> List[List[int]]:
     board = [[0 for _ in range(cols)] for _ in range(rows)]
     for cell in cells:
@@ -373,7 +482,7 @@ def board_from_server_cells(rows: int, cols: int, cells: List[Dict[str, Any]]) -
         if 0 <= r < rows and 0 <= c < cols:
             if st in ("player_x", "x", "human_x"):
                 board[r][c] = 1
-            elif st in ("robot_o", "o", "circle", "player_o"):
+            elif st in ("robot_o", "robot_circle", "player_o", "o", "circle"):
                 board[r][c] = 2
             else:
                 board[r][c] = 0
@@ -386,14 +495,13 @@ def board_from_server_cells(rows: int, cols: int, cells: List[Dict[str, Any]]) -
 class CameraWeb:
     def __init__(self, board: BoardState):
         self.board = board
-        self.app = Flask("scan_board_marker_debuglog")
+        self.app = Flask("scan_board_marker_only")
         self._lock = threading.Lock()
 
         self._last_frame = None
         self._scan_status = "idle"
         self._cells_server: List[Dict[str, Any]] = []
         self._stages_jpg: Dict[str, bytes] = {}
-        self._last_error = ""
 
         self._stop = threading.Event()
         self._ready = threading.Event()
@@ -413,15 +521,12 @@ class CameraWeb:
                 st["cols"] = self.board.cols
                 st["cells_server"] = self._cells_server
                 st["stages"] = list(self._stages_jpg.keys())
-                st["last_error"] = self._last_error
             st["board"] = self.board.snapshot()
-            st["logs"] = get_logs()
             return jsonify(st)
 
         @self.app.get("/play")
         def play():
             self._play_requested.set()
-            log("[WEB] Play Scan received")
             return jsonify({"ok": True})
 
         @self.app.get("/mjpeg")
@@ -441,11 +546,12 @@ class CameraWeb:
 <html>
 <head>
   <meta charset="utf-8"/>
-  <title>Scan Board 6x4 (marker debug log)</title>
+  <title>Scan Board 6x4 (marker-only)</title>
   <style>
     body {{ font-family: Arial, sans-serif; background:#0b0f14; color:#e7eef7; margin:0; }}
-    .wrap {{ display:grid; grid-template-columns: 420px 1fr 420px; gap:14px; padding:14px; }}
-    .card {{ background:#111827; border:1px solid #223; border-radius:12px; padding:12px; }}
+    .wrap {{ display:grid; grid-template-columns: 1fr 420px; gap:14px; padding:14px; }}
+    .left {{ display:flex; gap:14px; align-items:flex-start; }}
+    .card {{ background:#111827; border:1px solid #223; border-radius:12px; padding:12px; min-width:360px; }}
     .kv {{ margin:8px 0; }}
     .k {{ color:#93c5fd; }}
     .btn {{ background:#1f2937; border:1px solid #334155; color:#e7eef7; padding:8px 12px; border-radius:10px; cursor:pointer; }}
@@ -459,36 +565,33 @@ class CameraWeb:
 </head>
 <body>
   <div class="wrap">
-    <div class="card">
-      <div class="kv"><span class="k">Board:</span> rows=<span id="rows">-</span>, cols=<span id="cols">-</span></div>
-      <div class="kv"><span class="k">Scan status:</span> <span id="scan_status">-</span></div>
-      <div class="kv"><span class="k">Last error:</span></div>
-      <div id="last_error" class="mono" style="max-height:70px; overflow:auto;">-</div>
+    <div class="left">
+      <div class="card">
+        <div class="kv"><span class="k">Board:</span> rows=<span id="rows">-</span>, cols=<span id="cols">-</span></div>
+        <div class="kv"><span class="k">Scan status:</span> <span id="scan_status">-</span></div>
 
-      <div class="kv"><span class="k">Empty:</span> <span id="empty">-</span></div>
-      <div class="kv"><span class="k">Player X:</span> <span id="player_x">-</span></div>
-      <div class="kv"><span class="k">Robot O:</span> <span id="robot_o">-</span></div>
+        <div class="kv"><span class="k">Empty:</span> <span id="empty">-</span></div>
+        <div class="kv"><span class="k">Player X:</span> <span id="player_x">-</span></div>
+        <div class="kv"><span class="k">Robot O:</span> <span id="robot_o">-</span></div>
 
-      <div class="kv"><span class="k">Board state:</span></div>
-      <div id="board" class="mono">-</div>
+        <div class="kv"><span class="k">Board state:</span></div>
+        <div id="board" class="mono">-</div>
 
-      <div class="kv"><span class="k">Cells (server):</span></div>
-      <div id="cells" class="mono" style="max-height:220px; overflow:auto;">-</div>
+        <div class="kv"><span class="k">Cells (server):</span></div>
+        <div id="cells" class="mono" style="max-height:240px; overflow:auto;">-</div>
 
-      <div class="kv">
-        <button class="btn" onclick="playScan()">Play Scan</button>
-        <div class="muted" style="margin-top:8px;">Stages chỉ update sau scan xong để đỡ giật.</div>
+        <div class="kv">
+          <button class="btn" onclick="playScan()">Play Scan</button>
+          <div class="muted" style="margin-top:8px;">Stages chỉ update sau khi scan xong để đỡ giật.</div>
+        </div>
       </div>
 
-      <div class="kv"><span class="k">Logs:</span></div>
-      <div id="logs" class="mono" style="max-height:260px; overflow:auto; border:1px solid #223; padding:8px; border-radius:10px;">-</div>
+      <img class="video" id="cam" src="/mjpeg" />
     </div>
-
-    <img class="video" id="cam" src="/mjpeg" />
 
     <div class="stages">
       <div class="title">Processing Stages</div>
-      <div class="muted">Nếu scan fail, bạn vẫn thấy marker_mask + marker_debug ở đây.</div>
+      <div class="muted">marker-only: không dùng edges.</div>
       <div id="stage_list"></div>
     </div>
   </div>
@@ -534,17 +637,12 @@ async function tick() {{
     document.getElementById('player_x').textContent = js.player_x ?? '-';
     document.getElementById('robot_o').textContent = js.robot_o ?? '-';
 
-    document.getElementById('last_error').textContent = js.last_error || '-';
     document.getElementById('board').textContent = formatBoard(js.board);
     document.getElementById('cells').textContent = formatCells(js.cells_server);
-    document.getElementById('logs').textContent = js.logs || '-';
 
     const ts = js.last_scan_ts || 0;
-    if ((js.stages || []).length && ts !== last_ts) {{
+    if (ts > 0 && ts !== last_ts) {{
       last_ts = ts;
-      renderStages(js.stages || []);
-    }} else {{
-      // even if fail, still render stages if existed
       renderStages(js.stages || []);
     }}
   }} catch(e) {{}}
@@ -593,10 +691,6 @@ tick();
         with self._lock:
             self._scan_status = str(status)
 
-    def set_last_error(self, s: str):
-        with self._lock:
-            self._last_error = s[:800]
-
     def set_cells_server(self, cells: List[Dict[str, Any]]):
         with self._lock:
             self._cells_server = cells or []
@@ -610,7 +704,7 @@ tick();
                 img_bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
             else:
                 img_bgr = img
-            jpgs[name] = _encode_jpeg(img_bgr, quality=85)
+            jpgs[name] = _encode_jpeg(img_bgr, quality=80)
         with self._lock:
             self._stages_jpg = jpgs
 
@@ -625,7 +719,7 @@ tick();
         cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
 
         if not cap.isOpened():
-            log(f"[CAM] cannot open camera: {dev}")
+            print(f"[CAM] cannot open camera: {dev}", flush=True)
             self._failed.set()
             self._ready.set()
             return
@@ -633,8 +727,6 @@ tick();
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_W)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
         cap.set(cv2.CAP_PROP_FPS, CAM_FPS)
-
-        log("[CAM] capture started")
 
         while not self._stop.is_set():
             ok, frame = cap.read()
@@ -663,7 +755,7 @@ tick();
             ),
             daemon=True,
         ).start()
-        log(f"[WEB] http://<pi_ip>:{WEB_PORT}/")
+        print(f"[WEB] http://<pi_ip>:{WEB_PORT}/", flush=True)
 
     def wait_ready(self, timeout_sec: float = 5.0) -> bool:
         self._ready.wait(timeout=max(0.1, float(timeout_sec)))
@@ -671,89 +763,79 @@ tick();
 
 
 # =========================
-# MAIN LOOP (never die)
+# MAIN
 # =========================
 def main():
-    log("[START] marker-only inner-quad + web logs")
-    log(f"[CFG] GRID_ROWS={GRID_ROWS} GRID_COLS={GRID_COLS}  ROTATE_180={ROTATE_180}")
-    log(f"[CFG] SCAN_API_URL={SCAN_API_URL}")
+    print("[START] marker_only_board_bbox_send_bbox_and_warp", flush=True)
+    print(f"[CFG] GRID_ROWS={GRID_ROWS} GRID_COLS={GRID_COLS}", flush=True)
+    print(f"[CFG] ROTATE_180={ROTATE_180}", flush=True)
+    print(f"[CFG] HSV H[{Y_H_MIN},{Y_H_MAX}] S[{Y_S_MIN},{Y_S_MAX}] V[{Y_V_MIN},{Y_V_MAX}]", flush=True)
+    print(f"[CFG] TOP_NOISE_REJECT_Y={TOP_NOISE_REJECT_Y} CORNER_BAND={CORNER_BAND}", flush=True)
+    print(f"[CFG] AREA_KEEP_FRAC={AREA_KEEP_FRAC}", flush=True)
 
     board = BoardState(rows=GRID_ROWS, cols=GRID_COLS)
     cam = CameraWeb(board)
     cam.start()
 
-    if not cam.wait_ready(timeout_sec=6.0):
-        log("[FATAL] camera not ready")
+    if not cam.wait_ready(timeout_sec=5.0):
+        print("[CAM] not ready, stop", flush=True)
         return
 
     detector = MarkerBoardDetector()
-    log("[READY] press Play Scan")
 
-    while True:
-        try:
+    print("[WEB] press Play Scan to run pipeline", flush=True)
+
+    try:
+        while True:
             if not cam.consume_scan_request():
                 time.sleep(0.08)
                 continue
 
-            cam.set_last_error("")
             cam.set_scan_status("scanning")
-            log("[SCAN] start")
 
             frame = cam.get_last_frame()
             if frame is None:
-                cam.set_last_error("frame is None")
                 cam.set_scan_status("failed")
-                log("[SCAN] failed: frame is None")
-                time.sleep(0.15)
+                time.sleep(0.2)
                 continue
 
             stages: Dict[str, np.ndarray] = {}
 
-            det = detector.detect_board_quad(frame)
+            det = detector.detect_board_bbox(frame)
             stages["3m_marker_mask"] = det.get("mask")
             stages["3m_marker_debug"] = det.get("debug")
 
-            if not det.get("found"):
-                reason = det.get("reason", "unknown")
-                cam.set_last_error(f"board_quad not found: {reason}")
+            if not det["found"] or det.get("bbox") is None:
                 fail = frame.copy()
-                cv2.putText(fail, f"board_quad NOT found ({reason})", (12, 32),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
-                stages["4_fail"] = fail
+                cv2.putText(fail, "board_bbox NOT found (markers)", (12, 32),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                stages["4_board_bbox"] = fail
                 cam.set_stage_images(stages)
                 cam.set_cells_server([])
                 cam.set_scan_status("failed")
-                log(f"[SCAN] failed: {reason}")
-                time.sleep(0.15)
+                time.sleep(0.2)
                 continue
 
-            stages["4_center_poly"] = det.get("stage_centers_poly")
-            stages["4b_inner_corner_debug"] = det.get("stage_inner_debug")
-            stages["4c_board_quad"] = det.get("stage_board_quad")
+            bbox = det["bbox"]
+            stages["4_board_bbox"] = det.get("board_bbox_img")
 
-            quad = det["quad"]
-            warp = warp_from_quad(frame, quad)
+            warp = warp_rect(frame, bbox)
             stages["5_warp"] = warp
 
-            # Final sent image: stack board_quad + warp
-            board_quad_img = stages["4c_board_quad"]
+            board_bbox_img = stages["4_board_bbox"]
             bw = warp.shape[1]
-            bh = int(round(board_quad_img.shape[0] * (bw / max(1, board_quad_img.shape[1]))))
-            board_small = cv2.resize(board_quad_img, (bw, bh))
+            bh = int(round(board_bbox_img.shape[0] * (bw / max(1, board_bbox_img.shape[1]))))
+            board_small = cv2.resize(board_bbox_img, (bw, bh))
             send_img = np.vstack([board_small, warp])
-            stages["6_final_sent_to_server"] = send_img
+            stages["6_sent_image"] = send_img
 
-            # Upload
-            log("[SCAN] uploading to server...")
-            result = _post_image_to_api(_encode_jpeg(send_img, quality=85))
+            result = _post_image_to_api(_encode_jpeg(send_img, quality=80))
 
             if not result or not result.get("found"):
-                cam.set_last_error("server returned found=false or no response")
                 cam.set_stage_images(stages)
                 cam.set_cells_server([])
                 cam.set_scan_status("failed")
-                log("[SCAN] failed: server no/invalid response")
-                time.sleep(0.15)
+                time.sleep(0.2)
                 continue
 
             cells = result.get("cells", []) or []
@@ -764,16 +846,12 @@ def main():
 
             cam.set_stage_images(stages)
             cam.set_scan_status("ready")
-            log(f"[SCAN] ok, cells={len(cells)}")
 
+            print("[SCAN] ok", {"cells": len(cells), "bbox": bbox}, flush=True)
             time.sleep(0.15)
 
-        except Exception as e:
-            # never die
-            cam.set_last_error(f"scan-loop exception: {repr(e)}")
-            cam.set_scan_status("failed")
-            log(f"[ERROR] scan-loop exception: {repr(e)}")
-            time.sleep(0.3)
+    except KeyboardInterrupt:
+        print("\n[EXIT] Ctrl+C", flush=True)
 
 
 if __name__ == "__main__":
