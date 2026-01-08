@@ -11,7 +11,6 @@ import urllib.error
 from typing import List, Optional, Tuple
 
 import cv2
-import numpy as np
 from flask import Flask, Response, jsonify
 
 WEB_PORT = 8000
@@ -30,12 +29,12 @@ SCAN_API_URL = os.environ.get(
     "https://embeddedprogramming-healtheworldserver.up.railway.app/scan_chess",
 )
 
-# Fine-tune overlay if your camera has constant offset (optional)
+# Nếu overlay bị lệch cố định (do camera / cắt ảnh), chỉnh 2 biến này:
 DRAW_X_OFF_X = int(os.environ.get("DRAW_X_OFF_X", "0"))
 DRAW_X_OFF_Y = int(os.environ.get("DRAW_X_OFF_Y", "0"))
 
-# Optional: shrink highlight inside each cell so it looks nicer
-HILITE_INSET_RATIO = float(os.environ.get("HILITE_INSET_RATIO", "0.12"))  # 12% inset
+# inset để highlight không che đường kẻ
+HILITE_INSET_RATIO = float(os.environ.get("HILITE_INSET_RATIO", "0.12"))
 
 
 def _encode_frame_jpeg(frame_bgr) -> bytes:
@@ -46,10 +45,6 @@ def _encode_frame_jpeg(frame_bgr) -> bytes:
 
 
 def _post_image_to_api(image_bytes: bytes):
-    """
-    POST multipart/form-data:
-      field name: image
-    """
     if not image_bytes:
         return None
 
@@ -92,19 +87,14 @@ def _post_image_to_api(image_bytes: bytes):
 
 
 def _bbox_to_pixels(bbox, w: int, h: int) -> Optional[Tuple[int, int, int, int]]:
-    """
-    Accept bbox in either normalized [0..1] or pixel units.
-    """
     if not bbox or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
         return None
     x0, y0, x1, y1 = bbox
-
     try:
         x0 = float(x0); y0 = float(y0); x1 = float(x1); y1 = float(y1)
     except Exception:
         return None
 
-    # normalized?
     if max(abs(x0), abs(y0), abs(x1), abs(y1)) <= 1.5:
         x0 = int(round(x0 * w))
         x1 = int(round(x1 * w))
@@ -126,9 +116,6 @@ def _bbox_to_pixels(bbox, w: int, h: int) -> Optional[Tuple[int, int, int, int]]
 
 
 def _cells_from_result(result, frame_shape):
-    """
-    Convert API cells -> pixel bbox list
-    """
     h, w = frame_shape[:2]
     cells = []
     for cell in result.get("cells", []):
@@ -139,21 +126,13 @@ def _cells_from_result(result, frame_shape):
         cells.append({
             "r": int(cell.get("row", 0)),
             "c": int(cell.get("col", 0)),
-            "x0": x0,
-            "y0": y0,
-            "x1": x1,
-            "y1": y1,
+            "x0": x0, "y0": y0, "x1": x1, "y1": y1,
             "state": str(cell.get("state", "empty")),
         })
     return cells
 
 
 def _board_from_cells(rows: int, cols: int, cells):
-    """
-    0 empty
-    1 player_x
-    2 robot_line (if ever used)
-    """
     board = [[0 for _ in range(cols)] for _ in range(rows)]
     for cell in cells:
         r = cell.get("r", -1)
@@ -168,9 +147,6 @@ def _board_from_cells(rows: int, cols: int, cells):
 
 
 def draw_grid_bbox(frame_bgr, grid_bbox, rows, cols):
-    """
-    Draw light grid lines based on grid_bbox (debug).
-    """
     if not grid_bbox or rows <= 0 or cols <= 0:
         return
     x0, y0, x1, y1 = grid_bbox
@@ -182,23 +158,16 @@ def draw_grid_bbox(frame_bgr, grid_bbox, rows, cols):
     cell_w = W / float(cols)
     cell_h = H / float(rows)
 
-    # outer box
     cv2.rectangle(frame_bgr, (x0, y0), (x1, y1), (0, 255, 255), 1)
-    # verticals
     for c in range(1, cols):
         xx = int(round(x0 + c * cell_w))
         cv2.line(frame_bgr, (xx, y0), (xx, y1), (0, 255, 255), 1)
-    # horizontals
     for r in range(1, rows):
         yy = int(round(y0 + r * cell_h))
         cv2.line(frame_bgr, (x0, yy), (x1, yy), (0, 255, 255), 1)
 
 
 def draw_x_overlay_by_grid(frame_bgr, grid_bbox, rows, cols, board):
-    """
-    Vẽ highlight CHỈ những ô có X (board[r][c] == 1) dựa trên grid_bbox chia đều.
-    Cách này ổn định hơn nhiều so với vẽ theo bbox từng cell.
-    """
     if not grid_bbox or rows <= 0 or cols <= 0:
         return
 
@@ -218,27 +187,23 @@ def draw_x_overlay_by_grid(frame_bgr, grid_bbox, rows, cols, board):
         for c in range(cols):
             if board[r][c] != 1:
                 continue
-
             cx0 = int(round(x0 + c * cell_w))
             cy0 = int(round(y0 + r * cell_h))
             cx1 = int(round(x0 + (c + 1) * cell_w))
             cy1 = int(round(y0 + (r + 1) * cell_h))
 
-            # inset so the highlight doesn't cover blue lines
             inset_x = int(round((cx1 - cx0) * HILITE_INSET_RATIO))
             inset_y = int(round((cy1 - cy0) * HILITE_INSET_RATIO))
             cx0 += inset_x; cx1 -= inset_x
             cy0 += inset_y; cy1 -= inset_y
 
-            cx0 = max(0, min(frame_bgr.shape[1]-1, cx0))
-            cx1 = max(0, min(frame_bgr.shape[1]-1, cx1))
-            cy0 = max(0, min(frame_bgr.shape[0]-1, cy0))
-            cy1 = max(0, min(frame_bgr.shape[0]-1, cy1))
-
+            cx0 = max(0, min(frame_bgr.shape[1] - 1, cx0))
+            cx1 = max(0, min(frame_bgr.shape[1] - 1, cx1))
+            cy0 = max(0, min(frame_bgr.shape[0] - 1, cy0))
+            cy1 = max(0, min(frame_bgr.shape[0] - 1, cy1))
             if cx1 <= cx0 or cy1 <= cy0:
                 continue
 
-            # Yellow highlight for detected X
             cv2.rectangle(overlay, (cx0, cy0), (cx1, cy1), (0, 255, 255), -1)
             drew += 1
 
@@ -276,10 +241,7 @@ class CameraWeb:
         self._lock = threading.Lock()
         self._last = None
 
-        # raw cells returned from API (for debug list)
         self._cells = []
-
-        # bbox of whole grid (pixel): (x0,y0,x1,y1)
         self._grid_bbox = None
         self._grid_rows = GRID_ROWS
         self._grid_cols = GRID_COLS
@@ -317,7 +279,8 @@ class CameraWeb:
             return Response(self._mjpeg_gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
     def _html(self) -> str:
-        return f"""<!doctype html>
+        # IMPORTANT: use .format and escape JS braces {{ }}
+        html = """<!doctype html>
 <html>
 <head>
   <meta charset="utf-8"/>
@@ -352,7 +315,7 @@ class CameraWeb:
       </div>
 
       <div class="kv" style="margin-top:12px;">
-        <span class="k">Tip:</span> nếu overlay hơi lệch cố định, set env:
+        <span class="k">Tip:</span> nếu overlay lệch cố định, set env:
         <div class="cells">DRAW_X_OFF_X=..., DRAW_X_OFF_Y=...</div>
       </div>
     </div>
@@ -368,8 +331,9 @@ async function tick() {{
     document.getElementById('empty').textContent = js.empty ?? '-';
     document.getElementById('player').textContent = js.player ?? '-';
     document.getElementById('robot').textContent = js.robot ?? '-';
+
     const cells = js.cells || [];
-    document.getElementById('cells_count').textContent = cells.length ?? '-';
+    document.getElementById('cells_count').textContent = (cells && cells.length) ? cells.length : 0;
     document.getElementById('cells').textContent = formatCells(cells);
     document.getElementById('board').textContent = formatBoard(js.board);
     document.getElementById('scan_status').textContent = js.scan_status ?? '-';
@@ -378,7 +342,7 @@ async function tick() {{
 
 function formatCells(cells) {{
   if (!cells || !cells.length) return '-';
-  return cells.map(c => `(${c.r},${c.c}) ${c.state} [${c.x0},${c.y0}]-[${c.x1},${c.y1}]`).join('\\n');
+  return cells.map(c => `(${{c.r}},${{c.c}}) ${{c.state}} [${{c.x0}},${{c.y0}}]-[${{c.x1}},${{c.y1}}]`).join('\\n');
 }}
 
 function formatBoard(board) {{
@@ -395,7 +359,9 @@ setInterval(tick, 500);
 tick();
 </script>
 </body>
-</html>"""
+</html>
+"""
+        return html.format(CAM_W=CAM_W, CAM_H=CAM_H)
 
     def _mjpeg_gen(self):
         while not self._stop.is_set():
@@ -463,7 +429,6 @@ tick();
             if ROTATE_180:
                 frame = cv2.rotate(frame, cv2.ROTATE_180)
 
-            # Draw overlay using grid_bbox + board snapshot (stable)
             with self._lock:
                 grid_bbox = self._grid_bbox
                 rows = self._grid_rows
@@ -471,12 +436,8 @@ tick();
 
             board_snapshot = self.board.snapshot()
 
-            # (optional) draw grid lines for debug
             if grid_bbox:
-                draw_grid_bbox(frame, grid_bbox, rows, cols)
-
-            # highlight ONLY X cells
-            if grid_bbox:
+                draw_grid_bbox(frame, grid_bbox, rows, cols)  # debug grid
                 draw_x_overlay_by_grid(frame, grid_bbox, rows, cols, board_snapshot)
 
             with self._lock:
@@ -544,22 +505,16 @@ def main():
                 rows = int(result.get("rows", GRID_ROWS) or GRID_ROWS)
                 cols = int(result.get("cols", GRID_COLS) or GRID_COLS)
 
-                # keep cells list for debug panel
                 cells = _cells_from_result(result, frame.shape)
-
-                # build board matrix (X only)
                 board_mat = _board_from_cells(rows, cols, cells)
                 board.set_board(board_mat)
                 cam.set_cells(cells)
 
-                # IMPORTANT: use grid_bbox for stable overlay
                 grid_bbox = _bbox_to_pixels(result.get("grid_bbox"), frame.shape[1], frame.shape[0])
                 cam.set_grid_bbox(grid_bbox, rows, cols)
 
                 cam.set_scan_status("ready")
-                print("[SCAN] board updated",
-                      {"rows": rows, "cols": cols, "player_x": result.get("player_count", "?")},
-                      flush=True)
+                print("[SCAN] board updated", {"rows": rows, "cols": cols}, flush=True)
 
             time.sleep(0.2)
 
