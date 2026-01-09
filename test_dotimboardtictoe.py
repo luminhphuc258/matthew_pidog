@@ -59,16 +59,16 @@ MARKER_MAX_AR = float(os.environ.get("MARKER_MAX_AR", "6.0"))
 MARKER_MIN_SIDE = int(os.environ.get("MARKER_MIN_SIDE", "8"))
 
 CORNER_BAND = float(os.environ.get("CORNER_BAND", "0.22"))
+
+# IMPORTANT: không còn reject top nữa, chỉ đánh dấu near_top để debug
 TOP_NOISE_REJECT_Y = float(os.environ.get("TOP_NOISE_REJECT_Y", "0.10"))
 
 BBOX_PAD_PX = int(os.environ.get("BBOX_PAD_PX", "0"))
 ALLOW_INFER_4TH = str(os.environ.get("ALLOW_INFER_4TH", "1")).lower() in ("1", "true", "yes", "on")
 BBOX_SMOOTH_ALPHA = float(os.environ.get("BBOX_SMOOTH_ALPHA", "0.25"))
 
-# x-match tolerance (top markers should align with bottom markers)
-TOP_X_MATCH_MAX = float(os.environ.get("TOP_X_MATCH_MAX", "0.22"))  # tăng nhẹ cho dễ match hơn
+TOP_X_MATCH_MAX = float(os.environ.get("TOP_X_MATCH_MAX", "0.22"))  # tolerance match theo x
 
-# logs
 LOG_KEEP = int(os.environ.get("LOG_KEEP", "250"))
 
 
@@ -130,7 +130,6 @@ def _post_image_to_api(image_bytes: bytes) -> Optional[Dict[str, Any]]:
 
 
 def order_points_4(pts: np.ndarray) -> np.ndarray:
-    """Return TL, TR, BR, BL"""
     pts = np.asarray(pts, dtype=np.float32).reshape(4, 2)
     s = pts.sum(axis=1)
     diff = np.diff(pts, axis=1).reshape(-1)
@@ -177,12 +176,12 @@ def smooth_bbox(prev: Optional[Tuple[int, int, int, int]], cur: Tuple[int, int, 
 
 def _make_black_warp(text="NO_WARP") -> np.ndarray:
     img = np.zeros((WARP_H, WARP_W, 3), dtype=np.uint8)
-    cv2.putText(img, text, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.3, (0, 0, 255), 3)
+    cv2.putText(img, text, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 255), 3)
     return img
 
 
 # =========================
-# Marker-only Detector (3 pts OK)
+# Marker-only Detector (FIX: không reject top markers)
 # =========================
 class MarkerBoardDetector:
     def __init__(self):
@@ -202,11 +201,9 @@ class MarkerBoardDetector:
     def _extract_candidates(self, frame_bgr) -> Dict[str, Any]:
         h, w = frame_bgr.shape[:2]
         mask = self._mask_yellow(frame_bgr)
-
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        cand = []
-        rej_top = []
+        cand: List[Dict[str, Any]] = []
         dbg = frame_bgr.copy()
 
         for c in contours:
@@ -223,45 +220,38 @@ class MarkerBoardDetector:
             if ar > MARKER_MAX_AR:
                 continue
 
+            near_top = (cy < TOP_NOISE_REJECT_Y * h)
+
             box = cv2.boxPoints(rect).astype(np.int32)
 
-            # mark & keep info even if rejected
-            if cy < TOP_NOISE_REJECT_Y * h:
-                cv2.drawContours(dbg, [box], -1, (0, 0, 255), 2)
-                cv2.circle(dbg, (int(cx), int(cy)), 4, (0, 0, 255), -1)
-                cv2.putText(dbg, "REJ_TOP", (int(cx) + 6, int(cy) + 6),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                rej_top.append({
-                    "center": np.array([cx, cy], dtype=np.float32),
-                    "area": area,
-                    "ar": float(ar),
-                })
-                continue
-
-            # valid candidate
-            cv2.drawContours(dbg, [box], -1, (0, 255, 0), 2)
-            cv2.circle(dbg, (int(cx), int(cy)), 4, (0, 255, 0), -1)
+            # ✅ FIX: không reject nữa, chỉ đổi màu + label để debug
+            if near_top:
+                cv2.drawContours(dbg, [box], -1, (0, 165, 255), 2)  # orange
+                cv2.circle(dbg, (int(cx), int(cy)), 4, (0, 165, 255), -1)
+                cv2.putText(dbg, "NEAR_TOP", (int(cx) + 6, int(cy) + 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+            else:
+                cv2.drawContours(dbg, [box], -1, (0, 255, 0), 2)
+                cv2.circle(dbg, (int(cx), int(cy)), 4, (0, 255, 0), -1)
 
             cand.append({
                 "center": np.array([cx, cy], dtype=np.float32),
                 "area": area,
                 "ar": float(ar),
+                "near_top": bool(near_top),
             })
 
-        # annotate all candidates index + coords (for you to debug)
+        # annotate indices
         dbg2 = dbg.copy()
         for i, c in enumerate(cand):
             cx, cy = int(c["center"][0]), int(c["center"][1])
-            cv2.putText(dbg2, f"#{i} ({cx},{cy})", (cx + 8, cy - 8),
+            tag = "T" if c.get("near_top") else " "
+            cv2.putText(dbg2, f"#{i}{tag} ({cx},{cy})", (cx + 8, cy - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
-        return {"mask": mask, "candidates": cand, "rejected_top": rej_top, "debug": dbg2}
+        return {"mask": mask, "candidates": cand, "debug": dbg2}
 
     def _infer_missing_from_3(self, slots: Dict[str, np.ndarray]) -> Optional[Dict[str, np.ndarray]]:
-        """
-        Infer missing corner using rectangle vector rule.
-        Keys: tl,tr,br,bl in slots (3 points). Return updated dict with 4 points or None.
-        """
         keys = {"tl", "tr", "br", "bl"}
         missing = list(keys - set(slots.keys()))
         if len(missing) != 1:
@@ -273,7 +263,6 @@ class MarkerBoardDetector:
         br = slots.get("br")
         bl = slots.get("bl")
 
-        # Prefer use bottom vector v = br - bl (stable)
         if bl is not None and br is not None:
             v = br - bl
             if m == "tl" and tr is not None:
@@ -282,17 +271,16 @@ class MarkerBoardDetector:
             if m == "tr" and tl is not None:
                 slots["tr"] = tl + v
                 return slots
-            # if missing bottom, use top vector too
-            if tl is not None and tr is not None:
-                vt = tr - tl
-                if m == "bl" and br is not None:
-                    slots["bl"] = br - vt
-                    return slots
-                if m == "br" and bl is not None:
-                    slots["br"] = bl + vt
-                    return slots
 
-        # fallback: parallelogram: p_missing = pA + pC - pB
+        if tl is not None and tr is not None:
+            vt = tr - tl
+            if m == "bl" and br is not None:
+                slots["bl"] = br - vt
+                return slots
+            if m == "br" and bl is not None:
+                slots["br"] = bl + vt
+                return slots
+
         pts = list(slots.values())
         if len(pts) == 3:
             p0, p1, p2 = pts
@@ -300,14 +288,9 @@ class MarkerBoardDetector:
             return slots
         return None
 
-    def _pick_3_or_4(self, candidates: List[Dict[str, Any]], w: int, h: int) -> Dict[str, Any]:
-        """
-        Try to choose BL/BR first, then TL/TR by x-match.
-        Allow missing 1 corner => infer.
-        Returns dict: slots, picked_pts(list), inferred(bool)
-        """
+    def _pick_slots(self, candidates: List[Dict[str, Any]], w: int, h: int) -> Dict[str, Any]:
         if len(candidates) < 2:
-            return {"slots": {}, "picked": [], "inferred": False}
+            return {"slots": {}, "inferred": False}
 
         pts = np.array([c["center"] for c in candidates], dtype=np.float32)
 
@@ -317,12 +300,13 @@ class MarkerBoardDetector:
 
         idx_all = list(range(len(pts)))
         idx_bottom = [i for i in idx_all if pts[i][1] >= bot_y]
-        if len(idx_bottom) < 2:
-            # fallback: take 2 points with largest y as bottom
-            idx_bottom = sorted(idx_all, key=lambda i: float(pts[i][1]), reverse=True)[:max(2, min(6, len(idx_all)))]
+        idx_top = [i for i in idx_all if pts[i][1] <= top_y]
 
-        idx_left_bot = [i for i in idx_bottom if pts[i][0] <= mid_x]
-        idx_right_bot = [i for i in idx_bottom if pts[i][0] >= mid_x]
+        # fallback pools
+        if len(idx_top) < 2:
+            idx_top = sorted(idx_all, key=lambda i: float(pts[i][1]))[:max(2, min(6, len(idx_all)))]
+        if len(idx_bottom) < 2:
+            idx_bottom = sorted(idx_all, key=lambda i: float(pts[i][1]), reverse=True)[:max(2, min(6, len(idx_all)))]
 
         def nearest(pool, tx, ty, forbid=set()):
             best_i, best_d = None, 1e18
@@ -337,21 +321,17 @@ class MarkerBoardDetector:
                     best_i = i
             return best_i
 
-        bl_i = nearest(idx_left_bot if idx_left_bot else idx_bottom, 0.0, float(h - 1), forbid=set())
-        br_i = None if bl_i is None else nearest(idx_right_bot if idx_right_bot else idx_bottom, float(w - 1), float(h - 1), forbid={bl_i})
-
-        slots: Dict[str, np.ndarray] = {}
+        # Try pick bottom first
         used = set()
+        slots: Dict[str, np.ndarray] = {}
 
+        bl_i = nearest(idx_bottom, 0.0, float(h - 1), forbid=set())
         if bl_i is not None:
             slots["bl"] = pts[bl_i]; used.add(bl_i)
+
+        br_i = nearest(idx_bottom, float(w - 1), float(h - 1), forbid=used)
         if br_i is not None:
             slots["br"] = pts[br_i]; used.add(br_i)
-
-        # top pool
-        idx_top = [i for i in idx_all if pts[i][1] <= top_y]
-        if not idx_top:
-            idx_top = [i for i in idx_all if pts[i][1] <= top_y * 1.45]
 
         max_dx = TOP_X_MATCH_MAX * w
 
@@ -370,28 +350,27 @@ class MarkerBoardDetector:
                     best_i = i
             return best_i
 
-        # try pick TL/TR using BL/BR x-ref if available
+        # ✅ This is what you want: TL x gần BL, TR x gần BR
         if "bl" in slots:
-            tl_pool = [i for i in idx_top if pts[i][0] <= mid_x]
-            tl_i = best_top_match(tl_pool if tl_pool else idx_top, slots["bl"][0], forbid=used)
+            tl_pool = [i for i in idx_top if pts[i][0] <= mid_x] or idx_top
+            tl_i = best_top_match(tl_pool, slots["bl"][0], used)
             if tl_i is not None:
                 slots["tl"] = pts[tl_i]; used.add(tl_i)
 
         if "br" in slots:
-            tr_pool = [i for i in idx_top if pts[i][0] >= mid_x]
-            tr_i = best_top_match(tr_pool if tr_pool else idx_top, slots["br"][0], forbid=used)
+            tr_pool = [i for i in idx_top if pts[i][0] >= mid_x] or idx_top
+            tr_i = best_top_match(tr_pool, slots["br"][0], used)
             if tr_i is not None:
                 slots["tr"] = pts[tr_i]; used.add(tr_i)
 
-        # If still missing top but have other top candidate, try pick by “closest to corner”
-        # (to help when right marker is weak)
-        if "tl" not in slots and idx_top:
-            tl_i2 = nearest(idx_top, 0.0, 0.0, forbid=used)
+        # If still missing TL/TR, choose closest to top corners (useful when only top markers exist)
+        if "tl" not in slots:
+            tl_i2 = nearest(idx_top, 0.0, 0.0, used)
             if tl_i2 is not None:
                 slots["tl"] = pts[tl_i2]; used.add(tl_i2)
 
-        if "tr" not in slots and idx_top:
-            tr_i2 = nearest(idx_top, float(w - 1), 0.0, forbid=used)
+        if "tr" not in slots:
+            tr_i2 = nearest(idx_top, float(w - 1), 0.0, used)
             if tr_i2 is not None:
                 slots["tr"] = pts[tr_i2]; used.add(tr_i2)
 
@@ -401,12 +380,7 @@ class MarkerBoardDetector:
             if res is not None and len(res) == 4:
                 inferred = True
 
-        picked_pts = []
-        for k in ["tl", "tr", "br", "bl"]:
-            if k in slots:
-                picked_pts.append(slots[k])
-
-        return {"slots": slots, "picked": picked_pts, "inferred": inferred}
+        return {"slots": slots, "inferred": inferred}
 
     def detect_board_bbox(self, frame_bgr) -> Dict[str, Any]:
         h, w = frame_bgr.shape[:2]
@@ -415,45 +389,30 @@ class MarkerBoardDetector:
         dbg = ex["debug"].copy()
         mask = ex["mask"]
 
-        # stage: show count
         cv2.putText(dbg, f"cand={len(cand)}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 0), 2)
 
-        picked_info = self._pick_3_or_4(cand, w, h)
-        slots = picked_info["slots"]
-        inferred = picked_info["inferred"]
+        picked = self._pick_slots(cand, w, h)
+        slots = picked["slots"]
+        inferred = picked["inferred"]
 
-        # draw picked/inferred clearly
-        dbg_pick = frame_bgr.copy()
-        dbg_pick = cv2.addWeighted(dbg_pick, 0.85, dbg, 0.15, 0)
+        dbg_pick = dbg.copy()
 
-        # draw all cand again for clarity
-        for i, c in enumerate(cand):
-            cx, cy = int(c["center"][0]), int(c["center"][1])
-            cv2.circle(dbg_pick, (cx, cy), 5, (0, 255, 255), -1)
-
-        # draw chosen corners
-        colors = {"tl": (255, 0, 255), "tr": (255, 0, 255), "br": (255, 0, 255), "bl": (255, 0, 255)}
         for k in ["tl", "tr", "br", "bl"]:
             if k in slots:
                 p = slots[k]
-                cv2.circle(dbg_pick, (int(p[0]), int(p[1])), 9, colors[k], -1)
+                cv2.circle(dbg_pick, (int(p[0]), int(p[1])), 10, (255, 0, 255), -1)
                 cv2.putText(dbg_pick, k.upper(), (int(p[0]) + 10, int(p[1]) - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, colors[k], 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 255), 2)
 
-        if inferred:
-            cv2.putText(dbg_pick, "INFERRED_4TH=YES", (12, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
-        else:
-            cv2.putText(dbg_pick, "INFERRED_4TH=NO", (12, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (180, 180, 180), 2)
+        cv2.putText(dbg_pick, f"INFER={inferred}", (12, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
 
-        # Need 4 corners to build bbox
         if len(slots) < 4:
             return {
                 "found": False,
                 "bbox": None,
                 "mask": mask,
-                "debug": dbg,                # candidates debug
-                "debug_pick": dbg_pick,      # picked/inferred debug
-                "picked_centers": picked_info["picked"],
+                "debug": dbg,
+                "debug_pick": dbg_pick,
                 "inferred": inferred,
                 "slots": {k: [float(v[0]), float(v[1])] for k, v in slots.items()},
             }
@@ -479,7 +438,6 @@ class MarkerBoardDetector:
             "debug_pick": dbg_pick,
             "board_bbox_img": out,
             "centers4": centers4,
-            "picked_centers": picked_info["picked"],
             "inferred": inferred,
             "slots": {k: [float(v[0]), float(v[1])] for k, v in slots.items()},
         }
@@ -642,7 +600,7 @@ class CameraWeb:
 
         <div class="kv">
           <button class="btn" onclick="playScan()">Play Scan</button>
-          <div class="muted" style="margin-top:8px;">Stages luôn update (kể cả fail) để debug dễ.</div>
+          <div class="muted" style="margin-top:8px;">Top marker không bị reject nữa.</div>
         </div>
 
         <div class="kv"><span class="k">Logs:</span></div>
@@ -654,7 +612,7 @@ class CameraWeb:
 
     <div class="stages">
       <div class="title">Processing Stages</div>
-      <div class="muted">3 markers OK (infer 4th). Always show candidates/picked/sent.</div>
+      <div class="muted">Always show candidates/picked/would_send.</div>
       <div id="stage_list"></div>
     </div>
   </div>
@@ -868,38 +826,31 @@ def main():
             stages["3m_candidates_debug"] = det.get("debug")
             stages["3m_picked_debug"] = det.get("debug_pick", det.get("debug"))
 
-            # Always build "would_send" image (even if no warp)
+            # build would_send always
             board_bbox_img = det.get("board_bbox_img", stages["3m_picked_debug"])
-            warp = None
-
             if det.get("found") and det.get("bbox") is not None:
                 bbox = det["bbox"]
                 stages["4_board_bbox"] = board_bbox_img
                 warp = warp_rect(frame, bbox)
                 stages["5_warp"] = warp
             else:
-                # no bbox => show placeholder
                 stages["4_board_bbox"] = board_bbox_img
                 warp = _make_black_warp("NO_WARP (need >=3 markers)")
                 stages["5_warp"] = warp
 
-            # Compose would_send
             bw = warp.shape[1]
             bh = int(round(board_bbox_img.shape[0] * (bw / max(1, board_bbox_img.shape[1]))))
             board_small = cv2.resize(board_bbox_img, (bw, bh))
             would_send = np.vstack([board_small, warp])
             stages["6_would_send"] = would_send
 
-            # If bbox not found => fail but still show stages
             if not det.get("found") or det.get("bbox") is None:
                 cam.set_stage_images(stages)
                 cam.set_cells_server([])
-                cam.set_scan_status("failed", "board bbox not found (need >=3 markers to infer 4th)")
-                cam.log("[SCAN] failed: bbox not found (need >=3 good markers)")
-                board.set_board([[0 for _ in range(GRID_COLS)] for _ in range(GRID_ROWS)])
+                cam.set_scan_status("failed", "board bbox not found (need >=3 markers)")
+                cam.log(f"[SCAN] failed: bbox not found, slots={det.get('slots')}")
                 continue
 
-            # bbox ok => send to server
             cam.log("[SCAN] posting to server...")
             result = _post_image_to_api(_encode_jpeg(would_send, quality=80))
 
@@ -913,13 +864,12 @@ def main():
 
             cells = result.get("cells", []) or []
             cam.set_cells_server(cells)
-
             board_mat = board_from_server_cells(GRID_ROWS, GRID_COLS, cells)
             board.set_board(board_mat)
 
             cam.set_stage_images(stages)
             cam.set_scan_status("ready", "")
-            cam.log(f"[SCAN] ok: cells={len(cells)} bbox={det['bbox']} inferred={det.get('inferred')}")
+            cam.log(f"[SCAN] ok: cells={len(cells)} bbox={det['bbox']}")
 
         except Exception as e:
             cam.set_stage_images(stages or {})
