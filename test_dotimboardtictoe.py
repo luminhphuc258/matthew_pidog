@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 import os
 import time
@@ -7,11 +9,12 @@ import uuid
 import urllib.request
 import urllib.error
 from typing import List, Optional, Tuple, Dict, Any
+from collections import deque
+from io import BytesIO
 
 import cv2
 import numpy as np
 from flask import Flask, Response, jsonify, send_file
-from io import BytesIO
 
 
 # =========================
@@ -25,25 +28,20 @@ CAM_H = int(os.environ.get("CAM_H", "480"))
 CAM_FPS = int(os.environ.get("CAM_FPS", "12"))
 JPEG_QUALITY = int(os.environ.get("CAM_JPEG_QUALITY", "70"))
 
-# ✅ rotate 180 if needed
 ROTATE_180 = str(os.environ.get("CAM_ROTATE_180", "1")).lower() in ("1", "true", "yes", "on")
 
-# Board is 6x4 (rows=6, cols=4)
 GRID_ROWS = int(os.environ.get("GRID_ROWS", "6"))
 GRID_COLS = int(os.environ.get("GRID_COLS", "4"))
 
-# warp size
 CELL_PX = int(os.environ.get("CELL_PX", "90"))
 WARP_W = GRID_COLS * CELL_PX
 WARP_H = GRID_ROWS * CELL_PX
 
-# endpoint
 SCAN_API_URL = os.environ.get(
     "SCAN_API_URL",
     "https://embeddedprogramming-healtheworldserver.up.railway.app/scan_chess",
 )
 
-# Web refresh
 STATE_POLL_MS = int(os.environ.get("STATE_POLL_MS", "500"))
 MJPEG_SLEEP = float(os.environ.get("MJPEG_SLEEP", "0.06"))
 
@@ -55,29 +53,35 @@ Y_S_MAX = int(os.environ.get("Y_S_MAX", "255"))
 Y_V_MIN = int(os.environ.get("Y_V_MIN", "70"))
 Y_V_MAX = int(os.environ.get("Y_V_MAX", "255"))
 
-# marker size filter
-MARKER_MIN_AREA = int(os.environ.get("MARKER_MIN_AREA", "140"))     # tăng nhẹ để bớt nhiễu nhỏ
+MARKER_MIN_AREA = int(os.environ.get("MARKER_MIN_AREA", "140"))
 MARKER_MAX_AREA = int(os.environ.get("MARKER_MAX_AREA", "40000"))
-MARKER_MAX_AR = float(os.environ.get("MARKER_MAX_AR", "6.0"))       # aspect ratio max
-MARKER_MIN_SIDE = int(os.environ.get("MARKER_MIN_SIDE", "8"))       # w/h min
+MARKER_MAX_AR = float(os.environ.get("MARKER_MAX_AR", "6.0"))
+MARKER_MIN_SIDE = int(os.environ.get("MARKER_MIN_SIDE", "8"))
 
-# “corner preference”
-CORNER_BAND = float(os.environ.get("CORNER_BAND", "0.22"))  # vùng góc (22% ảnh)
-TOP_NOISE_REJECT_Y = float(os.environ.get("TOP_NOISE_REJECT_Y", "0.10"))  # loại nhiễu nằm quá sát mép trên (10%)
+CORNER_BAND = float(os.environ.get("CORNER_BAND", "0.22"))
+TOP_NOISE_REJECT_Y = float(os.environ.get("TOP_NOISE_REJECT_Y", "0.10"))
 
-# board bbox padding (giữ 0 nếu muốn đúng “vùng góc”)
-BBOX_PAD_PX = int(os.environ.get("BBOX_PAD_PX", "0"))  # bạn muốn fixed => 0
-
-# if only 3 markers, infer the 4th using rectangle rule
+BBOX_PAD_PX = int(os.environ.get("BBOX_PAD_PX", "0"))
 ALLOW_INFER_4TH = str(os.environ.get("ALLOW_INFER_4TH", "1")).lower() in ("1", "true", "yes", "on")
-
-# smooth bbox to reduce jitter
 BBOX_SMOOTH_ALPHA = float(os.environ.get("BBOX_SMOOTH_ALPHA", "0.25"))
 
+TOP_X_MATCH_MAX = float(os.environ.get("TOP_X_MATCH_MAX", "0.18"))
+
+# logs
+LOG_KEEP = int(os.environ.get("LOG_KEEP", "250"))
+
 
 # =========================
-# HTTP upload helper
+# Helpers
 # =========================
+def now_s() -> str:
+    return time.strftime("%H:%M:%S")
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
 def _encode_jpeg(img_bgr, quality=JPEG_QUALITY) -> bytes:
     ok, buf = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
     if not ok:
@@ -117,21 +121,11 @@ def _post_image_to_api(image_bytes: bytes) -> Optional[Dict[str, Any]]:
             detail = exc.read().decode("utf-8", errors="ignore")
         except Exception:
             detail = ""
-        print(f"[SCAN] HTTPError {exc.code}: {detail[:350]}", flush=True)
-        return None
+        return {"found": False, "error": f"HTTPError {exc.code}: {detail[:300]}"}
     except urllib.error.URLError as exc:
-        print(f"[SCAN] URLError: {exc}", flush=True)
-        return None
+        return {"found": False, "error": f"URLError: {exc}"}
     except Exception as exc:
-        print(f"[SCAN] parse failed: {exc}", flush=True)
-        return None
-
-
-# =========================
-# Geometry helpers
-# =========================
-def clamp(v, lo, hi):
-    return max(lo, min(hi, v))
+        return {"found": False, "error": f"parse failed: {exc}"}
 
 
 def order_points_4(pts: np.ndarray) -> np.ndarray:
@@ -221,11 +215,7 @@ class MarkerBoardDetector:
             if ar > MARKER_MAX_AR:
                 continue
 
-            center = np.array([cx, cy], dtype=np.float32)
-
-            # reject noisy yellow objects too close to top edge
             if cy < TOP_NOISE_REJECT_Y * h:
-                # vẫn vẽ nhưng đánh dấu là reject
                 box = cv2.boxPoints(rect).astype(np.int32)
                 cv2.drawContours(dbg, [box], -1, (0, 0, 255), 2)
                 cv2.circle(dbg, (int(cx), int(cy)), 4, (0, 0, 255), -1)
@@ -238,154 +228,101 @@ class MarkerBoardDetector:
             cv2.circle(dbg, (int(cx), int(cy)), 4, (0, 0, 255), -1)
 
             cand.append({
-                "center": center,
+                "center": np.array([cx, cy], dtype=np.float32),
                 "area": area,
                 "ar": float(ar),
             })
 
         return {"mask": mask, "candidates": cand, "debug": dbg}
 
-    def _pick_best_4_by_corners(self, candidates: List[Dict[str, Any]], w: int, h: int) -> List[np.ndarray]:
-        """
-        Chọn 4 marker đúng bằng scoring theo 4 góc ảnh.
-        Ý tưởng: marker góc TL gần (0,0), TR gần (w,0), BR gần (w,h), BL gần (0,h)
-        + ưu tiên nằm trong vùng góc (CORNER_BAND)
-        """
-        if not candidates:
+    def _pick_best_4_by_bottom_then_topx(self, candidates: List[Dict[str, Any]], w: int, h: int) -> List[np.ndarray]:
+        if len(candidates) < 4:
             return []
 
-        centers = [c["center"] for c in candidates]
+        pts = np.array([c["center"] for c in candidates], dtype=np.float32)
 
-        corners = {
-            "tl": np.array([0.0, 0.0], dtype=np.float32),
-            "tr": np.array([float(w - 1), 0.0], dtype=np.float32),
-            "br": np.array([float(w - 1), float(h - 1)], dtype=np.float32),
-            "bl": np.array([0.0, float(h - 1)], dtype=np.float32),
-        }
+        top_y = CORNER_BAND * h
+        bot_y = (1.0 - CORNER_BAND) * h
+        mid_x = 0.5 * w
 
-        band_x = CORNER_BAND * w
-        band_y = CORNER_BAND * h
+        idx_all = list(range(len(pts)))
 
-        def in_corner_band(pt, key: str) -> bool:
-            x, y = float(pt[0]), float(pt[1])
-            if key == "tl":
-                return x <= band_x and y <= band_y
-            if key == "tr":
-                return x >= (w - band_x) and y <= band_y
-            if key == "br":
-                return x >= (w - band_x) and y >= (h - band_y)
-            if key == "bl":
-                return x <= band_x and y >= (h - band_y)
-            return False
+        # ---- BL & BR from bottom band ----
+        idx_bottom = [i for i in idx_all if pts[i][1] >= bot_y]
+        if len(idx_bottom) < 2:
+            idx_bottom = idx_all[:]
 
-        picked = {}
-        used = set()
+        idx_left = [i for i in idx_bottom if pts[i][0] <= mid_x]
+        idx_right = [i for i in idx_bottom if pts[i][0] >= mid_x]
 
-        # greedy pick per corner
-        for key in ["tl", "tr", "br", "bl"]:
-            best_i = None
-            best_score = 1e18
-            for i, pt in enumerate(centers):
-                if i in used:
+        def nearest(pool, tx, ty, forbid=set()):
+            best_i, best_d = None, 1e18
+            for i in pool:
+                if i in forbid:
                     continue
-                d = float(np.linalg.norm(pt - corners[key]))
-                # bonus nếu nằm trong band góc
-                if in_corner_band(pt, key):
-                    d *= 0.65
-                # penalty nếu nằm "ngược phía"
-                if key in ("tl", "bl") and pt[0] > w * 0.75:
-                    d *= 2.0
-                if key in ("tr", "br") and pt[0] < w * 0.25:
-                    d *= 2.0
-                if key in ("tl", "tr") and pt[1] > h * 0.75:
-                    d *= 2.0
-                if key in ("bl", "br") and pt[1] < h * 0.25:
-                    d *= 2.0
-
-                if d < best_score:
-                    best_score = d
+                dx = float(pts[i][0] - tx)
+                dy = float(pts[i][1] - ty)
+                d = dx*dx + dy*dy
+                if d < best_d:
+                    best_d = d
                     best_i = i
+            return best_i
 
-            if best_i is not None:
-                picked[key] = centers[best_i]
-                used.add(best_i)
+        bl_i = nearest(idx_left if idx_left else idx_bottom, 0.0, float(h - 1), forbid=set())
+        if bl_i is None:
+            return []
 
-        # trả ra theo thứ tự TL TR BR BL (chỉ những cái có)
-        out = []
-        for key in ["tl", "tr", "br", "bl"]:
-            if key in picked:
-                out.append(picked[key])
+        br_i = nearest(idx_right if idx_right else idx_bottom, float(w - 1), float(h - 1), forbid={bl_i})
+        if br_i is None:
+            return []
 
-        return out
+        bl = pts[bl_i]
+        br = pts[br_i]
 
-    def _infer_4th(self, pts3: List[np.ndarray]) -> Optional[np.ndarray]:
-        """infer 4th point from 3 corners: p_missing = pA + pC - pB (parallelogram)"""
-        if len(pts3) != 3:
-            return None
+        # ---- TL & TR from top band, x-match to BL/BR ----
+        idx_top = [i for i in idx_all if pts[i][1] <= top_y]
+        if not idx_top:
+            idx_top = [i for i in idx_all if pts[i][1] <= top_y * 1.35]
 
-        pts = np.array(pts3, dtype=np.float32)
-        cen = pts.mean(axis=0)
+        max_dx = TOP_X_MATCH_MAX * w
 
-        # classify into TL/TR/BR/BL using centroid quadrant
-        slots = {}
-        for p in pts:
-            if p[0] < cen[0] and p[1] < cen[1]:
-                slots["tl"] = p
-            elif p[0] >= cen[0] and p[1] < cen[1]:
-                slots["tr"] = p
-            elif p[0] >= cen[0] and p[1] >= cen[1]:
-                slots["br"] = p
-            else:
-                slots["bl"] = p
+        def best_top_match(pool, x_ref, forbid):
+            best_i, best_s = None, 1e18
+            for i in pool:
+                if i in forbid:
+                    continue
+                x, y = float(pts[i][0]), float(pts[i][1])
+                dx = abs(x - float(x_ref))
+                if dx > max_dx:
+                    continue
+                s = (dx*dx) * 2.0 + (y*y) * 0.15  # ưu tiên x match mạnh
+                if s < best_s:
+                    best_s = s
+                    best_i = i
+            return best_i
 
-        keys = {"tl", "tr", "br", "bl"}
-        missing = list(keys - set(slots.keys()))
-        if len(missing) != 1:
-            # fallback generic
-            p0, p1, p2 = pts
-            return p0 + p2 - p1
+        tl_pool = [i for i in idx_top if pts[i][0] <= mid_x]
+        tr_pool = [i for i in idx_top if pts[i][0] >= mid_x]
 
-        m = missing[0]
-        tl = slots.get("tl")
-        tr = slots.get("tr")
-        br = slots.get("br")
-        bl = slots.get("bl")
+        tl_i = best_top_match(tl_pool if tl_pool else idx_top, bl[0], forbid={bl_i, br_i})
+        tr_i = best_top_match(tr_pool if tr_pool else idx_top, br[0], forbid={bl_i, br_i, tl_i} if tl_i is not None else {bl_i, br_i})
 
-        if m == "tl" and tr is not None and br is not None and bl is not None:
-            return tr + bl - br
-        if m == "tr" and tl is not None and br is not None and bl is not None:
-            return tl + br - bl
-        if m == "br" and tl is not None and tr is not None and bl is not None:
-            return tr + bl - tl
-        if m == "bl" and tl is not None and tr is not None and br is not None:
-            return tl + br - tr
+        if tl_i is None or tr_i is None or tl_i == tr_i:
+            return []
 
-        return None
+        tl = pts[tl_i]
+        tr = pts[tr_i]
+
+        return [tl, tr, br, bl]
 
     def detect_board_bbox(self, frame_bgr) -> Dict[str, Any]:
         h, w = frame_bgr.shape[:2]
-
         ex = self._extract_candidates(frame_bgr)
         cand = ex["candidates"]
-
-        # debug stage
         dbg = ex["debug"].copy()
         mask = ex["mask"]
 
-        # pick best 4 by corner scoring
-        picked = self._pick_best_4_by_corners(cand, w, h)
-
-        # if more than 4 candidates exist and picked size < 4,
-        # still allow fallback: take top by area then corner scoring again
-        if len(picked) < 4 and len(cand) >= 4:
-            cand2 = sorted(cand, key=lambda x: x["area"], reverse=True)[:8]
-            picked = self._pick_best_4_by_corners(cand2, w, h)
-
-        inferred = None
-        if len(picked) == 3 and ALLOW_INFER_4TH:
-            inferred = self._infer_4th(picked)
-            if inferred is not None:
-                picked = picked + [inferred]
+        picked = self._pick_best_4_by_bottom_then_topx(cand, w, h)
 
         if len(picked) < 4:
             return {
@@ -394,27 +331,21 @@ class MarkerBoardDetector:
                 "mask": mask,
                 "debug": dbg,
                 "picked_centers": picked,
-                "inferred": inferred
+                "inferred": None
             }
 
-        centers4 = np.array(picked[:4], dtype=np.float32)
-        # reorder
-        centers4 = order_points_4(centers4)
-
-        # draw centers
+        centers4 = order_points_4(np.array(picked[:4], dtype=np.float32))
+        labels = ["TL", "TR", "BR", "BL"]
         for i, p in enumerate(centers4):
-            cv2.circle(dbg, (int(p[0]), int(p[1])), 6, (255, 0, 255), -1)
-            cv2.putText(dbg, f"C{i}", (int(p[0]) + 6, int(p[1]) - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+            cv2.circle(dbg, (int(p[0]), int(p[1])), 7, (255, 0, 255), -1)
+            cv2.putText(dbg, labels[i], (int(p[0]) + 8, int(p[1]) - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
 
-        # make upright rectangle bbox from 4 centers
         bbox = bbox_from_centers(centers4, w, h, pad_px=BBOX_PAD_PX)
         bbox = smooth_bbox(self.prev_bbox, bbox, BBOX_SMOOTH_ALPHA)
         self.prev_bbox = bbox
 
         x0, y0, x1, y1 = bbox
-
-        # draw rectangle (yellow)
         out = frame_bgr.copy()
         cv2.rectangle(out, (x0, y0), (x1, y1), (0, 255, 255), 2)
         cv2.putText(out, "board_bbox (marker-only)", (x0 + 10, max(20, y0 - 10)),
@@ -476,7 +407,7 @@ def board_from_server_cells(rows: int, cols: int, cells: List[Dict[str, Any]]) -
 
 
 # =========================
-# Web + Camera
+# Web + Camera + Logs
 # =========================
 class CameraWeb:
     def __init__(self, board: BoardState):
@@ -486,8 +417,10 @@ class CameraWeb:
 
         self._last_frame = None
         self._scan_status = "idle"
+        self._last_error = ""
         self._cells_server: List[Dict[str, Any]] = []
         self._stages_jpg: Dict[str, bytes] = {}
+        self._logs = deque(maxlen=LOG_KEEP)
 
         self._stop = threading.Event()
         self._ready = threading.Event()
@@ -503,6 +436,7 @@ class CameraWeb:
             st = self.board.stats()
             with self._lock:
                 st["scan_status"] = self._scan_status
+                st["last_error"] = self._last_error
                 st["rows"] = self.board.rows
                 st["cols"] = self.board.cols
                 st["cells_server"] = self._cells_server
@@ -510,9 +444,15 @@ class CameraWeb:
             st["board"] = self.board.snapshot()
             return jsonify(st)
 
+        @self.app.get("/logs.json")
+        def logs():
+            with self._lock:
+                return jsonify({"lines": list(self._logs)})
+
         @self.app.get("/play")
         def play():
             self._play_requested.set()
+            self.log("[UI] Play Scan clicked")
             return jsonify({"ok": True})
 
         @self.app.get("/mjpeg")
@@ -527,6 +467,12 @@ class CameraWeb:
                 return ("not found", 404)
             return send_file(BytesIO(data), mimetype="image/jpeg")
 
+    def log(self, msg: str):
+        line = f"{now_s()} {msg}"
+        with self._lock:
+            self._logs.append(line)
+        print(line, flush=True)
+
     def _html(self) -> str:
         html = """<!doctype html>
 <html>
@@ -540,6 +486,7 @@ class CameraWeb:
     .card {{ background:#111827; border:1px solid #223; border-radius:12px; padding:12px; min-width:360px; }}
     .kv {{ margin:8px 0; }}
     .k {{ color:#93c5fd; }}
+    .err {{ color:#fca5a5; font-size:12px; white-space:pre-wrap; }}
     .btn {{ background:#1f2937; border:1px solid #334155; color:#e7eef7; padding:8px 12px; border-radius:10px; cursor:pointer; }}
     .video {{ border:1px solid #223; border-radius:10px; width:{cam_w}px; height:{cam_h}px; background:#000; }}
     .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space:pre; font-size:12px; color:#cbd5f5; }}
@@ -547,6 +494,7 @@ class CameraWeb:
     .stageimg {{ width:100%; border-radius:10px; border:1px solid #223; margin-top:10px; }}
     .title {{ font-weight:700; margin-bottom:8px; }}
     .muted {{ color:#93a4b8; font-size:12px; }}
+    .logs {{ background:#0f172a; border:1px solid #223; border-radius:10px; padding:10px; margin-top:10px; max-height:160px; overflow:auto; }}
   </style>
 </head>
 <body>
@@ -555,6 +503,8 @@ class CameraWeb:
       <div class="card">
         <div class="kv"><span class="k">Board:</span> rows=<span id="rows">-</span>, cols=<span id="cols">-</span></div>
         <div class="kv"><span class="k">Scan status:</span> <span id="scan_status">-</span></div>
+        <div class="kv"><span class="k">Last error:</span></div>
+        <div id="last_error" class="err">-</div>
 
         <div class="kv"><span class="k">Empty:</span> <span id="empty">-</span></div>
         <div class="kv"><span class="k">Player X:</span> <span id="player_x">-</span></div>
@@ -564,12 +514,15 @@ class CameraWeb:
         <div id="board" class="mono">-</div>
 
         <div class="kv"><span class="k">Cells (server):</span></div>
-        <div id="cells" class="mono" style="max-height:240px; overflow:auto;">-</div>
+        <div id="cells" class="mono" style="max-height:200px; overflow:auto;">-</div>
 
         <div class="kv">
           <button class="btn" onclick="playScan()">Play Scan</button>
           <div class="muted" style="margin-top:8px;">Stages chỉ update sau khi scan xong để đỡ giật.</div>
         </div>
+
+        <div class="kv"><span class="k">Logs:</span></div>
+        <div id="logs" class="logs mono">-</div>
       </div>
 
       <img class="video" id="cam" src="/mjpeg" />
@@ -577,7 +530,7 @@ class CameraWeb:
 
     <div class="stages">
       <div class="title">Processing Stages</div>
-      <div class="muted">marker-only: không dùng edges.</div>
+      <div class="muted">marker-only (TL/TR match x với BL/BR).</div>
       <div id="stage_list"></div>
     </div>
   </div>
@@ -618,6 +571,7 @@ async function tick() {{
     document.getElementById('rows').textContent = js.rows ?? '-';
     document.getElementById('cols').textContent = js.cols ?? '-';
     document.getElementById('scan_status').textContent = js.scan_status ?? '-';
+    document.getElementById('last_error').textContent = js.last_error || '-';
 
     document.getElementById('empty').textContent = js.empty ?? '-';
     document.getElementById('player_x').textContent = js.player_x ?? '-';
@@ -631,6 +585,10 @@ async function tick() {{
       last_ts = ts;
       renderStages(js.stages || []);
     }}
+
+    const lr = await fetch('/logs.json', {{cache:'no-store'}});
+    const ljs = await lr.json();
+    document.getElementById('logs').textContent = (ljs.lines || []).slice(-120).join('\\n') || '-';
   }} catch(e) {{}}
 }}
 
@@ -651,16 +609,13 @@ tick();
         while not self._stop.is_set():
             with self._lock:
                 frame = None if self._last_frame is None else self._last_frame.copy()
-
             if frame is None:
                 time.sleep(0.05)
                 continue
-
             jpg = _encode_jpeg(frame, quality=JPEG_QUALITY)
             if not jpg:
                 time.sleep(0.03)
                 continue
-
             yield (b"--frame\r\n"
                    b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
             time.sleep(MJPEG_SLEEP)
@@ -673,9 +628,10 @@ tick();
         with self._lock:
             self._last_frame = frame
 
-    def set_scan_status(self, status: str):
+    def set_scan_status(self, status: str, error: str = ""):
         with self._lock:
             self._scan_status = str(status)
+            self._last_error = str(error or "")
 
     def set_cells_server(self, cells: List[Dict[str, Any]]):
         with self._lock:
@@ -702,10 +658,11 @@ tick();
 
     def _capture_loop(self):
         dev = int(CAM_DEV) if str(CAM_DEV).isdigit() else CAM_DEV
+        self.log(f"[CAM] opening {dev}")
         cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
 
         if not cap.isOpened():
-            print(f"[CAM] cannot open camera: {dev}", flush=True)
+            self.log(f"[CAM] cannot open camera: {dev}")
             self._failed.set()
             self._ready.set()
             return
@@ -713,16 +670,15 @@ tick();
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_W)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
         cap.set(cv2.CAP_PROP_FPS, CAM_FPS)
+        self.log(f"[CAM] opened ok, {CAM_W}x{CAM_H} fps={CAM_FPS}")
 
         while not self._stop.is_set():
             ok, frame = cap.read()
             if not ok or frame is None:
                 time.sleep(0.05)
                 continue
-
             if ROTATE_180:
                 frame = cv2.rotate(frame, cv2.ROTATE_180)
-
             self.set_last_frame(frame)
             self._ready.set()
             time.sleep(0.01)
@@ -741,7 +697,7 @@ tick();
             ),
             daemon=True,
         ).start()
-        print(f"[WEB] http://<pi_ip>:{WEB_PORT}/", flush=True)
+        self.log(f"[WEB] http://<pi_ip>:{WEB_PORT}/")
 
     def wait_ready(self, timeout_sec: float = 5.0) -> bool:
         self._ready.wait(timeout=max(0.1, float(timeout_sec)))
@@ -753,62 +709,58 @@ tick();
 # =========================
 def main():
     print("[START] marker_only_board_bbox_send_bbox_and_warp", flush=True)
-    print(f"[CFG] GRID_ROWS={GRID_ROWS} GRID_COLS={GRID_COLS}", flush=True)
-    print(f"[CFG] ROTATE_180={ROTATE_180}", flush=True)
-    print(f"[CFG] HSV H[{Y_H_MIN},{Y_H_MAX}] S[{Y_S_MIN},{Y_S_MAX}] V[{Y_V_MIN},{Y_V_MAX}]", flush=True)
-    print(f"[CFG] TOP_NOISE_REJECT_Y={TOP_NOISE_REJECT_Y} CORNER_BAND={CORNER_BAND}", flush=True)
-
     board = BoardState(rows=GRID_ROWS, cols=GRID_COLS)
     cam = CameraWeb(board)
     cam.start()
 
     if not cam.wait_ready(timeout_sec=5.0):
-        print("[CAM] not ready, stop", flush=True)
+        cam.log("[CAM] not ready, stop")
         return
 
     detector = MarkerBoardDetector()
+    cam.log("[WEB] press Play Scan to run pipeline")
 
-    print("[WEB] press Play Scan to run pipeline", flush=True)
+    while True:
+        if not cam.consume_scan_request():
+            time.sleep(0.08)
+            continue
 
-    try:
-        while True:
-            if not cam.consume_scan_request():
-                time.sleep(0.08)
-                continue
+        # always log when entering scan
+        cam.log("[SCAN] start")
+        cam.set_scan_status("scanning", "")
 
-            cam.set_scan_status("scanning")
-
+        stages: Dict[str, np.ndarray] = {}
+        try:
             frame = cam.get_last_frame()
             if frame is None:
-                cam.set_scan_status("failed")
-                time.sleep(0.2)
+                stages["0_fail"] = np.zeros((CAM_H, CAM_W, 3), dtype=np.uint8)
+                cam.set_stage_images(stages)
+                cam.set_cells_server([])
+                cam.set_scan_status("failed", "no frame from camera")
+                cam.log("[SCAN] failed: no frame")
                 continue
-
-            stages: Dict[str, np.ndarray] = {}
 
             det = detector.detect_board_bbox(frame)
             stages["3m_marker_mask"] = det.get("mask")
             stages["3m_marker_debug"] = det.get("debug")
 
-            if not det["found"] or det.get("bbox") is None:
+            if not det.get("found") or det.get("bbox") is None:
                 fail = frame.copy()
                 cv2.putText(fail, "board_bbox NOT found (markers)", (12, 32),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
                 stages["4_board_bbox"] = fail
                 cam.set_stage_images(stages)
                 cam.set_cells_server([])
-                cam.set_scan_status("failed")
-                time.sleep(0.2)
+                cam.set_scan_status("failed", "board bbox not found (need 4 good markers)")
+                cam.log(f"[SCAN] failed: bbox not found, candidates maybe noisy")
                 continue
 
             bbox = det["bbox"]
             stages["4_board_bbox"] = det.get("board_bbox_img")
 
-            # warp only from bbox rectangle
             warp = warp_rect(frame, bbox)
             stages["5_warp"] = warp
 
-            # ✅ send ONLY 4_board_bbox and 5_warp (no edges)
             board_bbox_img = stages["4_board_bbox"]
             bw = warp.shape[1]
             bh = int(round(board_bbox_img.shape[0] * (bw / max(1, board_bbox_img.shape[1]))))
@@ -816,13 +768,15 @@ def main():
             send_img = np.vstack([board_small, warp])
             stages["6_sent_image"] = send_img
 
+            cam.log("[SCAN] posting to server...")
             result = _post_image_to_api(_encode_jpeg(send_img, quality=80))
 
             if not result or not result.get("found"):
+                err = (result or {}).get("error", "server returned found=false")
                 cam.set_stage_images(stages)
                 cam.set_cells_server([])
-                cam.set_scan_status("failed")
-                time.sleep(0.2)
+                cam.set_scan_status("failed", f"server fail: {err}")
+                cam.log(f"[SCAN] failed: server: {err}")
                 continue
 
             cells = result.get("cells", []) or []
@@ -832,13 +786,17 @@ def main():
             board.set_board(board_mat)
 
             cam.set_stage_images(stages)
-            cam.set_scan_status("ready")
+            cam.set_scan_status("ready", "")
+            cam.log(f"[SCAN] ok: cells={len(cells)} bbox={bbox}")
 
-            print("[SCAN] ok", {"cells": len(cells), "bbox": bbox}, flush=True)
-            time.sleep(0.15)
+        except Exception as e:
+            # IMPORTANT: never fail silently
+            cam.set_stage_images(stages or {})
+            cam.set_cells_server([])
+            cam.set_scan_status("failed", f"exception: {repr(e)}")
+            cam.log(f"[SCAN] EXCEPTION: {repr(e)}")
 
-    except KeyboardInterrupt:
-        print("\n[EXIT] Ctrl+C", flush=True)
+        time.sleep(0.12)
 
 
 if __name__ == "__main__":
