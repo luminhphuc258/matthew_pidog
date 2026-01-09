@@ -59,33 +59,31 @@ MARKER_MAX_AR = float(os.environ.get("MARKER_MAX_AR", "6.0"))
 MARKER_MIN_SIDE = int(os.environ.get("MARKER_MIN_SIDE", "8"))
 
 CORNER_BAND = float(os.environ.get("CORNER_BAND", "0.22"))
+
+# IMPORTANT: không còn reject top nữa, chỉ đánh dấu near_top để debug
 TOP_NOISE_REJECT_Y = float(os.environ.get("TOP_NOISE_REJECT_Y", "0.10"))
 
 BBOX_PAD_PX = int(os.environ.get("BBOX_PAD_PX", "0"))
 ALLOW_INFER_4TH = str(os.environ.get("ALLOW_INFER_4TH", "1")).lower() in ("1", "true", "yes", "on")
 BBOX_SMOOTH_ALPHA = float(os.environ.get("BBOX_SMOOTH_ALPHA", "0.25"))
 
-TOP_X_MATCH_MAX = float(os.environ.get("TOP_X_MATCH_MAX", "0.22"))
+TOP_X_MATCH_MAX = float(os.environ.get("TOP_X_MATCH_MAX", "0.22"))  # tolerance match theo x
 
 LOG_KEEP = int(os.environ.get("LOG_KEEP", "250"))
 
-# --- Grid preprocess ---
+# --- NEW: preprocess grid lines before sending to GPT ---
+# 0=off, 1=on
 ENABLE_GRID_PREPROCESS = str(os.environ.get("ENABLE_GRID_PREPROCESS", "1")).lower() in ("1", "true", "yes", "on")
-GRID_ADAPT_BLOCK = int(os.environ.get("GRID_ADAPT_BLOCK", "21"))   # odd
+# adaptive threshold block size (odd)
+GRID_ADAPT_BLOCK = int(os.environ.get("GRID_ADAPT_BLOCK", "21"))
 GRID_ADAPT_C = int(os.environ.get("GRID_ADAPT_C", "7"))
-
-GRID_HK = int(os.environ.get("GRID_HK", "0"))  # auto if 0
-GRID_VK = int(os.environ.get("GRID_VK", "0"))  # auto if 0
-
-# Bridge gaps (cluster/bridge) - nối đứt đoạn, KHÔNG xóa
-GRID_BRIDGE_H = int(os.environ.get("GRID_BRIDGE_H", "0"))  # auto if 0
-GRID_BRIDGE_V = int(os.environ.get("GRID_BRIDGE_V", "0"))  # auto if 0
-
-GRID_DOT_OPEN = int(os.environ.get("GRID_DOT_OPEN", "1"))          # remove tiny dots
-GRID_THICK_DILATE = int(os.environ.get("GRID_THICK_DILATE", "1"))  # thicken final a bit (0..2)
-
-# NEW: show final image on web before posting
-PRE_POST_PREVIEW_SEC = float(os.environ.get("PRE_POST_PREVIEW_SEC", "0.35"))
+# line kernel sizes (auto if <=0)
+GRID_HK = int(os.environ.get("GRID_HK", "0"))
+GRID_VK = int(os.environ.get("GRID_VK", "0"))
+# thicken lines a bit
+GRID_THICK_DILATE = int(os.environ.get("GRID_THICK_DILATE", "1"))  # 0..2
+# remove tiny dots
+GRID_DOT_OPEN = int(os.environ.get("GRID_DOT_OPEN", "1"))
 
 
 # =========================
@@ -197,15 +195,26 @@ def _make_black_warp(text="NO_WARP") -> np.ndarray:
 
 
 # =========================
-# Grid preprocess: keep lines, then BRIDGE gaps (not erase)
+# NEW: Grid preprocess (gray + remove dots + smooth + extract lines)
 # =========================
 def preprocess_grid_for_gpt(warp_bgr: np.ndarray) -> Dict[str, np.ndarray]:
+    """
+    Output:
+      - gray (uint8)
+      - bin (0/255)
+      - lines (0/255) : combined horizontal+vertical lines
+      - final_bgr : white background + black clear grid lines (BGR)
+    """
     h, w = warp_bgr.shape[:2]
     gray = cv2.cvtColor(warp_bgr, cv2.COLOR_BGR2GRAY)
 
+    # mild denoise (keeps edges)
     gray_blur = cv2.bilateralFilter(gray, 7, 50, 50)
 
-    blk = max(9, int(GRID_ADAPT_BLOCK))
+    # adaptive threshold (invert so lines become white)
+    blk = GRID_ADAPT_BLOCK
+    if blk < 9:
+        blk = 9
     if blk % 2 == 0:
         blk += 1
 
@@ -214,17 +223,20 @@ def preprocess_grid_for_gpt(warp_bgr: np.ndarray) -> Dict[str, np.ndarray]:
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
         blk,
-        int(GRID_ADAPT_C)
+        GRID_ADAPT_C
     )
 
+    # remove tiny dots
     if GRID_DOT_OPEN > 0:
-        bin_inv = cv2.morphologyEx(bin_inv, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=GRID_DOT_OPEN)
+        k = np.ones((3, 3), np.uint8)
+        bin_inv = cv2.morphologyEx(bin_inv, cv2.MORPH_OPEN, k, iterations=GRID_DOT_OPEN)
 
-    hk = GRID_HK if GRID_HK > 0 else max(15, w // 12)
-    vk = GRID_VK if GRID_VK > 0 else max(15, h // 12)
+    # line extraction kernels
+    hk = GRID_HK if GRID_HK > 0 else max(15, w // 12)   # horizontal kernel length
+    vk = GRID_VK if GRID_VK > 0 else max(15, h // 12)   # vertical kernel length
 
     horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (hk, 1))
-    vert_kernel  = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vk))
+    vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vk))
 
     horiz = cv2.erode(bin_inv, horiz_kernel, iterations=1)
     horiz = cv2.dilate(horiz, horiz_kernel, iterations=1)
@@ -232,39 +244,33 @@ def preprocess_grid_for_gpt(warp_bgr: np.ndarray) -> Dict[str, np.ndarray]:
     vert = cv2.erode(bin_inv, vert_kernel, iterations=1)
     vert = cv2.dilate(vert, vert_kernel, iterations=1)
 
-    lines = cv2.bitwise_or(horiz, vert)  # 5c_grid_lines
+    lines = cv2.bitwise_or(horiz, vert)
 
-    # BRIDGE gaps: close along H and V directions
-    bh = GRID_BRIDGE_H if GRID_BRIDGE_H > 0 else max(9, w // 18)
-    bv = GRID_BRIDGE_V if GRID_BRIDGE_V > 0 else max(9, h // 18)
+    # connect broken segments a bit
+    lines = cv2.morphologyEx(lines, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
 
-    bridge_h = cv2.getStructuringElement(cv2.MORPH_RECT, (bh, 1))
-    bridge_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, bv))
-
-    bridged_h = cv2.morphologyEx(lines, cv2.MORPH_CLOSE, bridge_h, iterations=1)
-    bridged_v = cv2.morphologyEx(lines, cv2.MORPH_CLOSE, bridge_v, iterations=1)
-
-    grid_clean = cv2.bitwise_or(bridged_h, bridged_v)
-    grid_clean = cv2.morphologyEx(grid_clean, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
-
+    # thicken lines slightly
     if GRID_THICK_DILATE > 0:
-        grid_clean = cv2.dilate(grid_clean, np.ones((3, 3), np.uint8), iterations=GRID_THICK_DILATE)
+        lines = cv2.dilate(lines, np.ones((3, 3), np.uint8), iterations=GRID_THICK_DILATE)
 
-    # Send: white background + black lines
-    send_gray = 255 - grid_clean
-    final_bgr = cv2.cvtColor(send_gray, cv2.COLOR_GRAY2BGR)
+    # final: white background with black grid lines
+    final = 255 - lines  # lines black
+    final_bgr = cv2.cvtColor(final, cv2.COLOR_GRAY2BGR)
+
+    # annotate for debug
+    cv2.putText(final_bgr, "grid_clean_gray_lines", (8, 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
 
     return {
         "gray": gray,
         "bin_inv": bin_inv,
         "lines": lines,
-        "grid_clean": grid_clean,
         "final_bgr": final_bgr,
     }
 
 
 # =========================
-# Marker-only Detector
+# Marker-only Detector (FIX: không reject top markers)
 # =========================
 class MarkerBoardDetector:
     def __init__(self):
@@ -295,7 +301,7 @@ class MarkerBoardDetector:
                 continue
 
             rect = cv2.minAreaRect(c)
-            (cx, cy), (rw, rh), _ = rect
+            (cx, cy), (rw, rh), ang = rect
             if rw < MARKER_MIN_SIDE or rh < MARKER_MIN_SIDE:
                 continue
 
@@ -304,10 +310,12 @@ class MarkerBoardDetector:
                 continue
 
             near_top = (cy < TOP_NOISE_REJECT_Y * h)
+
             box = cv2.boxPoints(rect).astype(np.int32)
 
+            # ✅ FIX: không reject nữa, chỉ đổi màu + label để debug
             if near_top:
-                cv2.drawContours(dbg, [box], -1, (0, 165, 255), 2)
+                cv2.drawContours(dbg, [box], -1, (0, 165, 255), 2)  # orange
                 cv2.circle(dbg, (int(cx), int(cy)), 4, (0, 165, 255), -1)
                 cv2.putText(dbg, "NEAR_TOP", (int(cx) + 6, int(cy) + 6),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
@@ -317,11 +325,12 @@ class MarkerBoardDetector:
 
             cand.append({
                 "center": np.array([cx, cy], dtype=np.float32),
-                "near_top": bool(near_top),
                 "area": area,
                 "ar": float(ar),
+                "near_top": bool(near_top),
             })
 
+        # annotate indices
         dbg2 = dbg.copy()
         for i, c in enumerate(cand):
             cx, cy = int(c["center"][0]), int(c["center"][1])
@@ -382,6 +391,7 @@ class MarkerBoardDetector:
         idx_bottom = [i for i in idx_all if pts[i][1] >= bot_y]
         idx_top = [i for i in idx_all if pts[i][1] <= top_y]
 
+        # fallback pools
         if len(idx_top) < 2:
             idx_top = sorted(idx_all, key=lambda i: float(pts[i][1]))[:max(2, min(6, len(idx_all)))]
         if len(idx_bottom) < 2:
@@ -428,6 +438,7 @@ class MarkerBoardDetector:
                     best_i = i
             return best_i
 
+        # TL x gần BL, TR x gần BR
         if "bl" in slots:
             tl_pool = [i for i in idx_top if pts[i][0] <= mid_x] or idx_top
             tl_i = best_top_match(tl_pool, slots["bl"][0], used)
@@ -440,6 +451,7 @@ class MarkerBoardDetector:
             if tr_i is not None:
                 slots["tr"] = pts[tr_i]; used.add(tr_i)
 
+        # fallback nếu chỉ thấy top
         if "tl" not in slots:
             tl_i2 = nearest(idx_top, 0.0, 0.0, used)
             if tl_i2 is not None:
@@ -511,6 +523,7 @@ class MarkerBoardDetector:
             "debug": dbg,
             "debug_pick": dbg_pick,
             "board_bbox_img": out,
+            "centers4": centers4,
             "inferred": inferred,
             "slots": {k: [float(v[0]), float(v[1])] for k, v in slots.items()},
         }
@@ -673,7 +686,7 @@ class CameraWeb:
 
         <div class="kv">
           <button class="btn" onclick="playScan()">Play Scan</button>
-          <div class="muted" style="margin-top:8px;">Always show FINAL image (6_final_send) before POST.</div>
+          <div class="muted" style="margin-top:8px;">NEW: warp -> gray + smooth grid lines -> send to GPT.</div>
         </div>
 
         <div class="kv"><span class="k">Logs:</span></div>
@@ -685,7 +698,7 @@ class CameraWeb:
 
     <div class="stages">
       <div class="title">Processing Stages</div>
-      <div class="muted">Show: mask/candidates/picked/warp/5c_lines/5d_clean/6_final_send</div>
+      <div class="muted">Always show candidates/picked/warp/grid_clean/would_send.</div>
       <div id="stage_list"></div>
     </div>
   </div>
@@ -801,7 +814,7 @@ tick();
                 img_bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
             else:
                 img_bgr = img
-            jpgs[name] = _encode_jpeg(img_bgr, quality=85)
+            jpgs[name] = _encode_jpeg(img_bgr, quality=80)
         with self._lock:
             self._stages_jpg = jpgs
 
@@ -863,7 +876,7 @@ tick();
 # MAIN
 # =========================
 def main():
-    print("[START] marker_only_board_bbox_send_final_preview_before_post", flush=True)
+    print("[START] marker_only_board_bbox_send_bbox_and_warp", flush=True)
     board = BoardState(rows=GRID_ROWS, cols=GRID_COLS)
     cam = CameraWeb(board)
     cam.start()
@@ -898,44 +911,56 @@ def main():
             stages["3m_marker_mask"] = det.get("mask")
             stages["3m_candidates_debug"] = det.get("debug")
             stages["3m_picked_debug"] = det.get("debug_pick", det.get("debug"))
-            stages["4_board_bbox"] = det.get("board_bbox_img", stages["3m_picked_debug"])
 
-            if not det.get("found") or det.get("bbox") is None:
+            # Always build "would_send" stages
+            board_bbox_img = det.get("board_bbox_img", stages["3m_picked_debug"])
+            stages["4_board_bbox"] = board_bbox_img
+
+            if det.get("found") and det.get("bbox") is not None:
+                bbox = det["bbox"]
+                warp = warp_rect(frame, bbox)
+                stages["5_warp"] = warp
+
+                # --- NEW: preprocess warp before sending to GPT ---
+                if ENABLE_GRID_PREPROCESS:
+                    pp = preprocess_grid_for_gpt(warp)
+                    stages["5a_warp_gray"] = pp["gray"]
+                    stages["5b_warp_bin_inv"] = pp["bin_inv"]
+                    stages["5c_grid_lines"] = pp["lines"]
+                    grid_clean = pp["final_bgr"]
+                    stages["5d_grid_clean"] = grid_clean
+                    warp_for_send = grid_clean
+                else:
+                    warp_for_send = warp
+            else:
                 stages["5_warp"] = _make_black_warp("NO_WARP (need >=3 markers)")
-                stages["6_final_send"] = stages["5_warp"]
+                warp_for_send = stages["5_warp"]
+
+            # Stack: board_small + warp_for_send (this is what we actually send)
+            bw = warp_for_send.shape[1]
+            bh = int(round(board_bbox_img.shape[0] * (bw / max(1, board_bbox_img.shape[1]))))
+            board_small = cv2.resize(board_bbox_img, (bw, bh))
+
+            if warp_for_send.shape[:2] != (WARP_H, WARP_W):
+                warp_for_send = cv2.resize(warp_for_send, (WARP_W, WARP_H))
+
+            send_img = np.vstack([board_small, warp_for_send])
+            stages["6_would_send"] = send_img
+
+            # If cannot get bbox => show stages anyway, but do not send
+            if not det.get("found") or det.get("bbox") is None:
                 cam.set_stage_images(stages)
                 cam.set_cells_server([])
                 cam.set_scan_status("failed", "board bbox not found (need >=3 markers)")
                 cam.log(f"[SCAN] failed: bbox not found, slots={det.get('slots')}")
                 continue
 
-            bbox = det["bbox"]
-            warp = warp_rect(frame, bbox)
-            stages["5_warp"] = warp
-
-            # Build FINAL image to send
-            if ENABLE_GRID_PREPROCESS:
-                pp = preprocess_grid_for_gpt(warp)
-                stages["5a_warp_gray"] = pp["gray"]
-                stages["5b_warp_bin_inv"] = pp["bin_inv"]
-                stages["5c_grid_lines"] = pp["lines"]
-                stages["5d_grid_clean_mask"] = pp["grid_clean"]
-                final_send = pp["final_bgr"]   # send only this
-            else:
-                final_send = warp
-
-            # ✅ SHOW FINAL IMAGE ON WEB BEFORE POST
-            stages["6_final_send"] = final_send
-            cam.set_stage_images(stages)
-            cam.log("[SCAN] final prepared -> showing on web (6_final_send) ...")
-            time.sleep(max(0.0, PRE_POST_PREVIEW_SEC))
-
-            # Now POST
-            cam.log("[SCAN] posting to server...")
-            result = _post_image_to_api(_encode_jpeg(final_send, quality=90))
+            cam.log("[SCAN] posting to server (grid_clean)...")
+            result = _post_image_to_api(_encode_jpeg(send_img, quality=80))
 
             if not result or not result.get("found"):
                 err = (result or {}).get("error", "server returned found=false")
+                cam.set_stage_images(stages)
                 cam.set_cells_server([])
                 cam.set_scan_status("failed", f"server fail: {err}")
                 cam.log(f"[SCAN] failed: server: {err}")
@@ -946,8 +971,9 @@ def main():
             board_mat = board_from_server_cells(GRID_ROWS, GRID_COLS, cells)
             board.set_board(board_mat)
 
+            cam.set_stage_images(stages)
             cam.set_scan_status("ready", "")
-            cam.log(f"[SCAN] ok: cells={len(cells)} bbox={bbox}")
+            cam.log(f"[SCAN] ok: cells={len(cells)} bbox={det['bbox']}")
 
         except Exception as e:
             cam.set_stage_images(stages or {})
