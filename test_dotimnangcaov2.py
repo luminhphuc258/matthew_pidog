@@ -85,14 +85,19 @@ GRID_THICK_DILATE = int(os.environ.get("GRID_THICK_DILATE", "1"))  # 0..2
 # remove tiny dots
 GRID_DOT_OPEN = int(os.environ.get("GRID_DOT_OPEN", "1"))
 
-X_EDGE_MIN = int(os.environ.get("X_EDGE_MIN", "120"))
-X_EDGE_MAX = int(os.environ.get("X_EDGE_MAX", "200"))
-X_HOUGH_THRESH = int(os.environ.get("X_HOUGH_THRESH", "18"))
-X_MIN_LINE_LEN = float(os.environ.get("X_MIN_LINE_LEN", "0.45"))
-X_MAX_LINE_GAP = int(os.environ.get("X_MAX_LINE_GAP", "10"))
-X_SLOPE_MIN = float(os.environ.get("X_SLOPE_MIN", "0.45"))
-X_SLOPE_MAX = float(os.environ.get("X_SLOPE_MAX", "2.2"))
-X_EDGE_DENSITY = float(os.environ.get("X_EDGE_DENSITY", "0.03"))
+X_EDGE_MIN = int(os.environ.get("X_EDGE_MIN", "50"))
+X_EDGE_MAX = int(os.environ.get("X_EDGE_MAX", "150"))
+X_HOUGH_THRESH = int(os.environ.get("X_HOUGH_THRESH", "10"))
+X_MIN_LINE_LEN = float(os.environ.get("X_MIN_LINE_LEN", "0.30"))
+X_MAX_LINE_GAP = int(os.environ.get("X_MAX_LINE_GAP", "12"))
+X_SLOPE_MIN = float(os.environ.get("X_SLOPE_MIN", "0.40"))
+X_SLOPE_MAX = float(os.environ.get("X_SLOPE_MAX", "3.00"))
+X_EDGE_DENSITY = float(os.environ.get("X_EDGE_DENSITY", "0.01"))
+X_BIN_BLOCK = int(os.environ.get("X_BIN_BLOCK", "17"))
+X_BIN_C = int(os.environ.get("X_BIN_C", "7"))
+X_BIN_OPEN = int(os.environ.get("X_BIN_OPEN", "1"))
+X_DIAG_BAND = int(os.environ.get("X_DIAG_BAND", "5"))
+X_DIAG_MIN = float(os.environ.get("X_DIAG_MIN", "0.08"))
 X_ROI_MARGIN = float(os.environ.get("X_ROI_MARGIN", "0.12"))
 OVERLAY_ALPHA = float(os.environ.get("OVERLAY_ALPHA", "0.4"))
 
@@ -303,43 +308,81 @@ def detect_x_in_cell(cell_bgr: np.ndarray) -> bool:
 
     gray = cv2.cvtColor(cell_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    blk = X_BIN_BLOCK
+    if blk < 9:
+        blk = 9
+    if blk % 2 == 0:
+        blk += 1
+    bin_inv = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        blk,
+        X_BIN_C,
+    )
+    if X_BIN_OPEN > 0:
+        bin_inv = cv2.morphologyEx(
+            bin_inv,
+            cv2.MORPH_OPEN,
+            np.ones((3, 3), np.uint8),
+            iterations=X_BIN_OPEN,
+        )
+
     edges = cv2.Canny(gray, X_EDGE_MIN, X_EDGE_MAX)
 
     edge_density = float(np.count_nonzero(edges)) / float(edges.size)
-    if edge_density < X_EDGE_DENSITY:
-        return False
+    has_edges = edge_density >= X_EDGE_DENSITY
 
     min_dim = min(h, w)
     min_len = max(8, int(round(min_dim * X_MIN_LINE_LEN)))
 
-    lines = cv2.HoughLinesP(
-        edges,
-        1,
-        np.pi / 180.0,
-        threshold=X_HOUGH_THRESH,
-        minLineLength=min_len,
-        maxLineGap=X_MAX_LINE_GAP,
-    )
-
     pos = 0
     neg = 0
-    if lines is not None:
-        for ln in lines:
-            x1, y1, x2, y2 = ln[0]
-            dx = float(x2 - x1)
-            dy = float(y2 - y1)
-            if abs(dx) < 1.0:
-                continue
-            slope = dy / dx
-            abs_slope = abs(slope)
-            if abs_slope < X_SLOPE_MIN or abs_slope > X_SLOPE_MAX:
-                continue
-            if slope > 0:
-                pos += 1
-            else:
-                neg += 1
+    if has_edges:
+        lines = cv2.HoughLinesP(
+            edges,
+            1,
+            np.pi / 180.0,
+            threshold=X_HOUGH_THRESH,
+            minLineLength=min_len,
+            maxLineGap=X_MAX_LINE_GAP,
+        )
 
-    return pos > 0 and neg > 0
+        if lines is not None:
+            for ln in lines:
+                x1, y1, x2, y2 = ln[0]
+                dx = float(x2 - x1)
+                dy = float(y2 - y1)
+                if abs(dx) < 1.0:
+                    continue
+                slope = dy / dx
+                abs_slope = abs(slope)
+                if abs_slope < X_SLOPE_MIN or abs_slope > X_SLOPE_MAX:
+                    continue
+                if slope > 0:
+                    pos += 1
+                else:
+                    neg += 1
+
+    if pos > 0 and neg > 0:
+        return True
+
+    band = max(1, int(X_DIAG_BAND))
+    mask1 = np.zeros_like(bin_inv)
+    mask2 = np.zeros_like(bin_inv)
+    cv2.line(mask1, (0, 0), (w - 1, h - 1), 255, band)
+    cv2.line(mask2, (0, h - 1), (w - 1, 0), 255, band)
+
+    m1 = np.count_nonzero(mask1)
+    m2 = np.count_nonzero(mask2)
+    if m1 == 0 or m2 == 0:
+        return False
+
+    r1 = float(np.count_nonzero(cv2.bitwise_and(bin_inv, mask1))) / float(m1)
+    r2 = float(np.count_nonzero(cv2.bitwise_and(bin_inv, mask2))) / float(m2)
+
+    return r1 >= X_DIAG_MIN and r2 >= X_DIAG_MIN
 
 
 def detect_x_cells(warp_bgr: np.ndarray, rows: int, cols: int) -> set:
