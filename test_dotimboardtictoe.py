@@ -41,6 +41,7 @@ SCAN_API_URL = os.environ.get(
     "SCAN_API_URL",
     "https://embeddedprogramming-healtheworldserver.up.railway.app/scan_chess",
 )
+SCAN_TIMEOUT = float(os.environ.get("SCAN_TIMEOUT", "40"))
 
 STATE_POLL_MS = int(os.environ.get("STATE_POLL_MS", "500"))
 MJPEG_SLEEP = float(os.environ.get("MJPEG_SLEEP", "0.06"))
@@ -123,6 +124,30 @@ def _encode_jpeg(img_bgr, quality=JPEG_QUALITY) -> bytes:
     return buf.tobytes()
 
 
+def _parse_json_response(text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    if text is None:
+        return None, "empty response"
+    raw = text.strip()
+    if not raw:
+        return None, "empty response"
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else None, None
+    except Exception as exc:
+        pass
+
+    try:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            obj = json.loads(raw[start:end + 1])
+            return obj if isinstance(obj, dict) else None, None
+    except Exception as exc2:
+        return None, str(exc2)
+
+    return None, "parse failed"
+
+
 def _post_image_to_api(image_bytes: bytes) -> Optional[Dict[str, Any]]:
     if not image_bytes:
         return None
@@ -147,15 +172,20 @@ def _post_image_to_api(image_bytes: bytes) -> Optional[Dict[str, Any]]:
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=25) as resp:
+        with urllib.request.urlopen(req, timeout=SCAN_TIMEOUT) as resp:
             data = resp.read().decode("utf-8", errors="ignore")
-            return json.loads(data)
+            parsed, perr = _parse_json_response(data)
+            if parsed is None:
+                return {"found": False, "error": f"parse failed: {perr}", "_raw": data}
+            if "_raw" not in parsed:
+                parsed["_raw"] = data
+            return parsed
     except urllib.error.HTTPError as exc:
         try:
             detail = exc.read().decode("utf-8", errors="ignore")
         except Exception:
             detail = ""
-        return {"found": False, "error": f"HTTPError {exc.code}: {detail[:300]}"}
+        return {"found": False, "error": f"HTTPError {exc.code}: {detail[:300]}", "_raw": detail}
     except urllib.error.URLError as exc:
         return {"found": False, "error": f"URLError: {exc}"}
     except Exception as exc:
@@ -824,6 +854,7 @@ class CameraWeb:
         self._overlay_x_polys: List[np.ndarray] = []
         self._scan_status = "idle"
         self._last_error = ""
+        self._last_server_raw = ""
         self._cells_server: List[Dict[str, Any]] = []
         self._stages_jpg: Dict[str, bytes] = {}
         self._logs = deque(maxlen=LOG_KEEP)
@@ -843,6 +874,7 @@ class CameraWeb:
             with self._lock:
                 st["scan_status"] = self._scan_status
                 st["last_error"] = self._last_error
+                st["server_raw"] = self._last_server_raw
                 st["rows"] = self.board.rows
                 st["cols"] = self.board.cols
                 st["cells_server"] = self._cells_server
@@ -922,9 +954,12 @@ class CameraWeb:
         <div class="kv"><span class="k">Cells (server):</span></div>
         <div id="cells" class="mono" style="max-height:200px; overflow:auto;">-</div>
 
+        <div class="kv"><span class="k">Server raw:</span></div>
+        <div id="server_raw" class="mono" style="max-height:160px; overflow:auto;">-</div>
+
         <div class="kv">
           <button class="btn" onclick="playScan()">Play Scan</button>
-          <div class="muted" style="margin-top:8px;">NEW: perspective + deskew + local OpenCV detect X/O.</div>
+          <div class="muted" style="margin-top:8px;">NEW: perspective + deskew + server detect X.</div>
         </div>
 
         <div class="kv"><span class="k">Logs:</span></div>
@@ -985,6 +1020,7 @@ async function tick() {{
 
     document.getElementById('board').textContent = formatBoard(js.board);
     document.getElementById('cells').textContent = formatCells(js.cells_server);
+    document.getElementById('server_raw').textContent = js.server_raw || '-';
 
     const ts = js.last_scan_ts || 0;
     if (ts > 0 && ts !== last_ts) {{
@@ -1043,6 +1079,13 @@ tick();
             self._scan_status = str(status)
             self._last_error = str(error or "")
 
+    def set_server_raw(self, raw: str):
+        raw = raw or ""
+        if len(raw) > 4000:
+            raw = raw[:4000] + "..."
+        with self._lock:
+            self._last_server_raw = raw
+
     def set_overlay(self, lines, x_polys):
         with self._lock:
             self._overlay_lines = list(lines or [])
@@ -1074,6 +1117,7 @@ tick();
         if self._play_requested.is_set():
             self._play_requested.clear()
             self.clear_overlay()
+            self.set_server_raw("")
             return True
         return False
 
@@ -1213,6 +1257,10 @@ def main():
 
                 cam.log("[SCAN] posting to server (grid_on_warp)...")
                 result = _post_image_to_api(_encode_jpeg(grid_on_warp, quality=80))
+                raw_resp = (result or {}).get("_raw", "")
+                cam.set_server_raw(raw_resp)
+                if raw_resp:
+                    cam.log(f"[SERVER] raw: {raw_resp[:400]}")
 
                 if not result or not result.get("found"):
                     err = (result or {}).get("error", "server returned found=false")
@@ -1259,6 +1307,7 @@ def main():
                 cam.set_cells_server([])
                 cam.set_scan_status("failed", "board corners not found (need >=3 markers)")
                 cam.set_overlay([], [])
+                cam.set_server_raw("")
                 cam.log(f"[SCAN] failed: corners not found, slots={det.get('slots')}")
                 continue
 
