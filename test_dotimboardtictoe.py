@@ -867,7 +867,6 @@ class CameraWeb:
         self._overlay_x_polys: List[np.ndarray] = []
         self._scan_status = "idle"
         self._last_error = ""
-        self._last_server_raw = ""
         self._cells_server: List[Dict[str, Any]] = []
         self._stages_jpg: Dict[str, bytes] = {}
         self._logs = deque(maxlen=LOG_KEEP)
@@ -887,7 +886,6 @@ class CameraWeb:
             with self._lock:
                 st["scan_status"] = self._scan_status
                 st["last_error"] = self._last_error
-                st["server_raw"] = self._last_server_raw
                 st["rows"] = self.board.rows
                 st["cols"] = self.board.cols
                 st["cells_server"] = self._cells_server
@@ -967,9 +965,6 @@ class CameraWeb:
         <div class="kv"><span class="k">Cells (server):</span></div>
         <div id="cells" class="mono" style="max-height:160px; overflow:auto;">-</div>
 
-        <div class="kv"><span class="k">Server raw:</span></div>
-        <div id="server_raw" class="mono" style="max-height:120px; overflow:auto;">-</div>
-
         <div class="kv">
           <button class="btn" onclick="playScan()">Play Scan</button>
           <div class="muted" style="margin-top:8px;">NEW: perspective + deskew + server detect X.</div>
@@ -1033,7 +1028,6 @@ async function tick() {{
 
     document.getElementById('board').textContent = formatBoard(js.board);
     document.getElementById('cells').textContent = formatCells(js.cells_server);
-    document.getElementById('server_raw').textContent = js.server_raw || '-';
 
     const ts = js.last_scan_ts || 0;
     if (ts > 0 && ts !== last_ts) {{
@@ -1092,13 +1086,6 @@ tick();
             self._scan_status = str(status)
             self._last_error = str(error or "")
 
-    def set_server_raw(self, raw: str):
-        raw = raw or ""
-        if len(raw) > 4000:
-            raw = raw[:4000] + "..."
-        with self._lock:
-            self._last_server_raw = raw
-
     def set_overlay(self, lines, x_polys):
         with self._lock:
             self._overlay_lines = list(lines or [])
@@ -1130,7 +1117,6 @@ tick();
         if self._play_requested.is_set():
             self._play_requested.clear()
             self.clear_overlay()
-            self.set_server_raw("")
             return True
         return False
 
@@ -1262,7 +1248,6 @@ def main():
                 cam.log("[SCAN] posting to server (grid_on_warp)...")
                 result = _post_image_to_api(_encode_jpeg(grid_on_warp, quality=80))
                 raw_resp = (result or {}).get("_raw", "")
-                cam.set_server_raw(raw_resp)
                 if raw_resp:
                     cam.log(f"[SERVER] raw: {raw_resp[:400]}")
 
@@ -1308,7 +1293,6 @@ def main():
                 cam.set_cells_server([])
                 cam.set_scan_status("failed", "board corners not found (need >=3 markers)")
                 cam.set_overlay([], [])
-                cam.set_server_raw("")
                 cam.log(f"[SCAN] failed: corners not found, slots={det.get('slots')}")
                 continue
 
