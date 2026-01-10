@@ -931,13 +931,13 @@ class CameraWeb:
   <style>
     body {{ font-family: Arial, sans-serif; background:#0b0f14; color:#e7eef7; margin:0; }}
     .wrap {{ display:grid; grid-template-columns: 1fr 420px; gap:14px; padding:14px; }}
-    .left {{ display:flex; gap:14px; align-items:flex-start; }}
-    .card {{ background:#111827; border:1px solid #223; border-radius:12px; padding:12px; min-width:360px; max-height: calc(100vh - 28px); overflow:auto; }}
+    .left {{ display:flex; flex-direction:column; gap:14px; align-items:stretch; }}
+    .card {{ background:#111827; border:1px solid #223; border-radius:12px; padding:12px; min-width:360px; max-height: 45vh; overflow:auto; }}
     .kv {{ margin:8px 0; }}
     .k {{ color:#93c5fd; }}
     .err {{ color:#fca5a5; font-size:12px; white-space:pre-wrap; }}
     .btn {{ background:#1f2937; border:1px solid #334155; color:#e7eef7; padding:8px 12px; border-radius:10px; cursor:pointer; }}
-    .video {{ border:1px solid #223; border-radius:10px; width:{cam_w}px; height:{cam_h}px; background:#000; }}
+    .video {{ border:1px solid #223; border-radius:10px; width:100%; max-width:{cam_w}px; height:auto; background:#000; }}
     .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space:pre; font-size:12px; color:#cbd5f5; }}
     .stages {{ background:#111827; border:1px solid #223; border-radius:12px; padding:12px; max-height: calc(100vh - 28px); overflow:auto; }}
     .stageimg {{ width:100%; border-radius:10px; border:1px solid #223; margin-top:10px; }}
@@ -1266,6 +1266,7 @@ def main():
                 board.set_board(board_mat)
 
                 x_polys = []
+                x_polys_warp = []
                 for cell in cells:
                     r = int(cell.get("row", cell.get("r", -1)))
                     c = int(cell.get("col", cell.get("c", -1)))
@@ -1279,11 +1280,13 @@ def main():
                     x1 = x0 + CELL_PX
                     y1 = y0 + CELL_PX
                     pts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+                    x_polys_warp.append(np.asarray(pts, dtype=np.float32))
                     cam_pts = project_points_to_camera(pts, M_inv, invR)
                     x_polys.append(cam_pts)
 
                 cam.set_overlay(cam_lines, x_polys)
                 stages["6_grid_on_cam"] = overlay_frame(cam_overlay, cam_lines, x_polys, OVERLAY_ALPHA)
+                stages["6a_grid_x_warp"] = overlay_frame(grid_on_warp, grid_lines, x_polys_warp, OVERLAY_ALPHA)
             else:
                 stages["5_warp_persp"] = _make_black_warp("NO_WARP (need >=3 markers)")
 
