@@ -71,7 +71,7 @@ TOP_X_MATCH_MAX = float(os.environ.get("TOP_X_MATCH_MAX", "0.22"))  # tolerance 
 
 LOG_KEEP = int(os.environ.get("LOG_KEEP", "250"))
 
-# --- NEW: preprocess grid lines before sending to GPT ---
+# --- Preprocess grid lines (debug/optional) ---
 # 0=off, 1=on
 ENABLE_GRID_PREPROCESS = str(os.environ.get("ENABLE_GRID_PREPROCESS", "1")).lower() in ("1", "true", "yes", "on")
 # adaptive threshold block size (odd)
@@ -84,6 +84,24 @@ GRID_VK = int(os.environ.get("GRID_VK", "0"))
 GRID_THICK_DILATE = int(os.environ.get("GRID_THICK_DILATE", "1"))  # 0..2
 # remove tiny dots
 GRID_DOT_OPEN = int(os.environ.get("GRID_DOT_OPEN", "1"))
+
+# --- NEW: local OpenCV pipeline ---
+GRID_SAVE_PATH = os.environ.get("GRID_SAVE_PATH", "grid_coords.json")
+DESKEW_MAX_ANGLE = float(os.environ.get("DESKEW_MAX_ANGLE", "12.0"))
+DESKEW_HOUGH_THRESH = int(os.environ.get("DESKEW_HOUGH_THRESH", "120"))
+DESKEW_MIN_LINE = int(os.environ.get("DESKEW_MIN_LINE", "60"))
+DESKEW_MAX_GAP = int(os.environ.get("DESKEW_MAX_GAP", "15"))
+
+CELL_PAD_RATIO = float(os.environ.get("CELL_PAD_RATIO", "0.12"))
+O_MIN_AREA_FRAC = float(os.environ.get("O_MIN_AREA_FRAC", "0.08"))
+O_MAX_AREA_FRAC = float(os.environ.get("O_MAX_AREA_FRAC", "0.65"))
+O_MIN_CIRC = float(os.environ.get("O_MIN_CIRC", "0.62"))
+X_MIN_LINES = int(os.environ.get("X_MIN_LINES", "2"))
+X_ANGLE_TOL = float(os.environ.get("X_ANGLE_TOL", "18.0"))
+X_CENTER_RADIUS = float(os.environ.get("X_CENTER_RADIUS", "0.25"))
+
+GRID_LINE_THICK = int(os.environ.get("GRID_LINE_THICK", "2"))
+CELL_BORDER_THICK = int(os.environ.get("CELL_BORDER_THICK", "2"))
 
 
 # =========================
@@ -176,6 +194,17 @@ def warp_rect(frame_bgr, rect_bbox: Tuple[int, int, int, int]) -> np.ndarray:
     return cv2.warpPerspective(frame_bgr, M, (WARP_W, WARP_H))
 
 
+def warp_perspective_from_centers(frame_bgr, centers4: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    src = order_points_4(centers4)
+    dst = np.array(
+        [[0, 0], [WARP_W - 1, 0], [WARP_W - 1, WARP_H - 1], [0, WARP_H - 1]],
+        dtype=np.float32,
+    )
+    M = cv2.getPerspectiveTransform(src, dst)
+    warp = cv2.warpPerspective(frame_bgr, M, (WARP_W, WARP_H))
+    return warp, M
+
+
 def smooth_bbox(prev: Optional[Tuple[int, int, int, int]], cur: Tuple[int, int, int, int], alpha: float) -> Tuple[int, int, int, int]:
     if prev is None:
         return cur
@@ -193,6 +222,205 @@ def _make_black_warp(text="NO_WARP") -> np.ndarray:
     cv2.putText(img, text, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 255), 3)
     return img
 
+
+def _angle_norm_deg(angle_deg: float) -> float:
+    a = angle_deg % 180.0
+    if a > 90.0:
+        a -= 180.0
+    return a
+
+
+def deskew_warp(warp_bgr: np.ndarray) -> Tuple[np.ndarray, float, np.ndarray]:
+    gray = cv2.cvtColor(warp_bgr, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180.0,
+        threshold=DESKEW_HOUGH_THRESH,
+        minLineLength=DESKEW_MIN_LINE,
+        maxLineGap=DESKEW_MAX_GAP,
+    )
+
+    angles = []
+    if lines is not None:
+        for l in lines[:, 0]:
+            x1, y1, x2, y2 = l
+            ang = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+            ang = _angle_norm_deg(ang)
+            if abs(ang) <= DESKEW_MAX_ANGLE:
+                angles.append(ang)
+            elif abs(abs(ang) - 90.0) <= DESKEW_MAX_ANGLE:
+                a2 = ang - 90.0 if ang > 0 else ang + 90.0
+                angles.append(a2)
+
+    angle = float(np.median(angles)) if angles else 0.0
+    if abs(angle) > DESKEW_MAX_ANGLE:
+        angle = 0.0
+
+    h, w = warp_bgr.shape[:2]
+    center = (w * 0.5, h * 0.5)
+    R = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(warp_bgr, R, (w, h), flags=cv2.INTER_LINEAR, borderValue=(0, 0, 0))
+    return rotated, angle, R
+
+
+def build_grid_lines(rows: int, cols: int, cell_px: int) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
+    lines = []
+    w = cols * cell_px
+    h = rows * cell_px
+    for r in range(rows + 1):
+        y = r * cell_px
+        lines.append(((0, y), (w, y)))
+    for c in range(cols + 1):
+        x = c * cell_px
+        lines.append(((x, 0), (x, h)))
+    return lines
+
+
+def draw_grid(img_bgr: np.ndarray, lines, color=(0, 255, 255), thick=2):
+    for (x0, y0), (x1, y1) in lines:
+        cv2.line(img_bgr, (int(x0), int(y0)), (int(x1), int(y1)), color, thick)
+
+
+def project_lines_to_camera(lines, M_inv: np.ndarray, invR: np.ndarray) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
+    out = []
+    for (x0, y0), (x1, y1) in lines:
+        pts = np.array([[x0, y0], [x1, y1]], dtype=np.float32).reshape(-1, 1, 2)
+        pts_warp = cv2.transform(pts, invR)
+        pts_cam = cv2.perspectiveTransform(pts_warp, M_inv)
+        p0 = pts_cam[0, 0]
+        p1 = pts_cam[1, 0]
+        out.append(((int(p0[0]), int(p0[1])), (int(p1[0]), int(p1[1]))))
+    return out
+
+
+def save_grid_coords(path: str, data: Dict[str, Any]):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=True)
+    except Exception:
+        pass
+
+
+def _line_intersection(p1, p2, p3, p4) -> Optional[Tuple[float, float]]:
+    x1, y1 = p1
+    x2, y2 = p2
+    x3, y3 = p3
+    x4, y4 = p4
+    den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+    if abs(den) < 1e-6:
+        return None
+    px = ((x1 * y2 - y1 * x2) * (x3 - x4) - (x1 - x2) * (x3 * y4 - y3 * x4)) / den
+    py = ((x1 * y2 - y1 * x2) * (y3 - y4) - (y1 - y2) * (x3 * y4 - y3 * x4)) / den
+    return (px, py)
+
+
+def detect_cell_state(cell_bgr: np.ndarray) -> int:
+    h, w = cell_bgr.shape[:2]
+    area = float(h * w)
+
+    gray = cv2.cvtColor(cell_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 50, 150)
+
+    # O detection (contour circularity)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for c in contours:
+        a = float(cv2.contourArea(c))
+        if a < O_MIN_AREA_FRAC * area or a > O_MAX_AREA_FRAC * area:
+            continue
+        per = float(cv2.arcLength(c, True))
+        if per <= 1.0:
+            continue
+        circ = 4.0 * np.pi * a / (per * per)
+        x, y, cw, ch = cv2.boundingRect(c)
+        ar = cw / float(max(1, ch))
+        if circ >= O_MIN_CIRC and 0.6 <= ar <= 1.4:
+            return 2
+
+    # X detection (two diagonal lines)
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180.0,
+        threshold=40,
+        minLineLength=max(10, int(0.5 * min(w, h))),
+        maxLineGap=10,
+    )
+    if lines is None:
+        return 0
+
+    pos = []
+    neg = []
+    for l in lines[:, 0]:
+        x1, y1, x2, y2 = l
+        ang = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+        ang = (ang + 180.0) % 180.0
+        if abs(ang - 45.0) <= X_ANGLE_TOL:
+            pos.append((x1, y1, x2, y2))
+        elif abs(ang - 135.0) <= X_ANGLE_TOL:
+            neg.append((x1, y1, x2, y2))
+
+    if len(pos) + len(neg) < X_MIN_LINES:
+        return 0
+
+    cx, cy = w * 0.5, h * 0.5
+    max_r = X_CENTER_RADIUS * min(w, h)
+    for a in pos:
+        for b in neg:
+            p = _line_intersection((a[0], a[1]), (a[2], a[3]), (b[0], b[1]), (b[2], b[3]))
+            if p is None:
+                continue
+            if (p[0] - cx) ** 2 + (p[1] - cy) ** 2 <= max_r * max_r:
+                return 1
+    return 0
+
+
+def detect_board_from_warp(warp_bgr: np.ndarray) -> Tuple[List[List[int]], np.ndarray, List[Dict[str, Any]]]:
+    board = [[0 for _ in range(GRID_COLS)] for _ in range(GRID_ROWS)]
+    cells_info: List[Dict[str, Any]] = []
+
+    overlay = warp_bgr.copy()
+    pad = int(CELL_PAD_RATIO * CELL_PX)
+    for r in range(GRID_ROWS):
+        for c in range(GRID_COLS):
+            x0 = c * CELL_PX
+            y0 = r * CELL_PX
+            x1 = x0 + CELL_PX
+            y1 = y0 + CELL_PX
+
+            ix0 = x0 + pad
+            iy0 = y0 + pad
+            ix1 = x1 - pad
+            iy1 = y1 - pad
+            ix0 = clamp(ix0, x0, x1 - 1)
+            iy0 = clamp(iy0, y0, y1 - 1)
+            ix1 = clamp(ix1, ix0 + 1, x1)
+            iy1 = clamp(iy1, iy0 + 1, y1)
+
+            cell = warp_bgr[iy0:iy1, ix0:ix1]
+            state = detect_cell_state(cell)
+            board[r][c] = state
+
+            if state == 1:
+                color = (0, 255, 255)  # yellow for player X
+                label = "X"
+            elif state == 2:
+                color = (0, 0, 255)  # red for robot O
+                label = "O"
+            else:
+                color = (160, 160, 160)  # gray for empty
+                label = ""
+
+            cv2.rectangle(overlay, (x0 + 1, y0 + 1), (x1 - 1, y1 - 1), color, CELL_BORDER_THICK)
+            if label:
+                cv2.putText(overlay, label, (x0 + 8, y0 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+            cells_info.append({"row": r, "col": c, "state": "empty" if state == 0 else ("player_x" if state == 1 else "robot_o")})
+
+    return board, overlay, cells_info
 
 # =========================
 # NEW: Grid preprocess (gray + remove dots + smooth + extract lines)
@@ -686,7 +914,7 @@ class CameraWeb:
 
         <div class="kv">
           <button class="btn" onclick="playScan()">Play Scan</button>
-          <div class="muted" style="margin-top:8px;">NEW: warp -> gray + smooth grid lines -> send to GPT.</div>
+          <div class="muted" style="margin-top:8px;">NEW: perspective + deskew + local OpenCV detect X/O.</div>
         </div>
 
         <div class="kv"><span class="k">Logs:</span></div>
@@ -698,7 +926,7 @@ class CameraWeb:
 
     <div class="stages">
       <div class="title">Processing Stages</div>
-      <div class="muted">Always show candidates/picked/warp/grid_clean/would_send.</div>
+      <div class="muted">Always show candidates/picked/warp/deskew/grid/cells overlay.</div>
       <div id="stage_list"></div>
     </div>
   </div>
@@ -912,68 +1140,60 @@ def main():
             stages["3m_candidates_debug"] = det.get("debug")
             stages["3m_picked_debug"] = det.get("debug_pick", det.get("debug"))
 
-            # Always build "would_send" stages
             board_bbox_img = det.get("board_bbox_img", stages["3m_picked_debug"])
             stages["4_board_bbox"] = board_bbox_img
 
-            if det.get("found") and det.get("bbox") is not None:
-                bbox = det["bbox"]
-                warp = warp_rect(frame, bbox)
-                stages["5_warp"] = warp
+            if det.get("found") and det.get("bbox") is not None and det.get("centers4") is not None:
+                centers4 = det.get("centers4")
+                warp_persp, M = warp_perspective_from_centers(frame, centers4)
+                stages["5_warp_persp"] = warp_persp
 
-                # --- NEW: preprocess warp before sending to GPT ---
-                if ENABLE_GRID_PREPROCESS:
-                    pp = preprocess_grid_for_gpt(warp)
-                    stages["5a_warp_gray"] = pp["gray"]
-                    stages["5b_warp_bin_inv"] = pp["bin_inv"]
-                    stages["5c_grid_lines"] = pp["lines"]
-                    grid_clean = pp["final_bgr"]
-                    stages["5d_grid_clean"] = grid_clean
-                    warp_for_send = grid_clean
-                else:
-                    warp_for_send = warp
+                warp_deskew, angle, R = deskew_warp(warp_persp)
+                stages["5e_deskew"] = warp_deskew
+
+                grid_lines = build_grid_lines(GRID_ROWS, GRID_COLS, CELL_PX)
+                grid_on_warp = warp_deskew.copy()
+                draw_grid(grid_on_warp, grid_lines, color=(0, 255, 255), thick=GRID_LINE_THICK)
+                stages["6_grid_on_warp"] = grid_on_warp
+
+                M_inv = np.linalg.inv(M)
+                invR = cv2.invertAffineTransform(R)
+                cam_overlay = frame.copy()
+                cam_lines = project_lines_to_camera(grid_lines, M_inv, invR)
+                draw_grid(cam_overlay, cam_lines, color=(0, 255, 255), thick=GRID_LINE_THICK)
+                stages["6_grid_on_cam"] = cam_overlay
+
+                board_mat, cells_overlay, cells_info = detect_board_from_warp(warp_deskew)
+                stages["7_cells_overlay"] = cells_overlay
+
+                coords = {
+                    "rows": GRID_ROWS,
+                    "cols": GRID_COLS,
+                    "cell_px": CELL_PX,
+                    "warp_size": [WARP_W, WARP_H],
+                    "deskew_angle": float(angle),
+                    "markers": det.get("slots", {}),
+                    "warp_lines": [([int(a[0]), int(a[1])], [int(b[0]), int(b[1])]) for a, b in grid_lines],
+                    "camera_lines": [([int(a[0]), int(a[1])], [int(b[0]), int(b[1])]) for a, b in cam_lines],
+                }
+                save_grid_coords(GRID_SAVE_PATH, coords)
+
+                cam.set_cells_server(cells_info)
+                board.set_board(board_mat)
             else:
-                stages["5_warp"] = _make_black_warp("NO_WARP (need >=3 markers)")
-                warp_for_send = stages["5_warp"]
+                stages["5_warp_persp"] = _make_black_warp("NO_WARP (need >=3 markers)")
 
-            # Stack: board_small + warp_for_send (this is what we actually send)
-            bw = warp_for_send.shape[1]
-            bh = int(round(board_bbox_img.shape[0] * (bw / max(1, board_bbox_img.shape[1]))))
-            board_small = cv2.resize(board_bbox_img, (bw, bh))
-
-            if warp_for_send.shape[:2] != (WARP_H, WARP_W):
-                warp_for_send = cv2.resize(warp_for_send, (WARP_W, WARP_H))
-
-            send_img = np.vstack([board_small, warp_for_send])
-            stages["6_would_send"] = send_img
-
-            # If cannot get bbox => show stages anyway, but do not send
-            if not det.get("found") or det.get("bbox") is None:
+            # If cannot get corners => show stages anyway
+            if not det.get("found") or det.get("bbox") is None or det.get("centers4") is None:
                 cam.set_stage_images(stages)
                 cam.set_cells_server([])
-                cam.set_scan_status("failed", "board bbox not found (need >=3 markers)")
-                cam.log(f"[SCAN] failed: bbox not found, slots={det.get('slots')}")
+                cam.set_scan_status("failed", "board corners not found (need >=3 markers)")
+                cam.log(f"[SCAN] failed: corners not found, slots={det.get('slots')}")
                 continue
-
-            cam.log("[SCAN] posting to server (grid_clean)...")
-            result = _post_image_to_api(_encode_jpeg(send_img, quality=80))
-
-            if not result or not result.get("found"):
-                err = (result or {}).get("error", "server returned found=false")
-                cam.set_stage_images(stages)
-                cam.set_cells_server([])
-                cam.set_scan_status("failed", f"server fail: {err}")
-                cam.log(f"[SCAN] failed: server: {err}")
-                continue
-
-            cells = result.get("cells", []) or []
-            cam.set_cells_server(cells)
-            board_mat = board_from_server_cells(GRID_ROWS, GRID_COLS, cells)
-            board.set_board(board_mat)
 
             cam.set_stage_images(stages)
             cam.set_scan_status("ready", "")
-            cam.log(f"[SCAN] ok: cells={len(cells)} bbox={det['bbox']}")
+            cam.log(f"[SCAN] ok: local detect bbox={det['bbox']}")
 
         except Exception as e:
             cam.set_stage_images(stages or {})
