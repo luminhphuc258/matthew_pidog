@@ -315,6 +315,19 @@ def draw_grid(img_bgr: np.ndarray, lines, color=(0, 255, 255), thick=2):
         cv2.line(img_bgr, (int(x0), int(y0)), (int(x1), int(y1)), color, thick)
 
 
+def overlay_frame(frame_bgr: np.ndarray, lines, polys, alpha: float) -> np.ndarray:
+    out = frame_bgr.copy()
+    if polys:
+        overlay = out.copy()
+        for poly in polys:
+            pts = np.asarray(poly, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.fillPoly(overlay, [pts], (0, 255, 255))
+        out = cv2.addWeighted(overlay, alpha, out, 1.0 - alpha, 0)
+    if lines:
+        draw_grid(out, lines, color=(0, 255, 255), thick=GRID_LINE_THICK)
+    return out
+
+
 def project_lines_to_camera(lines, M_inv: np.ndarray, invR: np.ndarray) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
     out = []
     for (x0, y0), (x1, y1) in lines:
@@ -921,7 +934,7 @@ class CameraWeb:
     body {{ font-family: Arial, sans-serif; background:#0b0f14; color:#e7eef7; margin:0; }}
     .wrap {{ display:grid; grid-template-columns: 1fr 420px; gap:14px; padding:14px; }}
     .left {{ display:flex; gap:14px; align-items:flex-start; }}
-    .card {{ background:#111827; border:1px solid #223; border-radius:12px; padding:12px; min-width:360px; }}
+    .card {{ background:#111827; border:1px solid #223; border-radius:12px; padding:12px; min-width:360px; max-height: calc(100vh - 28px); overflow:auto; }}
     .kv {{ margin:8px 0; }}
     .k {{ color:#93c5fd; }}
     .err {{ color:#fca5a5; font-size:12px; white-space:pre-wrap; }}
@@ -952,10 +965,10 @@ class CameraWeb:
         <div id="board" class="mono">-</div>
 
         <div class="kv"><span class="k">Cells (server):</span></div>
-        <div id="cells" class="mono" style="max-height:200px; overflow:auto;">-</div>
+        <div id="cells" class="mono" style="max-height:160px; overflow:auto;">-</div>
 
         <div class="kv"><span class="k">Server raw:</span></div>
-        <div id="server_raw" class="mono" style="max-height:160px; overflow:auto;">-</div>
+        <div id="server_raw" class="mono" style="max-height:120px; overflow:auto;">-</div>
 
         <div class="kv">
           <button class="btn" onclick="playScan()">Play Scan</button>
@@ -1057,7 +1070,7 @@ tick();
                 time.sleep(0.05)
                 continue
             if lines or polys:
-                frame = self._draw_overlay(frame, lines, polys)
+                frame = overlay_frame(frame, lines, polys, OVERLAY_ALPHA)
             jpg = _encode_jpeg(frame, quality=JPEG_QUALITY)
             if not jpg:
                 time.sleep(0.03)
@@ -1122,16 +1135,7 @@ tick();
         return False
 
     def _draw_overlay(self, frame, lines, polys):
-        out = frame.copy()
-        if polys:
-            overlay = out.copy()
-            for poly in polys:
-                pts = np.asarray(poly, dtype=np.int32).reshape(-1, 1, 2)
-                cv2.fillPoly(overlay, [pts], (0, 255, 255))
-            out = cv2.addWeighted(overlay, OVERLAY_ALPHA, out, 1.0 - OVERLAY_ALPHA, 0)
-        if lines:
-            draw_grid(out, lines, color=(0, 255, 255), thick=GRID_LINE_THICK)
-        return out
+        return overlay_frame(frame, lines, polys, OVERLAY_ALPHA)
 
     def _capture_loop(self):
         dev = int(CAM_DEV) if str(CAM_DEV).isdigit() else CAM_DEV
@@ -1294,10 +1298,7 @@ def main():
                     x_polys.append(cam_pts)
 
                 cam.set_overlay(cam_lines, x_polys)
-                for poly in x_polys:
-                    pts = np.asarray(poly, dtype=np.int32).reshape(-1, 1, 2)
-                    cv2.polylines(cam_overlay, [pts], True, (0, 255, 255), 2)
-                stages["6_grid_on_cam"] = cam_overlay
+                stages["6_grid_on_cam"] = overlay_frame(cam_overlay, cam_lines, x_polys, OVERLAY_ALPHA)
             else:
                 stages["5_warp_persp"] = _make_black_warp("NO_WARP (need >=3 markers)")
 
