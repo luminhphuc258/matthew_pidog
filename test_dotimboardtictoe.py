@@ -102,6 +102,7 @@ X_CENTER_RADIUS = float(os.environ.get("X_CENTER_RADIUS", "0.25"))
 
 GRID_LINE_THICK = int(os.environ.get("GRID_LINE_THICK", "2"))
 CELL_BORDER_THICK = int(os.environ.get("CELL_BORDER_THICK", "2"))
+OVERLAY_ALPHA = float(os.environ.get("OVERLAY_ALPHA", "0.35"))
 
 
 # =========================
@@ -294,6 +295,13 @@ def project_lines_to_camera(lines, M_inv: np.ndarray, invR: np.ndarray) -> List[
         p1 = pts_cam[1, 0]
         out.append(((int(p0[0]), int(p0[1])), (int(p1[0]), int(p1[1]))))
     return out
+
+
+def project_points_to_camera(pts, M_inv: np.ndarray, invR: np.ndarray) -> np.ndarray:
+    pts = np.asarray(pts, dtype=np.float32).reshape(-1, 1, 2)
+    pts_warp = cv2.transform(pts, invR)
+    pts_cam = cv2.perspectiveTransform(pts_warp, M_inv)
+    return pts_cam.reshape(-1, 2)
 
 
 def save_grid_coords(path: str, data: Dict[str, Any]):
@@ -812,6 +820,8 @@ class CameraWeb:
         self._lock = threading.Lock()
 
         self._last_frame = None
+        self._overlay_lines: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
+        self._overlay_x_polys: List[np.ndarray] = []
         self._scan_status = "idle"
         self._last_error = ""
         self._cells_server: List[Dict[str, Any]] = []
@@ -1005,9 +1015,13 @@ tick();
         while not self._stop.is_set():
             with self._lock:
                 frame = None if self._last_frame is None else self._last_frame.copy()
+                lines = list(self._overlay_lines)
+                polys = list(self._overlay_x_polys)
             if frame is None:
                 time.sleep(0.05)
                 continue
+            if lines or polys:
+                frame = self._draw_overlay(frame, lines, polys)
             jpg = _encode_jpeg(frame, quality=JPEG_QUALITY)
             if not jpg:
                 time.sleep(0.03)
@@ -1029,6 +1043,16 @@ tick();
             self._scan_status = str(status)
             self._last_error = str(error or "")
 
+    def set_overlay(self, lines, x_polys):
+        with self._lock:
+            self._overlay_lines = list(lines or [])
+            self._overlay_x_polys = list(x_polys or [])
+
+    def clear_overlay(self):
+        with self._lock:
+            self._overlay_lines = []
+            self._overlay_x_polys = []
+
     def set_cells_server(self, cells: List[Dict[str, Any]]):
         with self._lock:
             self._cells_server = cells or []
@@ -1049,8 +1073,21 @@ tick();
     def consume_scan_request(self) -> bool:
         if self._play_requested.is_set():
             self._play_requested.clear()
+            self.clear_overlay()
             return True
         return False
+
+    def _draw_overlay(self, frame, lines, polys):
+        out = frame.copy()
+        if polys:
+            overlay = out.copy()
+            for poly in polys:
+                pts = np.asarray(poly, dtype=np.int32).reshape(-1, 1, 2)
+                cv2.fillPoly(overlay, [pts], (0, 255, 255))
+            out = cv2.addWeighted(overlay, OVERLAY_ALPHA, out, 1.0 - OVERLAY_ALPHA, 0)
+        if lines:
+            draw_grid(out, lines, color=(0, 255, 255), thick=GRID_LINE_THICK)
+        return out
 
     def _capture_loop(self):
         dev = int(CAM_DEV) if str(CAM_DEV).isdigit() else CAM_DEV
@@ -1161,10 +1198,6 @@ def main():
                 cam_overlay = frame.copy()
                 cam_lines = project_lines_to_camera(grid_lines, M_inv, invR)
                 draw_grid(cam_overlay, cam_lines, color=(0, 255, 255), thick=GRID_LINE_THICK)
-                stages["6_grid_on_cam"] = cam_overlay
-
-                board_mat, cells_overlay, cells_info = detect_board_from_warp(warp_deskew)
-                stages["7_cells_overlay"] = cells_overlay
 
                 coords = {
                     "rows": GRID_ROWS,
@@ -1178,8 +1211,45 @@ def main():
                 }
                 save_grid_coords(GRID_SAVE_PATH, coords)
 
-                cam.set_cells_server(cells_info)
+                cam.log("[SCAN] posting to server (grid_on_warp)...")
+                result = _post_image_to_api(_encode_jpeg(grid_on_warp, quality=80))
+
+                if not result or not result.get("found"):
+                    err = (result or {}).get("error", "server returned found=false")
+                    cam.set_stage_images(stages)
+                    cam.set_cells_server([])
+                    cam.set_scan_status("failed", f"server fail: {err}")
+                    cam.set_overlay([], [])
+                    cam.log(f"[SCAN] failed: server: {err}")
+                    continue
+
+                cells = result.get("cells", []) or []
+                cam.set_cells_server(cells)
+                board_mat = board_from_server_cells(GRID_ROWS, GRID_COLS, cells)
                 board.set_board(board_mat)
+
+                x_polys = []
+                for cell in cells:
+                    r = int(cell.get("row", cell.get("r", -1)))
+                    c = int(cell.get("col", cell.get("c", -1)))
+                    st = str(cell.get("state", "empty")).lower().strip()
+                    if st not in ("player_x", "x", "human_x"):
+                        continue
+                    if r < 0 or c < 0 or r >= GRID_ROWS or c >= GRID_COLS:
+                        continue
+                    x0 = c * CELL_PX
+                    y0 = r * CELL_PX
+                    x1 = x0 + CELL_PX
+                    y1 = y0 + CELL_PX
+                    pts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+                    cam_pts = project_points_to_camera(pts, M_inv, invR)
+                    x_polys.append(cam_pts)
+
+                cam.set_overlay(cam_lines, x_polys)
+                for poly in x_polys:
+                    pts = np.asarray(poly, dtype=np.int32).reshape(-1, 1, 2)
+                    cv2.polylines(cam_overlay, [pts], True, (0, 255, 255), 2)
+                stages["6_grid_on_cam"] = cam_overlay
             else:
                 stages["5_warp_persp"] = _make_black_warp("NO_WARP (need >=3 markers)")
 
@@ -1188,12 +1258,13 @@ def main():
                 cam.set_stage_images(stages)
                 cam.set_cells_server([])
                 cam.set_scan_status("failed", "board corners not found (need >=3 markers)")
+                cam.set_overlay([], [])
                 cam.log(f"[SCAN] failed: corners not found, slots={det.get('slots')}")
                 continue
 
             cam.set_stage_images(stages)
             cam.set_scan_status("ready", "")
-            cam.log(f"[SCAN] ok: local detect bbox={det['bbox']}")
+            cam.log(f"[SCAN] ok: server detect bbox={det['bbox']}")
 
         except Exception as e:
             cam.set_stage_images(stages or {})
