@@ -1579,7 +1579,7 @@ def run_scan_pipeline(cam: CameraWeb, detector: MarkerBoardDetector, board: "Boa
 
                     cx, cy = cell_center_px(r, c)
                     p10, p11 = map_pixel_to_arm_angles(cx, cy)
-                    label = f\"{p10},{p11}\"
+                    label = f"{p10},{p11}"
                     ccam = project_points_to_camera([(cx, cy)], M_inv, invR)
                     lx, ly = ccam[0]
                     cam_labels.append(((int(lx) - 12, int(ly) + 4), label, (0, 200, 255)))
