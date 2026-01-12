@@ -115,7 +115,7 @@ POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
 ARM_LIFT_PORT = os.environ.get("ARM_LIFT_PORT", "P11")
 ARM_UP_ANGLE = int(os.environ.get("ARM_UP_ANGLE", "-77"))
 ARM_DOWN_ANGLE = int(os.environ.get("ARM_DOWN_ANGLE", "-15"))
-ARM_NEUTRAL_P10 = int(os.environ.get("ARM_NEUTRAL_P10", "80"))
+ARM_NEUTRAL_P10 = int(os.environ.get("ARM_NEUTRAL_P10", "85"))
 
 ARM_P10_LEFT = int(os.environ.get("ARM_P10_LEFT", "90"))
 ARM_P10_RIGHT = int(os.environ.get("ARM_P10_RIGHT", "41"))
@@ -127,7 +127,7 @@ ARM_TOUCH_HOLD_SEC = float(os.environ.get("ARM_TOUCH_HOLD_SEC", "0.5"))
 
 PREPARE_INIT_P8 = int(os.environ.get("PREPARE_INIT_P8", "38"))
 PREPARE_INIT_P10 = int(os.environ.get("PREPARE_INIT_P10", "75"))
-PREPARE_HEAD_P8 = int(os.environ.get("PREPARE_HEAD_P8", "80"))
+PREPARE_HEAD_P8 = int(os.environ.get("PREPARE_HEAD_P8", "50"))
 
 REAR_LIFT_ANGLES = {"P4": 80, "P5": 30, "P6": -70, "P7": -30}
 FRONT_LIFT_ANGLES = {"P0": -20, "P1": 90, "P2": 20, "P3": -75}
@@ -412,6 +412,9 @@ def prepare_robot(cam, robot_state: Dict[str, Any]):
 
         cam.log("[PREPARE] head init angles")
         apply_angles(HEAD_INIT_ANGLES, per_servo_delay=0.04)
+
+        cam.log("[PREPARE] hold P7 at -30 during startup")
+        set_servo_angle("P7", -30, hold_sec=0.4)
 
         cam.log("[PREPARE] lift rear legs")
         smooth_pair("P4", 0, REAR_LIFT_ANGLES["P4"], "P5", 0, REAR_LIFT_ANGLES["P5"], step=1, delay=0.04)
