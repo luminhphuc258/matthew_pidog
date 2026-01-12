@@ -8,6 +8,7 @@ import json
 import uuid
 import urllib.request
 import urllib.error
+from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
 from collections import deque
 from io import BytesIO
@@ -15,6 +16,9 @@ from io import BytesIO
 import cv2
 import numpy as np
 from flask import Flask, Response, jsonify, send_file
+
+from robot_hat import Servo
+from motion_controller import MotionController
 
 
 # =========================
@@ -105,6 +109,33 @@ GRID_LINE_THICK = int(os.environ.get("GRID_LINE_THICK", "2"))
 CELL_BORDER_THICK = int(os.environ.get("CELL_BORDER_THICK", "2"))
 OVERLAY_ALPHA = float(os.environ.get("OVERLAY_ALPHA", "0.35"))
 
+# --- Robot/arm config ---
+POSE_FILE = Path(__file__).resolve().parent / "pidog_pose_config.txt"
+
+ARM_LIFT_PORT = os.environ.get("ARM_LIFT_PORT", "P11")
+ARM_UP_ANGLE = int(os.environ.get("ARM_UP_ANGLE", "-77"))
+ARM_DOWN_ANGLE = int(os.environ.get("ARM_DOWN_ANGLE", "-15"))
+ARM_NEUTRAL_P10 = int(os.environ.get("ARM_NEUTRAL_P10", "80"))
+
+ARM_P10_LEFT = int(os.environ.get("ARM_P10_LEFT", "90"))
+ARM_P10_RIGHT = int(os.environ.get("ARM_P10_RIGHT", "41"))
+ARM_P10_REVERSE = str(os.environ.get("ARM_P10_REVERSE", "0")).lower() in ("1", "true", "yes", "on")
+
+ARM_P11_HOVER_MIN = int(os.environ.get("ARM_P11_HOVER_MIN", str(ARM_UP_ANGLE)))
+ARM_P11_HOVER_MAX = int(os.environ.get("ARM_P11_HOVER_MAX", str(ARM_UP_ANGLE)))
+ARM_TOUCH_HOLD_SEC = float(os.environ.get("ARM_TOUCH_HOLD_SEC", "0.5"))
+
+PREPARE_INIT_P8 = int(os.environ.get("PREPARE_INIT_P8", "38"))
+PREPARE_INIT_P10 = int(os.environ.get("PREPARE_INIT_P10", "75"))
+PREPARE_HEAD_P8 = int(os.environ.get("PREPARE_HEAD_P8", "80"))
+
+REAR_LIFT_ANGLES = {"P4": 80, "P5": 30, "P6": -70, "P7": -30}
+FRONT_LIFT_ANGLES = {"P0": -20, "P1": 90, "P2": 20, "P3": -75}
+HEAD_INIT_ANGLES = {"P8": 38, "P9": -70, "P10": 75}
+
+RESCAN_BACKWARD = str(os.environ.get("RESCAN_BACKWARD", "1")).lower() in ("1", "true", "yes", "on")
+RESCAN_FORWARD = str(os.environ.get("RESCAN_FORWARD", "1")).lower() in ("1", "true", "yes", "on")
+
 
 # =========================
 # Helpers
@@ -115,6 +146,116 @@ def now_s() -> str:
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
+
+
+def clamp_servo(angle: float) -> int:
+    try:
+        v = int(angle)
+    except Exception:
+        v = 0
+    return max(-90, min(90, v))
+
+
+def apply_angles(angles: Dict[str, float], per_servo_delay: float = 0.03):
+    for port, angle in angles.items():
+        try:
+            s = Servo(port)
+            s.angle(clamp_servo(angle))
+        except Exception:
+            pass
+        time.sleep(per_servo_delay)
+
+
+def set_servo_angle(port: str, angle: float, hold_sec: float = 0.4):
+    try:
+        s = Servo(port)
+        s.angle(clamp_servo(angle))
+        time.sleep(max(0.05, float(hold_sec)))
+        s.angle(clamp_servo(angle))
+    except Exception:
+        pass
+
+
+def smooth_pair(
+    pA: str, a_start: int, a_end: int,
+    pB: str, b_start: int, b_end: int,
+    step: int = 1,
+    delay: float = 0.03,
+):
+    sA = Servo(pA)
+    sB = Servo(pB)
+
+    a_start, a_end = clamp_servo(a_start), clamp_servo(a_end)
+    b_start, b_end = clamp_servo(b_start), clamp_servo(b_end)
+
+    a = a_start
+    b = b_start
+
+    try:
+        sA.angle(a)
+        sB.angle(b)
+    except Exception:
+        pass
+
+    max_steps = max(abs(a_end - a_start), abs(b_end - b_start))
+    if max_steps == 0:
+        return
+
+    step = max(1, int(abs(step)))
+
+    for _ in range(max_steps):
+        if a != a_end:
+            a += step if a_end > a else -step
+            if (a_end > a_start and a > a_end) or (a_end < a_start and a < a_end):
+                a = a_end
+
+        if b != b_end:
+            b += step if b_end > b else -step
+            if (b_end > b_start and b > b_end) or (b_end < b_start and b < b_end):
+                b = b_end
+
+        try:
+            sA.angle(clamp_servo(a))
+            sB.angle(clamp_servo(b))
+        except Exception:
+            pass
+
+        time.sleep(delay)
+
+
+def smooth_single(port: str, start: int, end: int, step: int = 1, delay: float = 0.03):
+    s = Servo(port)
+    start, end = clamp_servo(start), clamp_servo(end)
+    a = start
+    try:
+        s.angle(a)
+    except Exception:
+        pass
+
+    step = max(1, int(abs(step)))
+    total = abs(end - start)
+    if total == 0:
+        return
+
+    for _ in range(total):
+        if a == end:
+            break
+        a += step if end > a else -step
+        if (end > start and a > end) or (end < start and a < end):
+            a = end
+        try:
+            s.angle(clamp_servo(a))
+        except Exception:
+            pass
+        time.sleep(delay)
+
+
+def smooth_single_duration(port: str, start: int, end: int, duration_sec: float):
+    total = abs(clamp_servo(end) - clamp_servo(start))
+    if total == 0:
+        return
+    delay = max(0.01, float(duration_sec) / float(total))
+    smooth_single(port, start, end, step=1, delay=delay)
 
 
 def _encode_jpeg(img_bgr, quality=JPEG_QUALITY) -> bytes:
@@ -246,6 +387,155 @@ def smooth_bbox(prev: Optional[Tuple[int, int, int, int]], cur: Tuple[int, int, 
     x1 = int(round((1 - alpha) * px1 + alpha * cx1))
     y1 = int(round((1 - alpha) * py1 + alpha * cy1))
     return (x0, y0, x1, y1)
+
+
+def prepare_robot(cam, robot_state: Dict[str, Any]):
+    with robot_state["lock"]:
+        if robot_state.get("prepared"):
+            cam.set_prepare_status("ready")
+            cam.log("[PREPARE] already prepared")
+            return
+
+    cam.set_prepare_status("preparing")
+    cam.log("[PREPARE] boot to stand (same as test_dichuyentheobanco)")
+
+    os.environ.setdefault("PIDOG_SKIP_HEAD_INIT", "1")
+    os.environ.setdefault("PIDOG_SKIP_MCU_RESET", "1")
+    os.environ.setdefault("HEAD_P8_IDLE", str(PREPARE_INIT_P8))
+    os.environ.setdefault("HEAD_SWEEP_MIN", str(PREPARE_INIT_P8))
+    os.environ.setdefault("HEAD_SWEEP_MAX", str(PREPARE_INIT_P8))
+
+    try:
+        cam.log("[PREPARE] set P8/P10 init")
+        set_servo_angle("P8", PREPARE_INIT_P8, hold_sec=0.4)
+        set_servo_angle("P10", PREPARE_INIT_P10, hold_sec=0.4)
+
+        cam.log("[PREPARE] head init angles")
+        apply_angles(HEAD_INIT_ANGLES, per_servo_delay=0.04)
+
+        cam.log("[PREPARE] lift rear legs")
+        smooth_pair("P4", 0, REAR_LIFT_ANGLES["P4"], "P5", 0, REAR_LIFT_ANGLES["P5"], step=1, delay=0.04)
+        smooth_pair("P6", 0, REAR_LIFT_ANGLES["P6"], "P7", 0, REAR_LIFT_ANGLES["P7"], step=1, delay=0.04)
+        time.sleep(2.0)
+
+        cam.log("[PREPARE] lift front legs")
+        apply_angles(FRONT_LIFT_ANGLES, per_servo_delay=0.04)
+        time.sleep(2.0)
+
+        cam.log("[PREPARE] boot robot to stand")
+        motion = MotionController(pose_file=POSE_FILE)
+        motion.boot()
+        try:
+            motion.close()
+        except Exception:
+            pass
+
+        time.sleep(2.0)
+        cam.log("[PREPARE] arm up + head ready")
+        set_servo_angle(ARM_LIFT_PORT, ARM_UP_ANGLE, hold_sec=0.35)
+        set_servo_angle("P8", PREPARE_HEAD_P8, hold_sec=0.35)
+        set_servo_angle("P10", ARM_NEUTRAL_P10, hold_sec=0.35)
+
+        with robot_state["lock"]:
+            robot_state["motion"] = motion
+            robot_state["prepared"] = True
+
+        cam.set_prepare_status("ready")
+        cam.log("[PREPARE] done")
+    except Exception as exc:
+        cam.set_prepare_status("failed")
+        cam.log(f"[PREPARE] failed: {repr(exc)}")
+
+
+def pick_empty_cell(board_mat: List[List[int]]) -> Optional[Tuple[int, int]]:
+    for r, row in enumerate(board_mat):
+        for c, v in enumerate(row):
+            if v == 0:
+                return r, c
+    return None
+
+
+def cell_center_px(row: int, col: int) -> Tuple[float, float]:
+    return (col + 0.5) * float(CELL_PX), (row + 0.5) * float(CELL_PX)
+
+
+def map_pixel_to_arm_angles(x_px: float, y_px: float) -> Tuple[int, int]:
+    if WARP_W <= 1:
+        x_norm = 0.5
+    else:
+        x_norm = clamp(float(x_px) / float(WARP_W - 1), 0.0, 1.0)
+    if ARM_P10_REVERSE:
+        x_norm = 1.0 - x_norm
+    p10 = ARM_P10_LEFT + (ARM_P10_RIGHT - ARM_P10_LEFT) * x_norm
+
+    if WARP_H <= 1:
+        y_norm = 0.5
+    else:
+        y_norm = clamp(float(y_px) / float(WARP_H - 1), 0.0, 1.0)
+    p11_hover = ARM_P11_HOVER_MIN + (ARM_P11_HOVER_MAX - ARM_P11_HOVER_MIN) * y_norm
+
+    return int(round(p10)), int(round(p11_hover))
+
+
+def move_arm_to_cell(cam, row: int, col: int):
+    x_px, y_px = cell_center_px(row, col)
+    p10, p11_hover = map_pixel_to_arm_angles(x_px, y_px)
+    cam.log(f"[MOVE] cell=({row},{col}) center=({x_px:.1f},{y_px:.1f}) -> P10={p10} P11_hover={p11_hover}")
+
+    set_servo_angle(ARM_LIFT_PORT, ARM_UP_ANGLE, hold_sec=0.2)
+    set_servo_angle("P10", p10, hold_sec=0.2)
+    set_servo_angle(ARM_LIFT_PORT, p11_hover, hold_sec=0.2)
+
+    set_servo_angle(ARM_LIFT_PORT, ARM_DOWN_ANGLE, hold_sec=ARM_TOUCH_HOLD_SEC)
+    time.sleep(0.1)
+
+    set_servo_angle(ARM_LIFT_PORT, ARM_UP_ANGLE, hold_sec=0.25)
+    set_servo_angle("P10", ARM_NEUTRAL_P10, hold_sec=0.25)
+
+
+def perform_robot_move(cam, board: "BoardState", robot_state: Dict[str, Any], detector) -> None:
+    with robot_state["lock"]:
+        prepared = bool(robot_state.get("prepared"))
+        motion = robot_state.get("motion")
+
+    if not prepared:
+        cam.log("[MOVE] skipped: robot not prepared")
+        return
+
+    board_mat = board.snapshot()
+    target = pick_empty_cell(board_mat)
+    if target is None:
+        cam.log("[MOVE] no empty cell to play")
+        return
+
+    cam.log("[MOVE] start draw action")
+    sel_poly = cam.get_cell_cam_poly(target[0], target[1])
+    cam.set_selected_poly(sel_poly)
+    move_arm_to_cell(cam, target[0], target[1])
+    cam.set_selected_poly(None)
+    cam.log("[MOVE] action done -> rescan board")
+
+    res = run_scan_pipeline(cam, detector, board)
+    if res.get("ok"):
+        return
+
+    if motion is not None and RESCAN_BACKWARD:
+        cam.log("[MOVE] rescan failed, move BACK then scan")
+        try:
+            motion.execute("BACK")
+        except Exception:
+            pass
+        res = run_scan_pipeline(cam, detector, board)
+        if res.get("ok"):
+            return
+
+    if motion is not None and RESCAN_FORWARD:
+        cam.log("[MOVE] rescan failed, move FORWARD then scan")
+        try:
+            motion.execute("FORWARD")
+        except Exception:
+            pass
+        run_scan_pipeline(cam, detector, board)
 
 
 def _make_black_warp(text="NO_WARP") -> np.ndarray:
@@ -865,7 +1155,11 @@ class CameraWeb:
         self._last_frame = None
         self._overlay_lines: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
         self._overlay_x_polys: List[np.ndarray] = []
+        self._overlay_labels: List[Tuple[Tuple[int, int], str, Tuple[int, int, int]]] = []
+        self._selected_poly: Optional[np.ndarray] = None
+        self._cell_cam_polys: Dict[Tuple[int, int], np.ndarray] = {}
         self._scan_status = "idle"
+        self._prepare_status = "idle"
         self._last_error = ""
         self._cells_server: List[Dict[str, Any]] = []
         self._stages_jpg: Dict[str, bytes] = {}
@@ -875,6 +1169,7 @@ class CameraWeb:
         self._ready = threading.Event()
         self._failed = threading.Event()
         self._play_requested = threading.Event()
+        self._prepare_requested = threading.Event()
 
         @self.app.get("/")
         def index():
@@ -885,6 +1180,7 @@ class CameraWeb:
             st = self.board.stats()
             with self._lock:
                 st["scan_status"] = self._scan_status
+                st["prepare_status"] = self._prepare_status
                 st["last_error"] = self._last_error
                 st["rows"] = self.board.rows
                 st["cols"] = self.board.cols
@@ -902,6 +1198,12 @@ class CameraWeb:
         def play():
             self._play_requested.set()
             self.log("[UI] Play Scan clicked")
+            return jsonify({"ok": True})
+
+        @self.app.get("/prepare")
+        def prepare():
+            self._prepare_requested.set()
+            self.log("[UI] Prepare clicked")
             return jsonify({"ok": True})
 
         @self.app.get("/mjpeg")
@@ -952,6 +1254,7 @@ class CameraWeb:
       <div class="card">
         <div class="kv"><span class="k">Board:</span> rows=<span id="rows">-</span>, cols=<span id="cols">-</span></div>
         <div class="kv"><span class="k">Scan status:</span> <span id="scan_status">-</span></div>
+        <div class="kv"><span class="k">Prepare status:</span> <span id="prepare_status">-</span></div>
         <div class="kv"><span class="k">Last error:</span></div>
         <div id="last_error" class="err">-</div>
 
@@ -966,6 +1269,7 @@ class CameraWeb:
         <div id="cells" class="mono" style="max-height:160px; overflow:auto;">-</div>
 
         <div class="kv">
+          <button class="btn" onclick="prepareRobot()">Prepare to go</button>
           <button class="btn" onclick="playScan()">Play Scan</button>
           <div class="muted" style="margin-top:8px;">NEW: perspective + deskew + server detect X.</div>
         </div>
@@ -1020,6 +1324,7 @@ async function tick() {{
     document.getElementById('rows').textContent = js.rows ?? '-';
     document.getElementById('cols').textContent = js.cols ?? '-';
     document.getElementById('scan_status').textContent = js.scan_status ?? '-';
+    document.getElementById('prepare_status').textContent = js.prepare_status ?? '-';
     document.getElementById('last_error').textContent = js.last_error || '-';
 
     document.getElementById('empty').textContent = js.empty ?? '-';
@@ -1046,6 +1351,11 @@ async function playScan() {{
   tick();
 }}
 
+async function prepareRobot() {{
+  try {{ await fetch('/prepare'); }} catch(e) {{}}
+  tick();
+}}
+
 setInterval(tick, {poll_ms});
 tick();
 </script>
@@ -1060,11 +1370,21 @@ tick();
                 frame = None if self._last_frame is None else self._last_frame.copy()
                 lines = list(self._overlay_lines)
                 polys = list(self._overlay_x_polys)
+                labels = list(self._overlay_labels)
+                selected = None if self._selected_poly is None else self._selected_poly.copy()
             if frame is None:
                 time.sleep(0.05)
                 continue
             if lines or polys:
                 frame = overlay_frame(frame, lines, polys, OVERLAY_ALPHA)
+            if selected is not None:
+                overlay = frame.copy()
+                pts = np.asarray(selected, dtype=np.int32).reshape(-1, 1, 2)
+                cv2.fillPoly(overlay, [pts], (0, 0, 255))
+                frame = cv2.addWeighted(overlay, 0.4, frame, 0.6, 0)
+            if labels:
+                for (x, y), text, color in labels:
+                    cv2.putText(frame, text, (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
             jpg = _encode_jpeg(frame, quality=JPEG_QUALITY)
             if not jpg:
                 time.sleep(0.03)
@@ -1086,15 +1406,38 @@ tick();
             self._scan_status = str(status)
             self._last_error = str(error or "")
 
+    def set_prepare_status(self, status: str):
+        with self._lock:
+            self._prepare_status = str(status)
+
     def set_overlay(self, lines, x_polys):
         with self._lock:
             self._overlay_lines = list(lines or [])
             self._overlay_x_polys = list(x_polys or [])
 
+    def set_overlay_labels(self, labels):
+        with self._lock:
+            self._overlay_labels = list(labels or [])
+
+    def set_selected_poly(self, poly: Optional[np.ndarray]):
+        with self._lock:
+            self._selected_poly = None if poly is None else np.asarray(poly, dtype=np.float32)
+
+    def set_cell_cam_polys(self, polys: Dict[Tuple[int, int], np.ndarray]):
+        with self._lock:
+            self._cell_cam_polys = dict(polys or {})
+
+    def get_cell_cam_poly(self, row: int, col: int) -> Optional[np.ndarray]:
+        with self._lock:
+            return self._cell_cam_polys.get((row, col))
+
     def clear_overlay(self):
         with self._lock:
             self._overlay_lines = []
             self._overlay_x_polys = []
+            self._overlay_labels = []
+            self._selected_poly = None
+            self._cell_cam_polys = {}
 
     def set_cells_server(self, cells: List[Dict[str, Any]]):
         with self._lock:
@@ -1117,6 +1460,12 @@ tick();
         if self._play_requested.is_set():
             self._play_requested.clear()
             self.clear_overlay()
+            return True
+        return False
+
+    def consume_prepare_request(self) -> bool:
+        if self._prepare_requested.is_set():
+            self._prepare_requested.clear()
             return True
         return False
 
@@ -1172,6 +1521,150 @@ tick();
 
 
 # =========================
+# Scan pipeline
+# =========================
+def run_scan_pipeline(cam: CameraWeb, detector: MarkerBoardDetector, board: "BoardState") -> Dict[str, Any]:
+    cam.log("[SCAN] start")
+    cam.set_scan_status("scanning", "")
+
+    stages: Dict[str, np.ndarray] = {}
+    try:
+        frame = cam.get_last_frame()
+        if frame is None:
+            stages["0_fail"] = np.zeros((CAM_H, CAM_W, 3), dtype=np.uint8)
+            cam.set_stage_images(stages)
+            cam.set_cells_server([])
+            cam.set_scan_status("failed", "no frame from camera")
+            cam.log("[SCAN] failed: no frame")
+            return {"ok": False}
+
+        det = detector.detect_board_bbox(frame)
+        stages["3m_marker_mask"] = det.get("mask")
+        stages["3m_candidates_debug"] = det.get("debug")
+        stages["3m_picked_debug"] = det.get("debug_pick", det.get("debug"))
+
+        board_bbox_img = det.get("board_bbox_img", stages["3m_picked_debug"])
+        stages["4_board_bbox"] = board_bbox_img
+
+        if det.get("found") and det.get("bbox") is not None and det.get("centers4") is not None:
+            centers4 = det.get("centers4")
+            warp_persp, M = warp_perspective_from_centers(frame, centers4)
+            stages["5_warp_persp"] = warp_persp
+
+            warp_deskew, angle, R = deskew_warp(warp_persp)
+            stages["5e_deskew"] = warp_deskew
+
+            grid_lines = build_grid_lines(GRID_ROWS, GRID_COLS, CELL_PX)
+            grid_on_warp = warp_deskew.copy()
+            draw_grid(grid_on_warp, grid_lines, color=(0, 255, 255), thick=GRID_LINE_THICK)
+            stages["6_grid_on_warp"] = grid_on_warp
+
+            M_inv = np.linalg.inv(M)
+            invR = cv2.invertAffineTransform(R)
+            cam_overlay = frame.copy()
+            cam_lines = project_lines_to_camera(grid_lines, M_inv, invR)
+            draw_grid(cam_overlay, cam_lines, color=(0, 255, 255), thick=GRID_LINE_THICK)
+
+            cam_cell_polys: Dict[Tuple[int, int], np.ndarray] = {}
+            cam_labels: List[Tuple[Tuple[int, int], str, Tuple[int, int, int]]] = []
+            for r in range(GRID_ROWS):
+                for c in range(GRID_COLS):
+                    x0 = c * CELL_PX
+                    y0 = r * CELL_PX
+                    x1 = x0 + CELL_PX
+                    y1 = y0 + CELL_PX
+                    pts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+                    cam_pts = project_points_to_camera(pts, M_inv, invR)
+                    cam_cell_polys[(r, c)] = cam_pts
+
+                    cx, cy = cell_center_px(r, c)
+                    p10, p11 = map_pixel_to_arm_angles(cx, cy)
+                    label = f\"{p10},{p11}\"
+                    ccam = project_points_to_camera([(cx, cy)], M_inv, invR)
+                    lx, ly = ccam[0]
+                    cam_labels.append(((int(lx) - 12, int(ly) + 4), label, (0, 200, 255)))
+
+            coords = {
+                "rows": GRID_ROWS,
+                "cols": GRID_COLS,
+                "cell_px": CELL_PX,
+                "warp_size": [WARP_W, WARP_H],
+                "deskew_angle": float(angle),
+                "markers": det.get("slots", {}),
+                "warp_lines": [([int(a[0]), int(a[1])], [int(b[0]), int(b[1])]) for a, b in grid_lines],
+                "camera_lines": [([int(a[0]), int(a[1])], [int(b[0]), int(b[1])]) for a, b in cam_lines],
+            }
+            save_grid_coords(GRID_SAVE_PATH, coords)
+
+            cam.log("[SCAN] posting to server (grid_on_warp)...")
+            result = _post_image_to_api(_encode_jpeg(grid_on_warp, quality=80))
+            raw_resp = (result or {}).get("_raw", "")
+            if raw_resp:
+                cam.log(f"[SERVER] raw: {raw_resp[:400]}")
+
+            if not result or not result.get("found"):
+                err = (result or {}).get("error", "server returned found=false")
+                cam.set_stage_images(stages)
+                cam.set_cells_server([])
+                cam.set_scan_status("failed", f"server fail: {err}")
+                cam.clear_overlay()
+                cam.log(f"[SCAN] failed: server: {err}")
+                return {"ok": False}
+
+            cells = result.get("cells", []) or []
+            cam.set_cells_server(cells)
+            board_mat = board_from_server_cells(GRID_ROWS, GRID_COLS, cells)
+            board.set_board(board_mat)
+
+            x_polys = []
+            x_polys_warp = []
+            for cell in cells:
+                r = int(cell.get("row", cell.get("r", -1)))
+                c = int(cell.get("col", cell.get("c", -1)))
+                st = str(cell.get("state", "empty")).lower().strip()
+                if st not in ("player_x", "x", "human_x"):
+                    continue
+                if r < 0 or c < 0 or r >= GRID_ROWS or c >= GRID_COLS:
+                    continue
+                x0 = c * CELL_PX
+                y0 = r * CELL_PX
+                x1 = x0 + CELL_PX
+                y1 = y0 + CELL_PX
+                pts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+                x_polys_warp.append(np.asarray(pts, dtype=np.float32))
+                cam_pts = project_points_to_camera(pts, M_inv, invR)
+                x_polys.append(cam_pts)
+
+            cam.set_overlay(cam_lines, x_polys)
+            cam.set_overlay_labels(cam_labels)
+            cam.set_cell_cam_polys(cam_cell_polys)
+            stages["6_grid_on_cam"] = overlay_frame(cam_overlay, cam_lines, x_polys, OVERLAY_ALPHA)
+            stages["6a_grid_x_warp"] = overlay_frame(grid_on_warp, grid_lines, x_polys_warp, OVERLAY_ALPHA)
+        else:
+            stages["5_warp_persp"] = _make_black_warp("NO_WARP (need >=3 markers)")
+
+        if not det.get("found") or det.get("bbox") is None or det.get("centers4") is None:
+            cam.set_stage_images(stages)
+            cam.set_cells_server([])
+            cam.set_scan_status("failed", "board corners not found (need >=3 markers)")
+            cam.clear_overlay()
+            cam.log(f"[SCAN] failed: corners not found, slots={det.get('slots')}")
+            return {"ok": False}
+
+        cam.set_stage_images(stages)
+        cam.set_scan_status("ready", "")
+        cam.log(f"[SCAN] ok: server detect bbox={det['bbox']}")
+        return {"ok": True}
+
+    except Exception as e:
+        cam.set_stage_images(stages or {})
+        cam.set_cells_server([])
+        cam.set_scan_status("failed", f"exception: {repr(e)}")
+        cam.log(f"[SCAN] EXCEPTION: {repr(e)}")
+        return {"ok": False}
+
+
+# =========================
 # MAIN
 # =========================
 def main():
@@ -1185,131 +1678,24 @@ def main():
         return
 
     detector = MarkerBoardDetector()
-    cam.log("[WEB] press Play Scan to run pipeline")
+    cam.log("[WEB] press Prepare to go, then Play Scan")
+
+    robot_state = {
+        "prepared": False,
+        "motion": None,
+        "lock": threading.Lock(),
+    }
 
     while True:
-        if not cam.consume_scan_request():
-            time.sleep(0.08)
-            continue
+        if cam.consume_prepare_request():
+            prepare_robot(cam, robot_state)
 
-        cam.log("[SCAN] start")
-        cam.set_scan_status("scanning", "")
+        if cam.consume_scan_request():
+            result = run_scan_pipeline(cam, detector, board)
+            if result.get("ok"):
+                perform_robot_move(cam, board, robot_state, detector)
 
-        stages: Dict[str, np.ndarray] = {}
-        try:
-            frame = cam.get_last_frame()
-            if frame is None:
-                stages["0_fail"] = np.zeros((CAM_H, CAM_W, 3), dtype=np.uint8)
-                cam.set_stage_images(stages)
-                cam.set_cells_server([])
-                cam.set_scan_status("failed", "no frame from camera")
-                cam.log("[SCAN] failed: no frame")
-                continue
-
-            det = detector.detect_board_bbox(frame)
-            stages["3m_marker_mask"] = det.get("mask")
-            stages["3m_candidates_debug"] = det.get("debug")
-            stages["3m_picked_debug"] = det.get("debug_pick", det.get("debug"))
-
-            board_bbox_img = det.get("board_bbox_img", stages["3m_picked_debug"])
-            stages["4_board_bbox"] = board_bbox_img
-
-            if det.get("found") and det.get("bbox") is not None and det.get("centers4") is not None:
-                centers4 = det.get("centers4")
-                warp_persp, M = warp_perspective_from_centers(frame, centers4)
-                stages["5_warp_persp"] = warp_persp
-
-                warp_deskew, angle, R = deskew_warp(warp_persp)
-                stages["5e_deskew"] = warp_deskew
-
-                grid_lines = build_grid_lines(GRID_ROWS, GRID_COLS, CELL_PX)
-                grid_on_warp = warp_deskew.copy()
-                draw_grid(grid_on_warp, grid_lines, color=(0, 255, 255), thick=GRID_LINE_THICK)
-                stages["6_grid_on_warp"] = grid_on_warp
-
-                M_inv = np.linalg.inv(M)
-                invR = cv2.invertAffineTransform(R)
-                cam_overlay = frame.copy()
-                cam_lines = project_lines_to_camera(grid_lines, M_inv, invR)
-                draw_grid(cam_overlay, cam_lines, color=(0, 255, 255), thick=GRID_LINE_THICK)
-
-                coords = {
-                    "rows": GRID_ROWS,
-                    "cols": GRID_COLS,
-                    "cell_px": CELL_PX,
-                    "warp_size": [WARP_W, WARP_H],
-                    "deskew_angle": float(angle),
-                    "markers": det.get("slots", {}),
-                    "warp_lines": [([int(a[0]), int(a[1])], [int(b[0]), int(b[1])]) for a, b in grid_lines],
-                    "camera_lines": [([int(a[0]), int(a[1])], [int(b[0]), int(b[1])]) for a, b in cam_lines],
-                }
-                save_grid_coords(GRID_SAVE_PATH, coords)
-
-                cam.log("[SCAN] posting to server (grid_on_warp)...")
-                result = _post_image_to_api(_encode_jpeg(grid_on_warp, quality=80))
-                raw_resp = (result or {}).get("_raw", "")
-                if raw_resp:
-                    cam.log(f"[SERVER] raw: {raw_resp[:400]}")
-
-                if not result or not result.get("found"):
-                    err = (result or {}).get("error", "server returned found=false")
-                    cam.set_stage_images(stages)
-                    cam.set_cells_server([])
-                    cam.set_scan_status("failed", f"server fail: {err}")
-                    cam.set_overlay([], [])
-                    cam.log(f"[SCAN] failed: server: {err}")
-                    continue
-
-                cells = result.get("cells", []) or []
-                cam.set_cells_server(cells)
-                board_mat = board_from_server_cells(GRID_ROWS, GRID_COLS, cells)
-                board.set_board(board_mat)
-
-                x_polys = []
-                x_polys_warp = []
-                for cell in cells:
-                    r = int(cell.get("row", cell.get("r", -1)))
-                    c = int(cell.get("col", cell.get("c", -1)))
-                    st = str(cell.get("state", "empty")).lower().strip()
-                    if st not in ("player_x", "x", "human_x"):
-                        continue
-                    if r < 0 or c < 0 or r >= GRID_ROWS or c >= GRID_COLS:
-                        continue
-                    x0 = c * CELL_PX
-                    y0 = r * CELL_PX
-                    x1 = x0 + CELL_PX
-                    y1 = y0 + CELL_PX
-                    pts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
-                    x_polys_warp.append(np.asarray(pts, dtype=np.float32))
-                    cam_pts = project_points_to_camera(pts, M_inv, invR)
-                    x_polys.append(cam_pts)
-
-                cam.set_overlay(cam_lines, x_polys)
-                stages["6_grid_on_cam"] = overlay_frame(cam_overlay, cam_lines, x_polys, OVERLAY_ALPHA)
-                stages["6a_grid_x_warp"] = overlay_frame(grid_on_warp, grid_lines, x_polys_warp, OVERLAY_ALPHA)
-            else:
-                stages["5_warp_persp"] = _make_black_warp("NO_WARP (need >=3 markers)")
-
-            # If cannot get corners => show stages anyway
-            if not det.get("found") or det.get("bbox") is None or det.get("centers4") is None:
-                cam.set_stage_images(stages)
-                cam.set_cells_server([])
-                cam.set_scan_status("failed", "board corners not found (need >=3 markers)")
-                cam.set_overlay([], [])
-                cam.log(f"[SCAN] failed: corners not found, slots={det.get('slots')}")
-                continue
-
-            cam.set_stage_images(stages)
-            cam.set_scan_status("ready", "")
-            cam.log(f"[SCAN] ok: server detect bbox={det['bbox']}")
-
-        except Exception as e:
-            cam.set_stage_images(stages or {})
-            cam.set_cells_server([])
-            cam.set_scan_status("failed", f"exception: {repr(e)}")
-            cam.log(f"[SCAN] EXCEPTION: {repr(e)}")
-
-        time.sleep(0.12)
+        time.sleep(0.08)
 
 
 if __name__ == "__main__":
