@@ -33,9 +33,9 @@ class MotionController:
         p1_invert=True,
         # ===== head controller =====
         head_p8_idle=65,        # idle/stop angle for P8
-        head_p9_fixed=-68,
-        head_p10_a=90,
-        head_p10_b=90,
+        head_p9_fixed=-76,
+        head_p10_a=33,
+        head_p10_b=33,
     ):
         self.pose_file = Path(pose_file)
         self.servo_ports = [f"P{i}" for i in range(12)]
@@ -237,7 +237,7 @@ class MotionController:
         """
         P8: sweep smoothly between 10..60 deg ONLY when moving (FORWARD / TURN_LEFT / TURN_RIGHT)
         P9: fixed
-        P10: toggle a/b as old behavior (optional)
+        P10: fixed unless a/b set differently
         """
         stop_evt = threading.Event()
 
@@ -361,6 +361,12 @@ class MotionController:
         self._dog = boot.create()
         time.sleep(1.0)
         self.stand(speed=30)
+
+        try:
+            Servo("P9").angle(self.clamp(self.head_p9_fixed))
+            Servo("P10").angle(self.clamp(self.head_p10_a))
+        except Exception:
+            pass
 
         # optional bark once
         try:
