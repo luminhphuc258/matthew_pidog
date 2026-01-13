@@ -439,7 +439,7 @@ def prepare_robot(cam, robot_state: Dict[str, Any]):
 
         time.sleep(2.0)
         cam.log("[PREPARE] force P8/P10 after MotionController")
-        set_servo_angle("P8", 40, hold_sec=0.35)
+        set_servo_angle("P8", 20, hold_sec=0.35)
         set_servo_angle("P10", 30, hold_sec=0.35)
 
         cam.log("[PREPARE] post-boot head/arm angles")
@@ -447,7 +447,6 @@ def prepare_robot(cam, robot_state: Dict[str, Any]):
         set_servo_angle(ARM_LIFT_PORT, POST_BOOT_P11, hold_sec=0.35)
 
         cam.log("[PREPARE] arm up + head ready")
-        set_servo_angle("P8", PREPARE_HEAD_P8, hold_sec=0.35)
         set_servo_angle("P10", POST_BOOT_P10, hold_sec=0.35)
 
         with robot_state["lock"]:
