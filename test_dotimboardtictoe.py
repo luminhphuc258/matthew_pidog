@@ -496,15 +496,8 @@ def move_arm_to_cell(cam, row: int, col: int):
     p10, p11_hover = map_pixel_to_arm_angles(x_px, y_px)
     cam.log(f"[MOVE] cell=({row},{col}) center=({x_px:.1f},{y_px:.1f}) -> P10={p10} P11_hover={p11_hover}")
 
-    set_servo_angle(ARM_LIFT_PORT, ARM_UP_ANGLE, hold_sec=0.2)
-    set_servo_angle("P10", p10, hold_sec=0.2)
-    set_servo_angle(ARM_LIFT_PORT, p11_hover, hold_sec=0.2)
-
-    set_servo_angle(ARM_LIFT_PORT, ARM_DOWN_ANGLE, hold_sec=ARM_TOUCH_HOLD_SEC)
-    time.sleep(0.1)
-
-    set_servo_angle(ARM_LIFT_PORT, ARM_UP_ANGLE, hold_sec=0.25)
-    set_servo_angle("P10", ARM_NEUTRAL_P10, hold_sec=0.25)
+    time.sleep(2.0)
+    smooth_single_duration(ARM_LIFT_PORT, ARM_UP_ANGLE, ARM_DOWN_ANGLE, duration_sec=1.0)
 
 
 def perform_robot_move(cam, board: "BoardState", robot_state: Dict[str, Any], detector) -> None:
