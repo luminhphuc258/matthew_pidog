@@ -438,6 +438,9 @@ def prepare_robot(cam, robot_state: Dict[str, Any]):
             pass
 
         time.sleep(2.0)
+        cam.log("[PREPARE] force P7 to -70 after MotionController")
+        set_servo_angle("P7", -70, hold_sec=0.35)
+
         cam.log("[PREPARE] post-boot head/arm angles")
         set_servo_angle("P9", POST_BOOT_P9, hold_sec=0.35)
         set_servo_angle(ARM_LIFT_PORT, POST_BOOT_P11, hold_sec=0.35)
@@ -523,29 +526,7 @@ def perform_robot_move(cam, board: "BoardState", robot_state: Dict[str, Any], de
     cam.set_selected_poly(sel_poly)
     move_arm_to_cell(cam, target[0], target[1])
     cam.set_selected_poly(None)
-    cam.log("[MOVE] action done -> rescan board")
-
-    res = run_scan_pipeline(cam, detector, board)
-    if res.get("ok"):
-        return
-
-    if motion is not None and RESCAN_BACKWARD:
-        cam.log("[MOVE] rescan failed, move BACK then scan")
-        try:
-            motion.execute("BACK")
-        except Exception:
-            pass
-        res = run_scan_pipeline(cam, detector, board)
-        if res.get("ok"):
-            return
-
-    if motion is not None and RESCAN_FORWARD:
-        cam.log("[MOVE] rescan failed, move FORWARD then scan")
-        try:
-            motion.execute("FORWARD")
-        except Exception:
-            pass
-        run_scan_pipeline(cam, detector, board)
+    cam.log("[MOVE] action done")
 
 
 def _make_black_warp(text="NO_WARP") -> np.ndarray:
