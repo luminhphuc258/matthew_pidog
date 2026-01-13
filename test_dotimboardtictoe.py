@@ -497,7 +497,9 @@ def move_arm_to_cell(cam, row: int, col: int):
     cam.log(f"[MOVE] cell=({row},{col}) center=({x_px:.1f},{y_px:.1f}) -> P10={p10} P11_hover={p11_hover}")
 
     time.sleep(2.0)
-    smooth_single_duration(ARM_LIFT_PORT, ARM_UP_ANGLE, ARM_DOWN_ANGLE, duration_sec=1.0)
+    for _ in range(2):
+        smooth_single_duration(ARM_LIFT_PORT, ARM_UP_ANGLE, ARM_DOWN_ANGLE, duration_sec=1.0)
+        smooth_single_duration(ARM_LIFT_PORT, ARM_DOWN_ANGLE, ARM_UP_ANGLE, duration_sec=1.0)
 
 
 def perform_robot_move(cam, board: "BoardState", robot_state: Dict[str, Any], detector) -> None:
