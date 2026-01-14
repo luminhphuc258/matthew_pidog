@@ -15,7 +15,7 @@ from io import BytesIO
 
 import cv2
 import numpy as np
-from flask import Flask, Response, jsonify, send_file
+from flask import Flask, Response, jsonify, send_file, request
 
 from robot_hat import Servo
 from motion_controller import MotionController
@@ -140,6 +140,9 @@ POST_BOOT_P11 = int(os.environ.get("POST_BOOT_P11", "-62"))
 RESCAN_BACKWARD = str(os.environ.get("RESCAN_BACKWARD", "1")).lower() in ("1", "true", "yes", "on")
 RESCAN_FORWARD = str(os.environ.get("RESCAN_FORWARD", "1")).lower() in ("1", "true", "yes", "on")
 
+ARM_STEP_DEG = int(os.environ.get("ARM_STEP_DEG", "1"))
+DISTANCE_STEP_CM = int(os.environ.get("DISTANCE_STEP_CM", "10"))
+
 
 # =========================
 # Helpers
@@ -158,6 +161,36 @@ def clamp_servo(angle: float) -> int:
     except Exception:
         v = 0
     return max(-90, min(90, v))
+
+
+def load_pose_cfg(path: Path) -> Dict[str, int]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    cfg = {}
+    for k, v in data.items():
+        if isinstance(k, str) and k.startswith("P"):
+            cfg[k] = clamp_servo(v)
+    return cfg
+
+
+def default_arm_angles() -> Dict[str, int]:
+    defaults = {
+        "P8": int(HEAD_INIT_ANGLES.get("P8", 0)),
+        "P9": int(HEAD_INIT_ANGLES.get("P9", 0)),
+        "P10": int(HEAD_INIT_ANGLES.get("P10", 0)),
+        "P11": int(POST_BOOT_P11),
+    }
+    cfg = load_pose_cfg(POSE_FILE)
+    for port in ("P8", "P9", "P10", "P11"):
+        if port in cfg:
+            defaults[port] = int(cfg[port])
+    return defaults
 
 
 def apply_angles(angles: Dict[str, float], per_servo_delay: float = 0.03):
@@ -413,9 +446,13 @@ def prepare_robot(cam, robot_state: Dict[str, Any]):
         cam.log("[PREPARE] set P8/P10 init")
         set_servo_angle("P8", PREPARE_INIT_P8, hold_sec=0.4)
         set_servo_angle("P10", PREPARE_INIT_P10, hold_sec=0.4)
+        cam.set_arm_angle("P8", PREPARE_INIT_P8)
+        cam.set_arm_angle("P10", PREPARE_INIT_P10)
 
         cam.log("[PREPARE] head init angles")
         apply_angles(HEAD_INIT_ANGLES, per_servo_delay=0.04)
+        for _port, _angle in HEAD_INIT_ANGLES.items():
+            cam.set_arm_angle(_port, _angle)
 
         cam.log("[PREPARE] hold P7 at -30 during startup")
         set_servo_angle("P7", -30, hold_sec=0.4)
@@ -445,9 +482,12 @@ def prepare_robot(cam, robot_state: Dict[str, Any]):
         cam.log("[PREPARE] post-boot head/arm angles")
         set_servo_angle("P9", POST_BOOT_P9, hold_sec=0.35)
         set_servo_angle(ARM_LIFT_PORT, POST_BOOT_P11, hold_sec=0.35)
+        cam.set_arm_angle("P9", POST_BOOT_P9)
+        cam.set_arm_angle("P11", POST_BOOT_P11)
 
         cam.log("[PREPARE] arm up + head ready")
         set_servo_angle("P10", POST_BOOT_P10, hold_sec=0.35)
+        cam.set_arm_angle("P10", POST_BOOT_P10)
 
         with robot_state["lock"]:
             robot_state["motion"] = motion
@@ -1133,10 +1173,12 @@ def board_from_server_cells(rows: int, cols: int, cells: List[Dict[str, Any]]) -
 # Web + Camera + Logs
 # =========================
 class CameraWeb:
-    def __init__(self, board: BoardState):
+    def __init__(self, board: BoardState, robot_state: Optional[Dict[str, Any]] = None):
         self.board = board
         self.app = Flask("scan_board_marker_only")
         self._lock = threading.Lock()
+        self._motion_lock = threading.Lock()
+        self.robot_state = robot_state
 
         self._last_frame = None
         self._overlay_lines: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
@@ -1150,6 +1192,8 @@ class CameraWeb:
         self._cells_server: List[Dict[str, Any]] = []
         self._stages_jpg: Dict[str, bytes] = {}
         self._logs = deque(maxlen=LOG_KEEP)
+        self._arm_angles = default_arm_angles()
+        self._distance_cm = 0
 
         self._stop = threading.Event()
         self._ready = threading.Event()
@@ -1172,6 +1216,8 @@ class CameraWeb:
                 st["cols"] = self.board.cols
                 st["cells_server"] = self._cells_server
                 st["stages"] = list(self._stages_jpg.keys())
+                st["arm_angles"] = dict(self._arm_angles)
+                st["distance_cm"] = int(self._distance_cm)
             st["board"] = self.board.snapshot()
             return jsonify(st)
 
@@ -1192,6 +1238,43 @@ class CameraWeb:
             self.log("[UI] Prepare clicked")
             return jsonify({"ok": True})
 
+        @self.app.get("/arm_adjust")
+        def arm_adjust():
+            port = str(request.args.get("port", "")).upper()
+            delta = request.args.get("delta", "0")
+            if port not in ("P8", "P9", "P10", "P11"):
+                return jsonify({"ok": False, "error": "invalid port"})
+            try:
+                d = int(delta)
+            except Exception:
+                d = 0
+            if d == 0:
+                return jsonify({"ok": False, "error": "delta=0"})
+            with self._lock:
+                cur = int(self._arm_angles.get(port, 0))
+            newv = clamp_servo(cur + d)
+            set_servo_angle(port, newv, hold_sec=0.15)
+            self.set_arm_angle(port, newv)
+            self.log(f"[UI] Arm {port} {cur} -> {newv}")
+            return jsonify({"ok": True, "port": port, "angle": newv})
+
+        @self.app.get("/move")
+        def move():
+            direction = str(request.args.get("dir", "")).lower()
+            if direction not in ("forward", "back"):
+                return jsonify({"ok": False, "error": "invalid dir"})
+            ok = self._move_robot(direction, steps=1)
+            with self._lock:
+                dist = int(self._distance_cm)
+            return jsonify({"ok": ok, "distance_cm": dist})
+
+        @self.app.get("/distance/reset")
+        def distance_reset():
+            ok = self._reset_distance()
+            with self._lock:
+                dist = int(self._distance_cm)
+            return jsonify({"ok": ok, "distance_cm": dist})
+
         @self.app.get("/mjpeg")
         def mjpeg():
             return Response(self._mjpeg_gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
@@ -1210,6 +1293,53 @@ class CameraWeb:
             self._logs.append(line)
         print(line, flush=True)
 
+    def set_arm_angle(self, port: str, angle: int):
+        with self._lock:
+            self._arm_angles[str(port).upper()] = clamp_servo(angle)
+
+    def _get_motion(self) -> Optional[MotionController]:
+        rs = self.robot_state or {}
+        lock = rs.get("lock")
+        if lock is None:
+            return None
+        with lock:
+            if not rs.get("prepared"):
+                return None
+            return rs.get("motion")
+
+    def _move_robot(self, direction: str, steps: int = 1) -> bool:
+        motion = self._get_motion()
+        if motion is None:
+            self.log("[UI] Move skipped: robot not prepared")
+            return False
+        steps = max(0, int(steps))
+        if steps <= 0:
+            return False
+        delta = DISTANCE_STEP_CM if direction == "back" else -DISTANCE_STEP_CM
+        with self._motion_lock:
+            for _ in range(steps):
+                if direction == "back":
+                    motion.execute("BACK")
+                else:
+                    motion.execute("FORWARD")
+                with self._lock:
+                    self._distance_cm += delta
+        with self._lock:
+            dist = int(self._distance_cm)
+        self.log(f"[UI] Move {direction} step={steps}, distance={dist}cm")
+        return True
+
+    def _reset_distance(self) -> bool:
+        with self._lock:
+            dist = int(self._distance_cm)
+        if dist == 0:
+            return True
+        steps = int(abs(dist) / max(1, DISTANCE_STEP_CM))
+        if steps <= 0:
+            return True
+        direction = "forward" if dist > 0 else "back"
+        return self._move_robot(direction, steps=steps)
+
     def _html(self) -> str:
         html = """<!doctype html>
 <html>
@@ -1225,6 +1355,7 @@ class CameraWeb:
     .k {{ color:#93c5fd; }}
     .err {{ color:#fca5a5; font-size:12px; white-space:pre-wrap; }}
     .btn {{ background:#1f2937; border:1px solid #334155; color:#e7eef7; padding:8px 12px; border-radius:10px; cursor:pointer; }}
+    .btn.sm {{ padding:6px 10px; border-radius:8px; font-size:12px; }}
     .video {{ border:1px solid #223; border-radius:10px; width:100%; max-width:{cam_w}px; height:auto; background:#000; }}
     .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space:pre; font-size:12px; color:#cbd5f5; }}
     .stages {{ background:#111827; border:1px solid #223; border-radius:12px; padding:12px; max-height: calc(100vh - 28px); overflow:auto; }}
@@ -1232,6 +1363,10 @@ class CameraWeb:
     .title {{ font-weight:700; margin-bottom:8px; }}
     .muted {{ color:#93a4b8; font-size:12px; }}
     .logs {{ background:#0f172a; border:1px solid #223; border-radius:10px; padding:10px; margin-top:10px; max-height:160px; overflow:auto; }}
+    .arm-grid {{ display:flex; flex-direction:column; gap:8px; }}
+    .arm-row {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }}
+    .arm-label {{ width:34px; font-weight:700; color:#93c5fd; }}
+    .arm-val {{ min-width:64px; font-weight:700; }}
   </style>
 </head>
 <body>
@@ -1253,6 +1388,46 @@ class CameraWeb:
 
         <div class="kv"><span class="k">Cells (server):</span></div>
         <div id="cells" class="mono" style="max-height:160px; overflow:auto;">-</div>
+
+        <div class="kv">
+          <span class="k">Mapping robot arm to board:</span>
+          <div class="arm-grid" style="margin-top:6px;">
+            <div class="arm-row">
+              <span class="arm-label">P8</span>
+              <button class="btn sm" onclick="adjustArm('P8', {arm_step})">Up</button>
+              <button class="btn sm" onclick="adjustArm('P8', {arm_step_neg})">Down</button>
+              <span id="angle_P8" class="arm-val">-</span>
+            </div>
+            <div class="arm-row">
+              <span class="arm-label">P9</span>
+              <button class="btn sm" onclick="adjustArm('P9', {arm_step})">Up</button>
+              <button class="btn sm" onclick="adjustArm('P9', {arm_step_neg})">Down</button>
+              <span id="angle_P9" class="arm-val">-</span>
+            </div>
+            <div class="arm-row">
+              <span class="arm-label">P10</span>
+              <button class="btn sm" onclick="adjustArm('P10', {arm_step})">Up</button>
+              <button class="btn sm" onclick="adjustArm('P10', {arm_step_neg})">Down</button>
+              <span id="angle_P10" class="arm-val">-</span>
+            </div>
+            <div class="arm-row">
+              <span class="arm-label">P11</span>
+              <button class="btn sm" onclick="adjustArm('P11', {arm_step})">Up</button>
+              <button class="btn sm" onclick="adjustArm('P11', {arm_step_neg})">Down</button>
+              <span id="angle_P11" class="arm-val">-</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="kv">
+          <span class="k">Distance:</span>
+          <div class="arm-row" style="margin-top:6px;">
+            <span id="distance_cm" class="arm-val">0 cm</span>
+            <button class="btn sm" onclick="moveRobot('forward')">Move forward</button>
+            <button class="btn sm" onclick="moveRobot('back')">Move back</button>
+            <button class="btn sm" onclick="resetDistance()">Reset</button>
+          </div>
+        </div>
 
         <div class="kv">
           <button class="btn" onclick="prepareRobot()">Prepare to go</button>
@@ -1320,6 +1495,20 @@ async function tick() {{
     document.getElementById('board').textContent = formatBoard(js.board);
     document.getElementById('cells').textContent = formatCells(js.cells_server);
 
+    const angles = js.arm_angles || {{}};
+    ['P8','P9','P10','P11'].forEach(p => {{
+      const el = document.getElementById(`angle_${{p}}`);
+      if (el) {{
+        const v = angles[p];
+        el.textContent = (v === undefined || v === null) ? '-' : `${{v}} deg`;
+      }}
+    }});
+    const distEl = document.getElementById('distance_cm');
+    if (distEl) {{
+      const d = (js.distance_cm === undefined || js.distance_cm === null) ? 0 : js.distance_cm;
+      distEl.textContent = `${{d}} cm`;
+    }}
+
     const ts = js.last_scan_ts || 0;
     if (ts > 0 && ts !== last_ts) {{
       last_ts = ts;
@@ -1342,13 +1531,34 @@ async function prepareRobot() {{
   tick();
 }}
 
+async function adjustArm(port, delta) {{
+  try {{ await fetch(`/arm_adjust?port=${{port}}&delta=${{delta}}`); }} catch(e) {{}}
+  tick();
+}}
+
+async function moveRobot(dir) {{
+  try {{ await fetch(`/move?dir=${{dir}}`); }} catch(e) {{}}
+  tick();
+}}
+
+async function resetDistance() {{
+  try {{ await fetch('/distance/reset'); }} catch(e) {{}}
+  tick();
+}}
+
 setInterval(tick, {poll_ms});
 tick();
 </script>
 </body>
 </html>
 """
-        return html.format(cam_w=CAM_W, cam_h=CAM_H, poll_ms=STATE_POLL_MS)
+        return html.format(
+            cam_w=CAM_W,
+            cam_h=CAM_H,
+            poll_ms=STATE_POLL_MS,
+            arm_step=ARM_STEP_DEG,
+            arm_step_neg=-ARM_STEP_DEG,
+        )
 
     def _mjpeg_gen(self):
         while not self._stop.is_set():
@@ -1656,7 +1866,12 @@ def run_scan_pipeline(cam: CameraWeb, detector: MarkerBoardDetector, board: "Boa
 def main():
     print("[START] marker_only_board_bbox_send_bbox_and_warp", flush=True)
     board = BoardState(rows=GRID_ROWS, cols=GRID_COLS)
-    cam = CameraWeb(board)
+    robot_state = {
+        "prepared": False,
+        "motion": None,
+        "lock": threading.Lock(),
+    }
+    cam = CameraWeb(board, robot_state)
     cam.start()
 
     if not cam.wait_ready(timeout_sec=5.0):
@@ -1665,12 +1880,6 @@ def main():
 
     detector = MarkerBoardDetector()
     cam.log("[WEB] press Prepare to go, then Play Scan")
-
-    robot_state = {
-        "prepared": False,
-        "motion": None,
-        "lock": threading.Lock(),
-    }
 
     while True:
         if cam.consume_prepare_request():
