@@ -142,6 +142,8 @@ RESCAN_FORWARD = str(os.environ.get("RESCAN_FORWARD", "1")).lower() in ("1", "tr
 
 ARM_STEP_DEG = int(os.environ.get("ARM_STEP_DEG", "1"))
 DISTANCE_STEP_CM = int(os.environ.get("DISTANCE_STEP_CM", "10"))
+MOVE_STEP_COUNT = int(os.environ.get("MOVE_STEP_COUNT", "1"))
+MOVE_SPEED = int(os.environ.get("MOVE_SPEED", "98"))
 
 
 # =========================
@@ -1316,12 +1318,32 @@ class CameraWeb:
         if steps <= 0:
             return False
         delta = DISTANCE_STEP_CM if direction == "back" else -DISTANCE_STEP_CM
+        step_count = max(1, int(MOVE_STEP_COUNT))
+        speed = int(MOVE_SPEED)
         with self._motion_lock:
             for _ in range(steps):
-                if direction == "back":
-                    motion.execute("BACK")
+                if getattr(motion, "dog", None) is not None:
+                    try:
+                        if hasattr(motion, "_set_head_mode"):
+                            motion._set_head_mode("MOVE")
+                        if direction == "back":
+                            motion.dog.do_action("backward", step_count=step_count, speed=speed)
+                        else:
+                            motion.dog.do_action("forward", step_count=step_count, speed=speed)
+                        motion.dog.wait_all_done()
+                    except Exception:
+                        if direction == "back":
+                            motion.execute("BACK")
+                        else:
+                            motion.execute("FORWARD")
+                    finally:
+                        if hasattr(motion, "_set_head_mode"):
+                            motion._set_head_mode("IDLE")
                 else:
-                    motion.execute("FORWARD")
+                    if direction == "back":
+                        motion.execute("BACK")
+                    else:
+                        motion.execute("FORWARD")
                 with self._lock:
                     self._distance_cm += delta
         with self._lock:
