@@ -8,6 +8,8 @@ import json
 import uuid
 import urllib.request
 import urllib.error
+import ssl
+import wave
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
 from collections import deque
@@ -17,9 +19,13 @@ import cv2
 import numpy as np
 from flask import Flask, Response, jsonify, send_file, request
 
-from robot_hat import Servo
+from robot_hat import Servo, Music
 from motion_controller import MotionController
 
+try:
+    import paho.mqtt.client as mqtt
+except Exception:
+    mqtt = None
 
 # =========================
 # CONFIG
@@ -144,6 +150,23 @@ ARM_STEP_DEG = int(os.environ.get("ARM_STEP_DEG", "1"))
 DISTANCE_STEP_CM = int(os.environ.get("DISTANCE_STEP_CM", "10"))
 MOVE_STEP_COUNT = int(os.environ.get("MOVE_STEP_COUNT", "1"))
 MOVE_SPEED = int(os.environ.get("MOVE_SPEED", "98"))
+
+# --- MQTT robot arm ---
+MQTT_ENABLE = str(os.environ.get("MQTT_ENABLE", "1")).lower() in ("1", "true", "yes", "on")
+MQTT_HOST = os.environ.get("MQTT_HOST", "rfff7184.ala.us-east-1.emqxsl.com")
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "8883"))
+MQTT_USER = os.environ.get("MQTT_USER", "robot_matthew")
+MQTT_PASS = os.environ.get("MQTT_PASS", "29061992abCD!yesokmen")
+MQTT_CLIENT_ID = os.environ.get("MQTT_CLIENT_ID", "pidog-tictoe-pi")
+MQTT_TOPIC_MOVE = os.environ.get("MQTT_TOPIC_MOVE", "/pidog/moveontictoeboard")
+MQTT_TOPIC_STATUS = os.environ.get("MQTT_TOPIC_STATUS", "/pidog/tictoemoving/status")
+MQTT_STATUS_POLL_SEC = float(os.environ.get("MQTT_STATUS_POLL_SEC", "4.0"))
+MQTT_TLS_INSECURE = str(os.environ.get("MQTT_TLS_INSECURE", "1")).lower() in ("1", "true", "yes", "on")
+
+# --- Bark while robot arm moves ---
+BARK_WAV = Path(__file__).resolve().parent / "tiengsua.wav"
+BARK_VOLUME = int(os.environ.get("BARK_VOLUME", "80"))
+BARK_PINCTRL = str(os.environ.get("BARK_PINCTRL", "1")).lower() in ("1", "true", "yes", "on")
 
 
 # =========================
@@ -295,6 +318,162 @@ def smooth_single_duration(port: str, start: int, end: int, duration_sec: float)
         return
     delay = max(0.01, float(duration_sec) / float(total))
     smooth_single(port, start, end, step=1, delay=delay)
+
+
+def _wav_duration_sec(path: Path) -> Optional[float]:
+    try:
+        with wave.open(str(path), "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate()
+            if rate > 0:
+                return float(frames) / float(rate)
+    except Exception:
+        return None
+    return None
+
+
+class BarkPlayer:
+    def __init__(self, wav_path: Path):
+        self.wav_path = wav_path
+        self._music = None
+        self._thread = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+
+    def _ensure_music(self):
+        if self._music is not None:
+            return
+        if BARK_PINCTRL:
+            os.system("pinctrl set 12 op dh")
+            time.sleep(0.2)
+        self._music = Music()
+        self._music.music_set_volume(BARK_VOLUME)
+
+    def start(self):
+        if not self.wav_path.exists():
+            return
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._ensure_music()
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+
+    def stop(self):
+        with self._lock:
+            self._stop.set()
+            if self._music is not None:
+                try:
+                    if hasattr(self._music, "music_stop"):
+                        self._music.music_stop()
+                except Exception:
+                    pass
+
+    def _loop(self):
+        dur = _wav_duration_sec(self.wav_path)
+        sleep_sec = 2.5 if dur is None else max(0.4, float(dur))
+        while not self._stop.is_set():
+            try:
+                self._music.music_play(str(self.wav_path), loops=1)
+            except Exception:
+                pass
+            self._stop.wait(timeout=sleep_sec)
+
+
+class MqttMoveClient:
+    def __init__(self):
+        self._client = None
+        self._lock = threading.Lock()
+        self._connected = False
+        self._last_status = None
+        self._last_status_ts = None
+        self._connect_error = None
+
+    def connect(self):
+        if not MQTT_ENABLE:
+            return False
+        if mqtt is None:
+            self._connect_error = "paho-mqtt not installed"
+            return False
+        if self._client is not None:
+            return self._connected
+
+        def on_connect(client, userdata, flags, rc, properties=None):
+            with self._lock:
+                self._connected = (rc == 0)
+                self._connect_error = None if rc == 0 else f"connect rc={rc}"
+            if rc == 0:
+                try:
+                    client.subscribe(MQTT_TOPIC_STATUS, qos=0)
+                except Exception:
+                    pass
+
+        def on_message(client, userdata, msg):
+            try:
+                payload = msg.payload.decode("utf-8", errors="ignore").strip()
+                data = json.loads(payload) if payload else {}
+                status = data.get("status", None)
+            except Exception:
+                status = None
+            if status is None:
+                status = (msg.payload or b"").decode("utf-8", errors="ignore").strip()
+            with self._lock:
+                self._last_status = status
+                self._last_status_ts = time.time()
+
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=MQTT_CLIENT_ID)
+        if MQTT_USER:
+            client.username_pw_set(MQTT_USER, MQTT_PASS)
+        if MQTT_TLS_INSECURE:
+            client.tls_set(cert_reqs=ssl.CERT_NONE)
+            client.tls_insecure_set(True)
+        client.on_connect = on_connect
+        client.on_message = on_message
+
+        try:
+            client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
+            client.loop_start()
+            self._client = client
+            return self.wait_connected(timeout_sec=4.0)
+        except Exception as exc:
+            with self._lock:
+                self._connect_error = f"connect fail: {exc}"
+            return False
+
+    def is_connected(self) -> bool:
+        with self._lock:
+            return bool(self._connected)
+
+    def wait_connected(self, timeout_sec: float = 3.0) -> bool:
+        deadline = time.time() + max(0.1, float(timeout_sec))
+        while time.time() < deadline:
+            if self.is_connected():
+                return True
+            time.sleep(0.1)
+        return self.is_connected()
+
+    def connect_error(self) -> Optional[str]:
+        with self._lock:
+            return self._connect_error
+
+    def publish_move(self, x: int, y: int) -> bool:
+        if not self._client:
+            return False
+        payload = json.dumps({"x": int(x), "y": int(y)})
+        try:
+            self._client.publish(MQTT_TOPIC_MOVE, payload)
+            return True
+        except Exception:
+            return False
+
+    def wait_for_done(self) -> bool:
+        while True:
+            with self._lock:
+                status = self._last_status
+            if isinstance(status, str) and status.strip().lower() == "done":
+                return True
+            time.sleep(max(0.2, float(MQTT_STATUS_POLL_SEC)))
 
 
 def _encode_jpeg(img_bgr, quality=JPEG_QUALITY) -> bytes:
@@ -547,6 +726,8 @@ def perform_robot_move(cam, board: "BoardState", robot_state: Dict[str, Any], de
     with robot_state["lock"]:
         prepared = bool(robot_state.get("prepared"))
         motion = robot_state.get("motion")
+        mqtt_client = robot_state.get("mqtt")
+        bark = robot_state.get("bark")
 
     if not prepared:
         cam.log("[MOVE] skipped: robot not prepared")
@@ -561,7 +742,28 @@ def perform_robot_move(cam, board: "BoardState", robot_state: Dict[str, Any], de
     cam.log("[MOVE] start draw action")
     sel_poly = cam.get_cell_cam_poly(target[0], target[1])
     cam.set_selected_poly(sel_poly)
-    move_arm_to_cell(cam, target[0], target[1])
+
+    if mqtt_client and not mqtt_client.is_connected():
+        mqtt_client.connect()
+
+    if mqtt_client and mqtt_client.is_connected():
+        x, y = target[0], target[1]
+        cam.log(f"[MOVE] mqtt publish move x={x} y={y}")
+        ok = mqtt_client.publish_move(x, y)
+        if not ok:
+            cam.log("[MOVE] mqtt publish failed, fallback local move")
+            move_arm_to_cell(cam, target[0], target[1])
+        else:
+            if bark:
+                bark.start()
+            cam.log("[MOVE] waiting for arm status done...")
+            mqtt_client.wait_for_done()
+            if bark:
+                bark.stop()
+            cam.log("[MOVE] mqtt status done")
+    else:
+        move_arm_to_cell(cam, target[0], target[1])
+
     cam.set_selected_poly(None)
     cam.log("[MOVE] action done")
 
@@ -1902,6 +2104,14 @@ def main():
 
     detector = MarkerBoardDetector()
     cam.log("[WEB] press Prepare to go, then Play Scan")
+    if MQTT_ENABLE:
+        mqtt_client = MqttMoveClient()
+        mqtt_client.connect()
+        err = mqtt_client.connect_error()
+        if err:
+            cam.log(f"[MQTT] connect error: {err}")
+        robot_state["mqtt"] = mqtt_client
+    robot_state["bark"] = BarkPlayer(BARK_WAV)
 
     while True:
         if cam.consume_prepare_request():
