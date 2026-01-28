@@ -40,7 +40,7 @@ def _start_arecord(device: str, rate: int):
 
 def main():
     parser = argparse.ArgumentParser(description="VOSK mic test via arecord")
-    parser.add_argument("--model", default=os.environ.get("VOSK_MODEL_PATH", "models/vosk-model-small-vn-0.4"))
+    parser.add_argument("--model", default=os.environ.get("VOSK_MODEL_PATH", "models/vosk-model-vn-0.4"))
     parser.add_argument("--device", default=os.environ.get("VOSK_MIC_DEVICE", "default"))
     parser.add_argument("--rate", type=int, default=int(os.environ.get("VOSK_SAMPLE_RATE", "16000")))
     parser.add_argument("--chunk", type=int, default=int(os.environ.get("VOSK_CHUNK_BYTES", "8000")))
