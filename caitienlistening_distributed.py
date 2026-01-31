@@ -306,6 +306,7 @@ def main():
     proc = None
     busy = False
     playing = False
+    last_voice_ts = 0.0
 
     try:
         proc = _start_arecord(args.device, args.rate)
@@ -327,13 +328,16 @@ def main():
 
             if args.min_rms > 0:
                 rms = _rms_pcm16(data)
-                if rms < float(args.min_rms):
-                    continue
+                if rms >= float(args.min_rms):
+                    last_voice_ts = time.time()
 
             if rec.AcceptWaveform(data):
                 res = json.loads(rec.Result())
                 text = res.get("text", "").strip()
                 if not text:
+                    continue
+                if args.min_rms > 0 and (time.time() - last_voice_ts) > 1.0:
+                    print("[SKIP] final without recent voice", flush=True)
                     continue
                 if args.min_chars > 0 and len(text) < int(args.min_chars):
                     print("[SKIP] short text:", text, flush=True)
