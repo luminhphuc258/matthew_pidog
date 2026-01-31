@@ -267,6 +267,7 @@ def main():
     parser.add_argument("--status-timeout", type=float, default=float(os.environ.get("STATUS_TIMEOUT_SEC", "90")))
     parser.add_argument("--volume", type=int, default=int(os.environ.get("PLAY_VOLUME", "80")))
     parser.add_argument("--waiting-wav", default=os.environ.get("WAITING_WAV", "waitingmessage.wav"))
+    parser.add_argument("--error-wav", default=os.environ.get("ERROR_WAV", "errormessage.wav"))
     parser.add_argument("--pidog-pose-file", default=os.environ.get("PIDOG_POSE_FILE", "pidog_pose_config.txt"))
     parser.add_argument("--min-rms", type=float, default=float(os.environ.get("MIN_RMS", "650")))
     parser.add_argument("--min-words", type=int, default=int(os.environ.get("MIN_WORDS", "3")))
@@ -296,6 +297,7 @@ def main():
 
     player = AudioPlayer(volume=args.volume)
     waiting_path = Path(args.waiting_wav)
+    error_path = Path(args.error_wav)
 
     print("[MIC] device=", args.device, "rate=", args.rate, "chunk=", args.chunk, flush=True)
     print("[HTTP] request=", args.request_url, flush=True)
@@ -347,19 +349,18 @@ def main():
                 print("[FINAL]", text, flush=True)
                 print("[REQ] id=", req_id, flush=True)
 
-                wait_start = time.time()
-                if waiting_path.exists():
-                    print("[WAIT] play waitingmessage.wav", flush=True)
-                    player.play_wav(str(waiting_path))
-                else:
-                    print("[WAIT] missing waiting wav:", waiting_path, flush=True)
-
                 if args.wait_before_request > 0:
                     time.sleep(float(args.wait_before_request))
                 print("[REQ] send transcript -> HTTP /pidog/chat/request", flush=True)
+                wait_start = time.time()
                 resp = _post_request(args.request_url, text, req_id)
                 if not resp:
                     print("[REQ] HTTP request failed", flush=True)
+                    if error_path.exists():
+                        print("[ERROR] play errormessage.wav", flush=True)
+                        player.play_wav(str(error_path))
+                    else:
+                        print("[ERROR] missing error wav:", error_path, flush=True)
                     rec.Reset()
                     time.sleep(0.1)
                     continue
@@ -369,8 +370,14 @@ def main():
                     print("[REQ] server id=", server_id, "override local id", flush=True)
                     req_id = server_id
 
+                if waiting_path.exists():
+                    print("[WAIT] play waitingmessage.wav", flush=True)
+                    player.play_wav(str(waiting_path))
+                else:
+                    print("[WAIT] missing waiting wav:", waiting_path, flush=True)
+
                 audio_url = (resp.get("audio_url") or "").strip() if isinstance(resp, dict) else ""
-                
+
                 if audio_url:
                     mp3_path = _download_mp3_from_url(audio_url, req_id)
                     if mp3_path:
@@ -382,6 +389,15 @@ def main():
                         player.play_mp3(mp3_path)
                         playing = False
                         continue
+                    print("[ERROR] failed to download mp3", flush=True)
+                    if error_path.exists():
+                        print("[ERROR] play errormessage.wav", flush=True)
+                        player.play_wav(str(error_path))
+                    else:
+                        print("[ERROR] missing error wav:", error_path, flush=True)
+                    rec.Reset()
+                    time.sleep(0.1)
+                    continue
 
                 busy = True
                 mp3_path = _wait_status_done(args.status_url, req_id, args.status_timeout, args.status_interval)
@@ -389,6 +405,11 @@ def main():
 
                 if not mp3_path:
                     print("[STATUS] timeout for id=", req_id, flush=True)
+                    if error_path.exists():
+                        print("[ERROR] play errormessage.wav", flush=True)
+                        player.play_wav(str(error_path))
+                    else:
+                        print("[ERROR] missing error wav:", error_path, flush=True)
                     rec.Reset()
                     time.sleep(0.1)
                     continue
