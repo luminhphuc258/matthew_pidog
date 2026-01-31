@@ -284,7 +284,7 @@ def main():
     parser.add_argument("--mqtt-topic-status-prefix", default=os.environ.get("MQTT_TOPIC_STATUS_PREFIX", "/pidog/chat/status"))
     parser.add_argument("--request-url", default=os.environ.get(
         "REQUEST_URL",
-        "http://localhost:8080/pidog/chat/request",
+        "https://embeddedprogramming-healtheworldserver.up.railway.app/pidog/chat/request",
     ))
     parser.add_argument("--status-timeout", type=float, default=float(os.environ.get("STATUS_TIMEOUT_SEC", "90")))
     parser.add_argument("--answer-url", default=os.environ.get(
