@@ -127,6 +127,7 @@ class ChatMqttClient:
         self._tls_insecure = bool(tls_insecure)
 
         self._events = {}
+        self._done_ids = set()
         self._lock = Lock()
         self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=self._client_id, clean_session=True)
         if self._user:
@@ -147,8 +148,10 @@ class ChatMqttClient:
             return
         with self._lock:
             ev = self._events.get(req_id)
-        if ev:
-            ev.set()
+            if ev:
+                ev.set()
+                return
+            self._done_ids.add(req_id)
 
     def _on_message(self, client, userdata, msg):
         topic = msg.topic or ""
@@ -185,6 +188,14 @@ class ChatMqttClient:
         self._client.connect(self._host, self._port, keepalive=30)
         self._client.loop_start()
 
+    def subscribe_status_prefix(self, status_prefix: str):
+        topic = f"{status_prefix}/#"
+        try:
+            print("[MQTT] subscribe status prefix=", topic, flush=True)
+            self._client.subscribe(topic, qos=0)
+        except Exception as e:
+            print("[MQTT] subscribe error:", e, flush=True)
+
     def publish_request(self, topic: str, req_id: str, text: str):
         payload = json.dumps({"id": req_id, "text": text}, ensure_ascii=False)
         info = self._client.publish(topic, payload, qos=0)
@@ -201,14 +212,10 @@ class ChatMqttClient:
     def wait_for_done(self, status_topic: str, req_id: str, timeout_sec: float):
         ev = Event()
         with self._lock:
+            if req_id in self._done_ids:
+                self._done_ids.discard(req_id)
+                return True
             self._events[req_id] = ev
-
-        try:
-            print("[MQTT] subscribe status topic=", status_topic, "id=", req_id, flush=True)
-            self._client.subscribe(status_topic, qos=0)
-        except Exception as e:
-            print("[MQTT] subscribe error:", e, flush=True)
-            return False
 
         ok = ev.wait(timeout=timeout_sec)
         with self._lock:
@@ -319,6 +326,7 @@ def main():
         tls_insecure=True,
     )
     mqtt_client.connect()
+    mqtt_client.subscribe_status_prefix(args.mqtt_topic_status_prefix)
 
     player = AudioPlayer(volume=args.volume)
 
