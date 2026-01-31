@@ -172,6 +172,12 @@ class ChatMqttClient:
             except Exception:
                 status = payload
 
+        if topic.startswith("/pidog/chat/status"):
+            if status:
+                print("[STATUS] recv topic=", topic, "id=", req_id, "status=", status, flush=True)
+            else:
+                print("[STATUS] recv topic=", topic, "id=", req_id, "payload=", payload, flush=True)
+
         if status.lower() == "done":
             self._signal_done(req_id)
 
@@ -181,7 +187,16 @@ class ChatMqttClient:
 
     def publish_request(self, topic: str, req_id: str, text: str):
         payload = json.dumps({"id": req_id, "text": text}, ensure_ascii=False)
-        self._client.publish(topic, payload)
+        info = self._client.publish(topic, payload, qos=0)
+        print(
+            "[MQTT] publish request topic=", topic,
+            "id=", req_id,
+            "rc=", getattr(info, "rc", None),
+            "mid=", getattr(info, "mid", None),
+            flush=True,
+        )
+        if hasattr(info, "rc") and mqtt is not None and info.rc != mqtt.MQTT_ERR_SUCCESS:
+            print("[MQTT] publish error rc=", info.rc, flush=True)
 
     def wait_for_done(self, status_topic: str, req_id: str, timeout_sec: float):
         ev = Event()
@@ -189,6 +204,7 @@ class ChatMqttClient:
             self._events[req_id] = ev
 
         try:
+            print("[MQTT] subscribe status topic=", status_topic, "id=", req_id, flush=True)
             self._client.subscribe(status_topic, qos=0)
         except Exception as e:
             print("[MQTT] subscribe error:", e, flush=True)
@@ -235,7 +251,7 @@ def _download_mp3(url: str, req_id: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Distributed listening client (VOSK + MQTT)")
-    parser.add_argument("--model", default=os.environ.get("VOSK_MODEL_PATH", "models/vosk-model-small-vi-0.4"))
+    parser.add_argument("--model", default=os.environ.get("VOSK_MODEL_PATH", "models/vosk-model-vn-0.4"))
     parser.add_argument("--device", default=os.environ.get("VOSK_MIC_DEVICE", "default"))
     parser.add_argument("--rate", type=int, default=int(os.environ.get("VOSK_SAMPLE_RATE", "16000")))
     parser.add_argument("--chunk", type=int, default=int(os.environ.get("VOSK_CHUNK_BYTES", "8000")))
@@ -318,6 +334,7 @@ def main():
                 print("[FINAL]", text, flush=True)
                 print("[REQ] id=", req_id, flush=True)
 
+                print("[REQ] publish transcript -> /pidog/chat/request", flush=True)
                 mqtt_client.publish_request(args.mqtt_topic_request, req_id, text)
 
                 status_topic = f"{args.mqtt_topic_status_prefix}/{req_id}"
