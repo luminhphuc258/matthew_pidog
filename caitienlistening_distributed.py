@@ -20,6 +20,10 @@ try:
     from robot_hat import Music
 except Exception:
     Music = None
+try:
+    from motion_controller import MotionController
+except Exception:
+    MotionController = None
 
 
 def _require_arecord():
@@ -85,6 +89,9 @@ class AudioPlayer:
         if shutil.which("mpg123"):
             subprocess.run(["mpg123", "-q", filepath], check=False)
             return
+        if shutil.which("aplay"):
+            subprocess.run(["aplay", "-q", filepath], check=False)
+            return
         if shutil.which("ffplay"):
             subprocess.run(["ffplay", "-nodisp", "-autoexit", "-loglevel", "error", filepath], check=False)
             return
@@ -98,6 +105,30 @@ class AudioPlayer:
             except Exception as e:
                 print("[PLAY] music_play error:", e, flush=True)
         self._play_with_fallback(filepath)
+
+    def play_wav(self, filepath: str):
+        if self._music is not None:
+            try:
+                self._play_with_music(filepath)
+                return
+            except Exception as e:
+                print("[PLAY] music_play error:", e, flush=True)
+        self._play_with_fallback(filepath)
+
+
+def _boot_pidog_if_available(pose_file: str):
+    if MotionController is None:
+        print("[PIDOG] MotionController not available", flush=True)
+        return None
+    try:
+        mc = MotionController(pose_file=Path(pose_file))
+        print("[PIDOG] boot...", flush=True)
+        mc.boot()
+        time.sleep(0.8)
+        return mc
+    except Exception as e:
+        print("[PIDOG] boot error:", e, flush=True)
+        return None
 
 
 def _post_request(url: str, text: str, req_id: str):
@@ -217,6 +248,8 @@ def main():
     parser.add_argument("--status-interval", type=float, default=float(os.environ.get("STATUS_POLL_SEC", "1.5")))
     parser.add_argument("--status-timeout", type=float, default=float(os.environ.get("STATUS_TIMEOUT_SEC", "90")))
     parser.add_argument("--volume", type=int, default=int(os.environ.get("PLAY_VOLUME", "80")))
+    parser.add_argument("--waiting-wav", default=os.environ.get("WAITING_WAV", "waitingmessage.wav"))
+    parser.add_argument("--pidog-pose-file", default=os.environ.get("PIDOG_POSE_FILE", "pidog_pose_config.txt"))
     args = parser.parse_args()
 
     if not _require_arecord():
@@ -226,12 +259,21 @@ def main():
         print("ERROR: model folder not found:", args.model, flush=True)
         return 2
 
+    try:
+        os.system("pinctrl set 12 op dh")
+        time.sleep(0.1)
+    except Exception:
+        pass
+
+    mc = _boot_pidog_if_available(args.pidog_pose_file)
+
     print("[INIT] loading model:", args.model, flush=True)
     model = Model(args.model)
     rec = KaldiRecognizer(model, args.rate)
     rec.SetWords(True)
 
     player = AudioPlayer(volume=args.volume)
+    waiting_path = Path(args.waiting_wav)
 
     print("[MIC] device=", args.device, "rate=", args.rate, "chunk=", args.chunk, flush=True)
     print("[HTTP] request=", args.request_url, flush=True)
@@ -268,6 +310,12 @@ def main():
                 req_id = uuid.uuid4().hex
                 print("[FINAL]", text, flush=True)
                 print("[REQ] id=", req_id, flush=True)
+
+                if waiting_path.exists():
+                    print("[WAIT] play waitingmessage.wav", flush=True)
+                    player.play_wav(str(waiting_path))
+                else:
+                    print("[WAIT] missing waiting wav:", waiting_path, flush=True)
 
                 print("[REQ] send transcript -> HTTP /pidog/chat/request", flush=True)
                 resp = _post_request(args.request_url, text, req_id)
@@ -313,6 +361,11 @@ def main():
                 proc.wait(timeout=1.0)
             except Exception:
                 proc.kill()
+        try:
+            if mc:
+                mc.close()
+        except Exception:
+            pass
 
     return 0
 
