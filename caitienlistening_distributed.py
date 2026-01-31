@@ -110,11 +110,18 @@ def _post_request(url: str, text: str, req_id: str):
         print("[HTTP] status=", r.status_code, flush=True)
         if r.status_code != 200:
             return None
-        data = r.json()
-        print("[HTTP] response=", data, flush=True)
-        if isinstance(data, dict) and data.get("ok") is True:
-            resp_id = (data.get("id") or data.get("Id") or "").strip()
-            return resp_id or req_id
+        try:
+            data = r.json()
+            print("[HTTP] response=", data, flush=True)
+            if isinstance(data, dict) and data.get("ok") is True:
+                resp_id = (data.get("id") or data.get("Id") or "").strip()
+                return resp_id or req_id
+        except Exception:
+            body = (r.text or "").strip()
+            if body:
+                print("[HTTP] response text=", body[:200], flush=True)
+            # fallback: treat 200 with non-JSON as OK
+            return req_id
     except Exception as e:
         print("[HTTP] post error:", e, flush=True)
     return None
