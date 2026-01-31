@@ -5,22 +5,16 @@ import argparse
 import json
 import os
 import shutil
-import ssl
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
 from pathlib import Path
-from threading import Event, Lock
+from threading import Lock
 
 import requests
 from vosk import Model, KaldiRecognizer
-
-try:
-    import paho.mqtt.client as mqtt
-except Exception:
-    mqtt = None
 
 try:
     from robot_hat import Music
@@ -106,123 +100,6 @@ class AudioPlayer:
         self._play_with_fallback(filepath)
 
 
-class ChatMqttClient:
-    def __init__(
-        self,
-        host: str,
-        port: int,
-        user: str,
-        password: str,
-        client_id: str,
-        tls_insecure: bool = True,
-    ):
-        if mqtt is None:
-            raise RuntimeError("paho-mqtt not installed")
-
-        self._host = host
-        self._port = int(port)
-        self._user = user
-        self._password = password
-        self._client_id = client_id
-        self._tls_insecure = bool(tls_insecure)
-
-        self._events = {}
-        self._done_ids = set()
-        self._lock = Lock()
-        self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=self._client_id, clean_session=True)
-        if self._user:
-            self._client.username_pw_set(self._user, self._password)
-
-        if self._tls_insecure:
-            self._client.tls_set(cert_reqs=ssl.CERT_NONE)
-            self._client.tls_insecure_set(True)
-
-        self._client.on_connect = self._on_connect
-        self._client.on_message = self._on_message
-
-    def _on_connect(self, client, userdata, flags, rc, properties=None):
-        print("[MQTT] connected rc=", rc, flush=True)
-
-    def _signal_done(self, req_id: str):
-        if not req_id:
-            return
-        with self._lock:
-            ev = self._events.get(req_id)
-            if ev:
-                ev.set()
-                return
-            self._done_ids.add(req_id)
-
-    def _on_message(self, client, userdata, msg):
-        topic = msg.topic or ""
-        payload = msg.payload.decode("utf-8", errors="ignore").strip()
-
-        req_id = ""
-        status = ""
-
-        # try topic format: /pidog/chat/status/<id>
-        if topic.startswith("/pidog/chat/status/"):
-            req_id = topic.split("/")[-1].strip()
-
-        if payload:
-            try:
-                data = json.loads(payload)
-                if isinstance(data, dict):
-                    req_id = (data.get("id") or data.get("Id") or req_id or "").strip()
-                    status = (data.get("status") or data.get("state") or "").strip()
-                else:
-                    status = str(data).strip()
-            except Exception:
-                status = payload
-
-        if topic.startswith("/pidog/chat/status"):
-            if status:
-                print("[STATUS] recv topic=", topic, "id=", req_id, "status=", status, flush=True)
-            else:
-                print("[STATUS] recv topic=", topic, "id=", req_id, "payload=", payload, flush=True)
-
-        if status.lower() == "done":
-            self._signal_done(req_id)
-
-    def connect(self):
-        self._client.connect(self._host, self._port, keepalive=30)
-        self._client.loop_start()
-
-    def subscribe_status_prefix(self, status_prefix: str):
-        topic = f"{status_prefix}/#"
-        try:
-            print("[MQTT] subscribe status prefix=", topic, flush=True)
-            self._client.subscribe(topic, qos=0)
-        except Exception as e:
-            print("[MQTT] subscribe error:", e, flush=True)
-
-    def publish_request(self, topic: str, req_id: str, text: str):
-        payload = json.dumps({"id": req_id, "text": text}, ensure_ascii=False)
-        info = self._client.publish(topic, payload, qos=0)
-        print(
-            "[MQTT] publish request topic=", topic,
-            "id=", req_id,
-            "rc=", getattr(info, "rc", None),
-            "mid=", getattr(info, "mid", None),
-            flush=True,
-        )
-        if hasattr(info, "rc") and mqtt is not None and info.rc != mqtt.MQTT_ERR_SUCCESS:
-            print("[MQTT] publish error rc=", info.rc, flush=True)
-
-    def wait_for_done(self, status_topic: str, req_id: str, timeout_sec: float):
-        ev = Event()
-        with self._lock:
-            if req_id in self._done_ids:
-                self._done_ids.discard(req_id)
-                return True
-            self._events[req_id] = ev
-
-        ok = ev.wait(timeout=timeout_sec)
-        with self._lock:
-            self._events.pop(req_id, None)
-        return ok
-
-
 def _download_mp3(url: str, req_id: str):
     tmpdir = tempfile.mkdtemp(prefix="vosk_ans_")
     out = os.path.join(tmpdir, f"ans_{req_id}.mp3")
@@ -253,7 +130,7 @@ def _download_mp3(url: str, req_id: str):
         return out
     except Exception as e:
         print("[HTTP] error:", e, flush=True)
-        return None
+    return None
 
 
 def _post_request(url: str, text: str, req_id: str):
@@ -276,23 +153,49 @@ def _post_request(url: str, text: str, req_id: str):
     return None
 
 
+def _get_status(url: str, req_id: str):
+    try:
+        r = requests.get(url, params={"id": req_id}, timeout=15)
+        if r.status_code != 200:
+            print("[HTTP] status status_code=", r.status_code, flush=True)
+            return None
+        data = r.json()
+        if isinstance(data, dict):
+            status = (data.get("status") or data.get("state") or "").strip()
+            if status:
+                print("[STATUS] http id=", req_id, "status=", status, flush=True)
+            return status
+        return None
+    except Exception as e:
+        print("[HTTP] status error:", e, flush=True)
+        return None
+
+
+def _wait_status_done(status_url: str, req_id: str, timeout_sec: float, interval_sec: float):
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        status = _get_status(status_url, req_id)
+        if status and status.lower() == "done":
+            return True
+        time.sleep(interval_sec)
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="Distributed listening client (VOSK + MQTT)")
     parser.add_argument("--model", default=os.environ.get("VOSK_MODEL_PATH", "models/vosk-model-vn-0.4"))
     parser.add_argument("--device", default=os.environ.get("VOSK_MIC_DEVICE", "default"))
     parser.add_argument("--rate", type=int, default=int(os.environ.get("VOSK_SAMPLE_RATE", "16000")))
     parser.add_argument("--chunk", type=int, default=int(os.environ.get("VOSK_CHUNK_BYTES", "8000")))
-    parser.add_argument("--mqtt-host", default=os.environ.get("MQTT_HOST", "rfff7184.ala.us-east-1.emqxsl.com"))
-    parser.add_argument("--mqtt-port", type=int, default=int(os.environ.get("MQTT_PORT", "8883")))
-    parser.add_argument("--mqtt-user", default=os.environ.get("MQTT_USER", "robot_matthew"))
-    parser.add_argument("--mqtt-pass", default=os.environ.get("MQTT_PASS", "29061992abCD!yesokmen"))
-    parser.add_argument("--mqtt-client-id", default=os.environ.get("MQTT_CLIENT_ID", "pidog-stt-client"))
-    parser.add_argument("--mqtt-topic-request", default=os.environ.get("MQTT_TOPIC_REQUEST", "/pidog/chat/request"))
-    parser.add_argument("--mqtt-topic-status-prefix", default=os.environ.get("MQTT_TOPIC_STATUS_PREFIX", "/pidog/chat/status"))
     parser.add_argument("--request-url", default=os.environ.get(
         "REQUEST_URL",
         "https://embeddedprogramming-healtheworldserver.up.railway.app/pidog/chat/request",
     ))
+    parser.add_argument("--status-url", default=os.environ.get(
+        "STATUS_URL",
+        "https://embeddedprogramming-healtheworldserver.up.railway.app/pidog/chat/status",
+    ))
+    parser.add_argument("--status-interval", type=float, default=float(os.environ.get("STATUS_POLL_SEC", "0.5")))
     parser.add_argument("--status-timeout", type=float, default=float(os.environ.get("STATUS_TIMEOUT_SEC", "90")))
     parser.add_argument("--answer-url", default=os.environ.get(
         "ANSWER_URL",
@@ -308,31 +211,16 @@ def main():
         print("ERROR: model folder not found:", args.model, flush=True)
         return 2
 
-    if mqtt is None:
-        print("ERROR: paho-mqtt not installed", flush=True)
-        return 2
-
     print("[INIT] loading model:", args.model, flush=True)
     model = Model(args.model)
     rec = KaldiRecognizer(model, args.rate)
     rec.SetWords(True)
 
-    mqtt_client = ChatMqttClient(
-        host=args.mqtt_host,
-        port=args.mqtt_port,
-        user=args.mqtt_user,
-        password=args.mqtt_pass,
-        client_id=args.mqtt_client_id,
-        tls_insecure=True,
-    )
-    mqtt_client.connect()
-    mqtt_client.subscribe_status_prefix(args.mqtt_topic_status_prefix)
-
     player = AudioPlayer(volume=args.volume)
 
     print("[MIC] device=", args.device, "rate=", args.rate, "chunk=", args.chunk, flush=True)
-    print("[MQTT] request=", args.mqtt_topic_request, flush=True)
-    print("[MQTT] status prefix=", args.mqtt_topic_status_prefix, flush=True)
+    print("[HTTP] request=", args.request_url, flush=True)
+    print("[HTTP] status=", args.status_url, flush=True)
     print("[RUN] listening... (Ctrl+C to stop)", flush=True)
 
     proc = None
@@ -375,9 +263,8 @@ def main():
                     print("[REQ] server id=", server_id, "override local id", flush=True)
                     req_id = server_id
 
-                status_topic = f"{args.mqtt_topic_status_prefix}/{req_id}"
                 busy = True
-                ok = mqtt_client.wait_for_done(status_topic, req_id, args.status_timeout)
+                ok = _wait_status_done(args.status_url, req_id, args.status_timeout, args.status_interval)
                 busy = False
 
                 if not ok:
