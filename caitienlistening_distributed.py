@@ -269,7 +269,7 @@ def main():
     parser.add_argument("--waiting-wav", default=os.environ.get("WAITING_WAV", "waitingmessage.wav"))
     parser.add_argument("--pidog-pose-file", default=os.environ.get("PIDOG_POSE_FILE", "pidog_pose_config.txt"))
     parser.add_argument("--min-rms", type=float, default=float(os.environ.get("MIN_RMS", "450")))
-    parser.add_argument("--min-words", type=int, default=int(os.environ.get("MIN_WORDS", "2")))
+    parser.add_argument("--min-words", type=int, default=int(os.environ.get("MIN_WORDS", "3")))
     parser.add_argument("--min-chars", type=int, default=int(os.environ.get("MIN_CHARS", "6")))
     args = parser.parse_args()
 
@@ -384,6 +384,52 @@ def main():
                 partial = res.get("partial", "").strip()
                 if partial:
                     print("[PARTIAL]", partial, flush=True)
+                    if args.min_words > 0 and len(partial.split()) >= int(args.min_words):
+                        text = partial
+                        if args.min_chars > 0 and len(text) < int(args.min_chars):
+                            continue
+                        req_id = uuid.uuid4().hex
+                        print("[FINAL]", text, flush=True)
+                        print("[REQ] id=", req_id, flush=True)
+
+                        if waiting_path.exists():
+                            print("[WAIT] play waitingmessage.wav", flush=True)
+                            player.play_wav(str(waiting_path))
+                        else:
+                            print("[WAIT] missing waiting wav:", waiting_path, flush=True)
+
+                        print("[REQ] send transcript -> HTTP /pidog/chat/request", flush=True)
+                        resp = _post_request(args.request_url, text, req_id)
+                        if not resp:
+                            print("[REQ] HTTP request failed", flush=True)
+                            continue
+
+                        server_id = (resp.get("id") or resp.get("Id") or "").strip() if isinstance(resp, dict) else ""
+                        if server_id and server_id != req_id:
+                            print("[REQ] server id=", server_id, "override local id", flush=True)
+                            req_id = server_id
+
+                        audio_url = (resp.get("audio_url") or "").strip() if isinstance(resp, dict) else ""
+                        if audio_url:
+                            mp3_path = _download_mp3_from_url(audio_url, req_id)
+                            if mp3_path:
+                                print("[PLAY]", mp3_path, flush=True)
+                                player.play_mp3(mp3_path)
+                                rec.Reset()
+                                continue
+
+                        busy = True
+                        mp3_path = _wait_status_done(args.status_url, req_id, args.status_timeout, args.status_interval)
+                        busy = False
+
+                        if not mp3_path:
+                            print("[STATUS] timeout for id=", req_id, flush=True)
+                            rec.Reset()
+                            continue
+
+                        print("[PLAY]", mp3_path, flush=True)
+                        player.play_mp3(mp3_path)
+                        rec.Reset()
 
     except KeyboardInterrupt:
         pass
