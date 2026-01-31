@@ -52,6 +52,24 @@ def _start_arecord(device: str, rate: int):
     )
 
 
+def _rms_pcm16(data: bytes) -> float:
+    if not data:
+        return 0.0
+    try:
+        import array
+        a = array.array("h")
+        a.frombytes(data)
+        if not a:
+            return 0.0
+        # RMS = sqrt(mean(x^2))
+        s = 0.0
+        for v in a:
+            s += float(v) * float(v)
+        return (s / float(len(a)) + 1e-9) ** 0.5
+    except Exception:
+        return 0.0
+
+
 class AudioPlayer:
     def __init__(self, volume: int = 80):
         self._lock = Lock()
@@ -250,6 +268,9 @@ def main():
     parser.add_argument("--volume", type=int, default=int(os.environ.get("PLAY_VOLUME", "80")))
     parser.add_argument("--waiting-wav", default=os.environ.get("WAITING_WAV", "waitingmessage.wav"))
     parser.add_argument("--pidog-pose-file", default=os.environ.get("PIDOG_POSE_FILE", "pidog_pose_config.txt"))
+    parser.add_argument("--min-rms", type=float, default=float(os.environ.get("MIN_RMS", "450")))
+    parser.add_argument("--min-words", type=int, default=int(os.environ.get("MIN_WORDS", "2")))
+    parser.add_argument("--min-chars", type=int, default=int(os.environ.get("MIN_CHARS", "6")))
     args = parser.parse_args()
 
     if not _require_arecord():
@@ -279,6 +300,7 @@ def main():
     print("[HTTP] request=", args.request_url, flush=True)
     print("[HTTP] status=", args.status_url, flush=True)
     print("[RUN] listening... (Ctrl+C to stop)", flush=True)
+    print("[GATE] min_rms=", args.min_rms, "min_words=", args.min_words, "min_chars=", args.min_chars, flush=True)
 
     proc = None
     busy = False
@@ -301,10 +323,21 @@ def main():
                 # keep draining audio but ignore during request
                 continue
 
+            if args.min_rms > 0:
+                rms = _rms_pcm16(data)
+                if rms < float(args.min_rms):
+                    continue
+
             if rec.AcceptWaveform(data):
                 res = json.loads(rec.Result())
                 text = res.get("text", "").strip()
                 if not text:
+                    continue
+                if args.min_chars > 0 and len(text) < int(args.min_chars):
+                    print("[SKIP] short text:", text, flush=True)
+                    continue
+                if args.min_words > 0 and len(text.split()) < int(args.min_words):
+                    print("[SKIP] few words:", text, flush=True)
                     continue
 
                 req_id = uuid.uuid4().hex
