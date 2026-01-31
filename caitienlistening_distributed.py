@@ -336,9 +336,6 @@ def main():
                 text = res.get("text", "").strip()
                 if not text:
                     continue
-                if args.min_rms > 0 and (time.time() - last_voice_ts) > 1.0:
-                    print("[SKIP] final without recent voice", flush=True)
-                    continue
                 if args.min_chars > 0 and len(text) < int(args.min_chars):
                     print("[SKIP] short text:", text, flush=True)
                     continue
