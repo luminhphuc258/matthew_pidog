@@ -249,6 +249,26 @@ def _download_mp3(url: str, req_id: str):
         return None
 
 
+def _post_request(url: str, text: str, req_id: str):
+    try:
+        payload = {"text": text}
+        if req_id:
+            payload["id"] = req_id
+        print("[HTTP] post ->", url, "id=", req_id, flush=True)
+        r = requests.post(url, json=payload, timeout=20)
+        print("[HTTP] status=", r.status_code, flush=True)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        print("[HTTP] response=", data, flush=True)
+        if isinstance(data, dict) and data.get("ok") is True:
+            resp_id = (data.get("id") or data.get("Id") or "").strip()
+            return resp_id or req_id
+    except Exception as e:
+        print("[HTTP] post error:", e, flush=True)
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Distributed listening client (VOSK + MQTT)")
     parser.add_argument("--model", default=os.environ.get("VOSK_MODEL_PATH", "models/vosk-model-vn-0.4"))
@@ -262,6 +282,10 @@ def main():
     parser.add_argument("--mqtt-client-id", default=os.environ.get("MQTT_CLIENT_ID", "pidog-stt-client"))
     parser.add_argument("--mqtt-topic-request", default=os.environ.get("MQTT_TOPIC_REQUEST", "/pidog/chat/request"))
     parser.add_argument("--mqtt-topic-status-prefix", default=os.environ.get("MQTT_TOPIC_STATUS_PREFIX", "/pidog/chat/status"))
+    parser.add_argument("--request-url", default=os.environ.get(
+        "REQUEST_URL",
+        "http://localhost:8080/pidog/chat/request",
+    ))
     parser.add_argument("--status-timeout", type=float, default=float(os.environ.get("STATUS_TIMEOUT_SEC", "90")))
     parser.add_argument("--answer-url", default=os.environ.get(
         "ANSWER_URL",
@@ -334,8 +358,14 @@ def main():
                 print("[FINAL]", text, flush=True)
                 print("[REQ] id=", req_id, flush=True)
 
-                print("[REQ] publish transcript -> /pidog/chat/request", flush=True)
-                mqtt_client.publish_request(args.mqtt_topic_request, req_id, text)
+                print("[REQ] send transcript -> HTTP /pidog/chat/request", flush=True)
+                server_id = _post_request(args.request_url, text, req_id)
+                if not server_id:
+                    print("[REQ] HTTP request failed", flush=True)
+                    continue
+                if server_id != req_id:
+                    print("[REQ] server id=", server_id, "override local id", flush=True)
+                    req_id = server_id
 
                 status_topic = f"{args.mqtt_topic_status_prefix}/{req_id}"
                 busy = True
