@@ -101,28 +101,29 @@ class AudioPlayer:
 
 
 def _post_request(url: str, text: str, req_id: str):
+    r = None
     try:
         payload = {"text": text}
         if req_id:
             payload["id"] = req_id
+        params = {"format": "json"}
         print("[HTTP] post ->", url, "id=", req_id, flush=True)
-        r = requests.post(url, json=payload, timeout=20)
+        r = requests.post(url, params=params, json=payload, timeout=20)
         print("[HTTP] status=", r.status_code, flush=True)
         if r.status_code != 200:
             return None
-        try:
-            data = r.json()
-            print("[HTTP] response=", data, flush=True)
-            if isinstance(data, dict) and data.get("ok") is True:
-                resp_id = (data.get("id") or data.get("Id") or "").strip()
-                return resp_id or req_id
-        except Exception:
-            body = (r.text or "").strip()
-            if body:
-                print("[HTTP] response text=", body[:200], flush=True)
-            # fallback: treat 200 with non-JSON as OK
-            return req_id
+        data = r.json()
+        print("[HTTP] response=", data, flush=True)
+        if isinstance(data, dict) and data.get("ok") is True:
+            return data
     except Exception as e:
+        body = ""
+        try:
+            body = (r.text or "").strip() if r is not None else ""
+        except Exception:
+            body = ""
+        if body:
+            print("[HTTP] response text=", body[:200], flush=True)
         print("[HTTP] post error:", e, flush=True)
     return None
 
@@ -141,29 +142,34 @@ def _save_mp3_response(resp, req_id: str):
     return out
 
 
-def _get_status(url: str, req_id: str):
+def _download_mp3_from_url(url: str, req_id: str):
     try:
-        params = {"id": req_id, "format": "mp3"}
-        headers = {"Accept": "audio/mpeg, application/json"}
-        r = requests.get(url, params=params, headers=headers, timeout=20, stream=True)
+        r = requests.get(url, timeout=45, stream=True)
+        if r.status_code != 200:
+            print("[HTTP] mp3 status=", r.status_code, flush=True)
+            return None
+        return _save_mp3_response(r, req_id)
+    except Exception as e:
+        print("[HTTP] mp3 error:", e, flush=True)
+        return None
+
+
+def _get_status_json(url: str, req_id: str):
+    try:
+        params = {"id": req_id, "format": "json"}
+        r = requests.get(url, params=params, timeout=20)
         if r.status_code != 200:
             print("[HTTP] status status_code=", r.status_code, flush=True)
             return None
-
-        ctype = (r.headers.get("Content-Type") or "").lower()
-        header_status = (r.headers.get("X-Pidog-Status") or "").strip()
-        header_id = (r.headers.get("X-Pidog-Id") or "").strip()
-
-        if "audio/mpeg" in ctype:
-            print("[STATUS] http id=", header_id or req_id, "status=", header_status or "done", flush=True)
-            return ("mp3", _save_mp3_response(r, header_id or req_id))
-
+        raw_text = (r.text or "").strip()
+        if raw_text:
+            print("[HTTP] raw body=", raw_text[:500], flush=True)
         data = r.json()
         if isinstance(data, dict):
-            status = (data.get("status") or data.get("state") or "").strip()
+            status = (data.get("status") or "").strip()
             if status:
                 print("[STATUS] http id=", req_id, "status=", status, flush=True)
-            return ("status", status)
+            return data
         return None
     except Exception as e:
         print("[HTTP] status error:", e, flush=True)
@@ -173,13 +179,23 @@ def _get_status(url: str, req_id: str):
 def _wait_status_done(status_url: str, req_id: str, timeout_sec: float, interval_sec: float):
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
-        result = _get_status(status_url, req_id)
-        if isinstance(result, tuple) and len(result) == 2:
-            kind, value = result
-            if kind == "mp3":
-                return value
-            if kind == "status" and value and value.lower() == "done":
-                print("[STATUS] done without mp3, keep polling", flush=True)
+        data = _get_status_json(status_url, req_id)
+        if isinstance(data, dict):
+            status = (data.get("status") or "").strip().lower()
+            audio_url = (data.get("audio_url") or "").strip()
+            warning = (data.get("warning") or "").strip()
+            error_msg = (data.get("error") or "").strip()
+            if warning:
+                print("[STATUS] warning=", warning, flush=True)
+            if status == "error":
+                print("[STATUS] error=", error_msg or "unknown", flush=True)
+                return False
+            if audio_url:
+                mp3_path = _download_mp3_from_url(audio_url, req_id)
+                if mp3_path:
+                    return mp3_path
+            if status == "done" and not audio_url:
+                print("[STATUS] done but audio_url missing, keep polling", flush=True)
         time.sleep(interval_sec)
     return False
 
@@ -254,13 +270,23 @@ def main():
                 print("[REQ] id=", req_id, flush=True)
 
                 print("[REQ] send transcript -> HTTP /pidog/chat/request", flush=True)
-                server_id = _post_request(args.request_url, text, req_id)
-                if not server_id:
+                resp = _post_request(args.request_url, text, req_id)
+                if not resp:
                     print("[REQ] HTTP request failed", flush=True)
                     continue
-                if server_id != req_id:
+
+                server_id = (resp.get("id") or resp.get("Id") or "").strip() if isinstance(resp, dict) else ""
+                if server_id and server_id != req_id:
                     print("[REQ] server id=", server_id, "override local id", flush=True)
                     req_id = server_id
+
+                audio_url = (resp.get("audio_url") or "").strip() if isinstance(resp, dict) else ""
+                if audio_url:
+                    mp3_path = _download_mp3_from_url(audio_url, req_id)
+                    if mp3_path:
+                        print("[PLAY]", mp3_path, flush=True)
+                        player.play_mp3(mp3_path)
+                        continue
 
                 busy = True
                 mp3_path = _wait_status_done(args.status_url, req_id, args.status_timeout, args.status_interval)
