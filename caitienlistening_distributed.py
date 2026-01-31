@@ -370,17 +370,18 @@ def main():
                     req_id = server_id
 
                 audio_url = (resp.get("audio_url") or "").strip() if isinstance(resp, dict) else ""
-                        if audio_url:
-                            mp3_path = _download_mp3_from_url(audio_url, req_id)
-                            if mp3_path:
-                                elapsed = time.time() - wait_start
-                                if elapsed < 4.0:
-                                    time.sleep(4.0 - elapsed)
-                                print("[PLAY]", mp3_path, flush=True)
-                                playing = True
-                                player.play_mp3(mp3_path)
-                                playing = False
-                                continue
+                
+                if audio_url:
+                    mp3_path = _download_mp3_from_url(audio_url, req_id)
+                    if mp3_path:
+                        elapsed = time.time() - wait_start
+                        if elapsed < 4.0:
+                            time.sleep(4.0 - elapsed)
+                        print("[PLAY]", mp3_path, flush=True)
+                        playing = True
+                        player.play_mp3(mp3_path)
+                        playing = False
+                        continue
 
                 busy = True
                 mp3_path = _wait_status_done(args.status_url, req_id, args.status_timeout, args.status_interval)
