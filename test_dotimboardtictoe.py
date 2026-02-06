@@ -139,8 +139,9 @@ REAR_LIFT_ANGLES = {"P4": 80, "P5": 30, "P6": -70, "P7": -30}
 FRONT_LIFT_ANGLES = {"P0": -20, "P1": 90, "P2": 20, "P3": -75}
 HEAD_INIT_ANGLES = {"P8": 38, "P9": -70, "P10": 75}
 
-POST_BOOT_P9 = int(os.environ.get("POST_BOOT_P9", "-76"))
-POST_BOOT_P10 = int(os.environ.get("POST_BOOT_P10", "33"))
+POST_BOOT_P8 = int(os.environ.get("POST_BOOT_P8", "35"))
+POST_BOOT_P9 = int(os.environ.get("POST_BOOT_P9", "-62"))
+POST_BOOT_P10 = int(os.environ.get("POST_BOOT_P10", "28"))
 POST_BOOT_P11 = int(os.environ.get("POST_BOOT_P11", "-62"))
 
 RESCAN_BACKWARD = str(os.environ.get("RESCAN_BACKWARD", "1")).lower() in ("1", "true", "yes", "on")
@@ -657,8 +658,8 @@ def prepare_robot(cam, robot_state: Dict[str, Any]):
 
         time.sleep(2.0)
         cam.log("[PREPARE] force P8/P10 after MotionController")
-        set_servo_angle("P8", 40, hold_sec=0.35)
-        set_servo_angle("P10", 30, hold_sec=0.35)
+        set_servo_angle("P8", POST_BOOT_P8, hold_sec=0.35)
+        set_servo_angle("P10", POST_BOOT_P10, hold_sec=0.35)
 
         cam.log("[PREPARE] post-boot head/arm angles")
         set_servo_angle("P9", POST_BOOT_P9, hold_sec=0.35)
